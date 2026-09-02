@@ -2,7 +2,8 @@
 name = "ailo"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# 1.87: keychain.rs が使う `usize::is_multiple_of`。bitbucket-tui から流用した箇所。
+rust-version = "1.87"
 description = "An HTTP client for AI agents — call APIs without pouring the whole response into the context window"
 license = "MIT"
 repository = "https://github.com/asriel-dev-apps/ailo"
@@ -12,6 +13,12 @@ categories = ["command-line-utilities"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
+# libloading は Linux の Secret Service(libsecret)を実行時 dlopen で呼ぶための依存(cargo 公式の
+# cargo-credential-libsecret と同方式)。ビルド時リンクや zbus 系の重い依存を避ける。target 依存に
+# せず通常依存にしているのは意図的: libsecret バックエンドのモジュールを全 OS でコンパイル対象に
+# して、macOS 上の check/clippy/test でも Linux 向けコードの大半を検証できるようにするため
+# (dlopen は実行時にしか起きないので macOS ビルドに実害はない)。
+libloading = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_json_path = "0.7"

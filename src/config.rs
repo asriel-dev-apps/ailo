@@ -1,0 +1,368 @@
+//! 設定・保存済みリクエスト・キャプチャした状態の読み書き。
+//!
+//! 3 つのファイルに分かれている。分けている理由は「誰が書き換えるか」が違うから。
+//!
+//! | ファイル | 場所 | 書き換える主体 |
+//! | --- | --- | --- |
+//! | `config.toml` | 設定ディレクトリ | 人間が手で書く |
+//! | `requests.toml` | 設定ディレクトリ | `ailo save` |
+//! | `state/<env>.toml` | データディレクトリ | キャプチャ |
+//!
+//! **どのファイルにも秘匿値は書かない。** キャプチャした値のうち秘匿指定されたものは
+//! キーチェーンへ行き、ここには残らない。
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::paths;
+
+fn write_private(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("{} を書けません", paths::tildify(path)))?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------- config.toml
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// `--env` を省いたときに使う環境。
+    pub default_env: Option<String>,
+    /// 全環境共通の変数。
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// 全環境共通で足すヘッダ。
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// 環境ごとの設定。
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvConfig>,
+    /// 既定に加えてマスクするヘッダ名。
+    #[serde(default)]
+    pub redact_headers: Vec<String>,
+    #[serde(default)]
+    pub retention: RetentionConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvConfig {
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    pub keep_count: usize,
+    pub keep_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            keep_count: crate::dump::DEFAULT_KEEP_COUNT,
+            keep_days: crate::dump::DEFAULT_KEEP_DAYS,
+        }
+    }
+}
+
+impl Config {
+    pub fn path() -> Result<PathBuf> {
+        Ok(paths::config_dir()?.join("config.toml"))
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(Self::default());
+        };
+        toml::from_str(&text).with_context(|| {
+            format!("{} を読めません", paths::tildify(&path))
+        })
+    }
+
+    /// 環境名を解決する。`--env` > `default_env`。
+    pub fn resolve_env(&self, requested: Option<&str>) -> Option<String> {
+        requested
+            .map(str::to_string)
+            .or_else(|| self.default_env.clone())
+    }
+
+    pub fn env_config(&self, env: Option<&str>) -> EnvConfig {
+        env.and_then(|e| self.env.get(e)).cloned().unwrap_or_default()
+    }
+
+    /// 環境名が設定に存在するか。打ち間違いを送信前に捕まえるために使う。
+    pub fn knows_env(&self, env: &str) -> bool {
+        self.env.contains_key(env)
+    }
+
+    pub fn environments(&self) -> Vec<&str> {
+        self.env.keys().map(String::as_str).collect()
+    }
+}
+
+// -------------------------------------------------------------- requests.toml
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Requests {
+    #[serde(default)]
+    pub requests: BTreeMap<String, SavedRequest>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SavedRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub form: bool,
+    /// レスポンスから変数へ束縛する式。`{ access_token = ".data.token" }`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capture: BTreeMap<String, String>,
+    /// `capture` のうちキーチェーンへ入れるもの。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret: Vec<String>,
+}
+
+impl Requests {
+    pub fn path() -> Result<PathBuf> {
+        Ok(paths::config_dir()?.join("requests.toml"))
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path()?;
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(Self::default());
+        };
+        toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        write_private(&Self::path()?, &toml::to_string_pretty(self)?)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&SavedRequest> {
+        self.requests.get(name)
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.requests.keys().map(String::as_str).collect()
+    }
+
+    pub fn put(&mut self, name: &str, req: SavedRequest) {
+        self.requests.insert(name.to_string(), req);
+    }
+}
+
+// ------------------------------------------------------------ 直前のリクエスト
+
+/// `ailo save` の材料。**展開前のテンプレート**を持つ。
+///
+/// ダンプから復元しないのは、ダンプがマスク済みだから。`***` を保存してしまう。
+/// かといって展開後の値を残せば平文の token をファイルに書くことになる。
+/// 展開前なら `{{token}}` のまま残る。
+///
+/// ただし展開前でも、`Authorization: Bearer <生の値>` や `password=<生の値>` のように
+/// **人が直接打ち込んだ秘匿値**はテンプレートに含まれてしまう。これはここに書かず、
+/// 落とした項目の名前だけを `redacted` に残す。`ailo save` はそれを見て保存を拒む。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastInvocation {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub items: Vec<String>,
+    #[serde(default)]
+    pub raw: Option<String>,
+    #[serde(default)]
+    pub form: bool,
+    /// 記録時に値を落とした項目名。空でなければ `save` できない。
+    #[serde(default)]
+    pub redacted: Vec<String>,
+}
+
+impl LastInvocation {
+    fn path() -> Result<PathBuf> {
+        Ok(paths::data_dir()?.join("last.toml"))
+    }
+
+    pub fn record(&self) -> Result<()> {
+        write_private(&Self::path()?, &toml::to_string_pretty(self)?)
+    }
+
+    pub fn load() -> Result<Option<Self>> {
+        let path = Self::path()?;
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        Ok(toml::from_str(&text).ok())
+    }
+}
+
+// ------------------------------------------------------------- state/<env>.toml
+
+/// キャプチャした非秘匿の値と、token の期限。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct State {
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// 変数名 → RFC3339 の失効時刻。
+    #[serde(default)]
+    pub expires_at: BTreeMap<String, String>,
+}
+
+impl State {
+    fn path(env: &str) -> Result<PathBuf> {
+        Ok(paths::data_dir()?.join("state").join(format!("{env}.toml")))
+    }
+
+    pub fn load(env: &str) -> Result<Self> {
+        let Ok(text) = fs::read_to_string(Self::path(env)?) else {
+            return Ok(Self::default());
+        };
+        Ok(toml::from_str(&text).unwrap_or_default())
+    }
+
+    pub fn save(&self, env: &str) -> Result<()> {
+        write_private(&Self::path(env)?, &toml::to_string_pretty(self)?)
+    }
+
+    /// 期限切れの変数名を返す。
+    pub fn expired(&self, now: time::OffsetDateTime) -> Vec<&str> {
+        use time::format_description::well_known::Rfc3339;
+        self.expires_at
+            .iter()
+            .filter(|(_, at)| {
+                time::OffsetDateTime::parse(at, &Rfc3339).is_ok_and(|t| t <= now)
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_config_file_is_not_an_error() {
+        // 設定を書く前でもアドホックに叩けること。
+        assert!(Config::default().vars.is_empty());
+    }
+
+    #[test]
+    fn config_parses_environments_and_common_values() {
+        let cfg: Config = toml::from_str(
+            r#"
+            default_env = "stg"
+            [vars]
+            api_version = "v1"
+            [env.stg.vars]
+            base_url = "https://stg.example.com"
+            [env.prd.vars]
+            base_url = "https://api.example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolve_env(None).as_deref(), Some("stg"));
+        assert_eq!(cfg.resolve_env(Some("prd")).as_deref(), Some("prd"));
+        assert_eq!(cfg.vars["api_version"], "v1");
+        assert_eq!(
+            cfg.env_config(Some("prd")).vars["base_url"],
+            "https://api.example.com"
+        );
+        assert_eq!(cfg.environments(), vec!["prd", "stg"]);
+    }
+
+    #[test]
+    fn an_unknown_environment_yields_empty_settings_not_a_panic() {
+        let cfg = Config::default();
+        assert!(cfg.env_config(Some("nope")).vars.is_empty());
+        assert!(!cfg.knows_env("nope"));
+    }
+
+    #[test]
+    fn a_typo_in_a_config_key_is_rejected_rather_than_ignored() {
+        // 黙って無視すると「設定したのに効かない」を延々と追うことになる。
+        let err = toml::from_str::<Config>("defualt_env = \"stg\"").unwrap_err();
+        assert!(err.to_string().contains("defualt_env"), "{err}");
+    }
+
+    #[test]
+    fn saved_requests_round_trip_through_toml() {
+        let mut reqs = Requests::default();
+        reqs.put(
+            "login",
+            SavedRequest {
+                method: "POST".into(),
+                url: "{{base_url}}/auth/login".into(),
+                items: vec!["email={{email}}".into()],
+                capture: BTreeMap::from([("access_token".into(), ".data.token".into())]),
+                secret: vec!["access_token".into()],
+                ..Default::default()
+            },
+        );
+        let text = toml::to_string_pretty(&reqs).unwrap();
+        let back: Requests = toml::from_str(&text).unwrap();
+        let saved = back.get("login").unwrap();
+        assert_eq!(saved.url, "{{base_url}}/auth/login");
+        assert_eq!(saved.capture["access_token"], ".data.token");
+        assert_eq!(saved.secret, vec!["access_token".to_string()]);
+    }
+
+    #[test]
+    fn saved_requests_keep_templates_not_expanded_values() {
+        // 展開後を保存すると平文の token がファイルに残る。
+        let text = toml::to_string_pretty(&Requests {
+            requests: BTreeMap::from([(
+                "x".into(),
+                SavedRequest {
+                    method: "GET".into(),
+                    url: "{{base_url}}/u".into(),
+                    items: vec!["Authorization: Bearer {{token}}".into()],
+                    ..Default::default()
+                },
+            )]),
+        })
+        .unwrap();
+        assert!(text.contains("{{token}}"), "{text}");
+        assert!(!text.contains("Bearer s3cr3t"), "{text}");
+    }
+
+    #[test]
+    fn expiry_is_reported_only_for_times_already_past() {
+        let now = time::OffsetDateTime::now_utc();
+        let state = State {
+            vars: BTreeMap::new(),
+            expires_at: BTreeMap::from([
+                ("old".into(), "2020-01-01T00:00:00Z".into()),
+                ("future".into(), "2999-01-01T00:00:00Z".into()),
+                ("garbage".into(), "not a time".into()),
+            ]),
+        };
+        let expired = state.expired(now);
+        assert_eq!(expired, vec!["old"]);
+    }
+}

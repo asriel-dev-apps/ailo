@@ -34,6 +34,17 @@ pub enum Command {
     Head(RequestArgs),
     /// OPTIONS を送る
     Options(RequestArgs),
+    /// 保存済みのリクエストを実行する
+    Run(RunArgs),
+    /// 直前のリクエストに名前を付けて保存する
+    Save(SaveArgs),
+    /// 保存済みのリクエストを一覧する
+    Ls,
+    /// 環境を一覧する
+    Env,
+    /// 秘匿値を出し入れする
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// 直近のリクエストを新しい順に並べる
     Log(LogArgs),
     /// ダンプ本体を表示する
@@ -41,7 +52,7 @@ pub enum Command {
 }
 
 impl Command {
-    /// リクエスト系サブコマンドなら (メソッド, 引数) を返す。
+    /// アドホックなリクエスト系サブコマンドなら (メソッド, 引数) を返す。
     pub fn as_request(&self) -> Option<(&'static str, &RequestArgs)> {
         match self {
             Command::Get(a) => Some(("GET", a)),
@@ -56,17 +67,16 @@ impl Command {
     }
 }
 
-#[derive(Debug, Args)]
-pub struct RequestArgs {
-    /// リクエスト先の URL
-    pub url: String,
+/// アドホックにも保存済み実行にも効く共通の指定。
+#[derive(Debug, Args, Clone)]
+pub struct CommonArgs {
+    /// 使う環境 (省略時は config の default_env)
+    #[arg(long, short)]
+    pub env: Option<String>,
 
-    /// key=値 / key:=JSON / key==クエリ / Name: 値 / key@パス
-    ///
-    /// `trailing_var_arg` は使わない。使うと item より後ろのフラグが item として
-    /// 飲み込まれ、`ailo post <url> name=x --pick .id` が黙って壊れる。
-    /// item は `-` で始まらないので、フラグとの取り違えは起きない。
-    pub items: Vec<String>,
+    /// 変数を上書きする (名前=値、繰り返し可)
+    #[arg(long = "var", value_name = "名前=値")]
+    pub vars: Vec<String>,
 
     /// 出力形式
     #[arg(long, value_enum, default_value = "auto")]
@@ -92,14 +102,6 @@ pub struct RequestArgs {
     #[arg(long)]
     pub no_redact: bool,
 
-    /// ボディを application/x-www-form-urlencoded で送る
-    #[arg(long)]
-    pub form: bool,
-
-    /// ボディを文字列として直接指定する
-    #[arg(long)]
-    pub raw: Option<String>,
-
     /// タイムアウト秒数
     #[arg(long, default_value_t = 30)]
     pub timeout: u64,
@@ -113,7 +115,7 @@ pub struct RequestArgs {
     pub fail: bool,
 }
 
-impl RequestArgs {
+impl CommonArgs {
     pub fn head_lines(&self) -> usize {
         if self.full {
             usize::MAX
@@ -121,6 +123,79 @@ impl RequestArgs {
             self.head
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct RequestArgs {
+    /// リクエスト先の URL
+    pub url: String,
+
+    /// key=値 / key:=JSON / key==クエリ / Name: 値 / key@パス
+    ///
+    /// `trailing_var_arg` は使わない。使うと item より後ろのフラグが item として
+    /// 飲み込まれ、`ailo post <url> name=x --pick .id` が黙って壊れる。
+    /// item は `-` で始まらないので、フラグとの取り違えは起きない。
+    pub items: Vec<String>,
+
+    /// ボディを application/x-www-form-urlencoded で送る
+    #[arg(long)]
+    pub form: bool,
+
+    /// ボディを文字列として直接指定する
+    #[arg(long)]
+    pub raw: Option<String>,
+
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    /// 保存済みリクエストの名前
+    pub name: String,
+
+    /// 追加の item (保存内容に上書きで足す)
+    pub items: Vec<String>,
+
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct SaveArgs {
+    /// 付ける名前
+    pub name: String,
+
+    /// レスポンスから変数を取り出す指定 (名前=式、繰り返し可)
+    #[arg(long = "capture", value_name = "名前=式")]
+    pub captures: Vec<String>,
+
+    /// capture のうちキーチェーンへ入れるもの (繰り返し可)
+    #[arg(long = "secret", value_name = "名前")]
+    pub secrets: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// 値を保存する (値は標準入力から読む)
+    Set {
+        /// 環境名
+        env: String,
+        /// キー名
+        key: String,
+    },
+    /// キー名を一覧する (値は表示しない)
+    Ls {
+        /// 環境名 (省略時は全環境)
+        env: Option<String>,
+    },
+    /// 削除する
+    Rm {
+        /// 環境名
+        env: String,
+        /// キー名
+        key: String,
+    },
 }
 
 #[derive(Debug, Args)]

@@ -24,7 +24,7 @@ fn flags_may_appear_after_items() {
     let (method, args) = cli.command.as_request().expect("リクエスト系");
     assert_eq!(method, "POST");
     assert_eq!(args.items, vec!["name=taro"]);
-    assert_eq!(args.pick.as_deref(), Some(".id"));
+    assert_eq!(args.common.pick.as_deref(), Some(".id"));
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn header_items_survive_argument_parsing() {
     ]);
     let (_, args) = cli.command.as_request().unwrap();
     assert_eq!(args.items, vec!["Authorization: Bearer x"]);
-    assert!(args.no_redact);
+    assert!(args.common.no_redact);
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn pick_and_shape_cannot_be_combined() {
 fn full_overrides_the_head_line_limit() {
     let cli = parse(&["ailo", "get", "https://example.com", "--full"]);
     let (_, args) = cli.command.as_request().unwrap();
-    assert_eq!(args.head_lines(), usize::MAX);
+    assert_eq!(args.common.head_lines(), usize::MAX);
 }
 
 #[test]

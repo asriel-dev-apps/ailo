@@ -1,81 +1,409 @@
 //! サブコマンドの実行。
 
-use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
+
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Method;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::args::{self, Item};
-use crate::cli::{Command, LogArgs, RequestArgs, ShowArgs};
+use crate::capture;
+use crate::cli::{Command, CommonArgs, LogArgs, RequestArgs, RunArgs, SaveArgs, SecretCommand, ShowArgs};
+use crate::config::{Config, LastInvocation, Requests, SavedRequest, State};
 use crate::dump::{self, Dump, Retention};
 use crate::output::{self, Format, Palette};
 use crate::paths;
 use crate::pick;
 use crate::redact::Redactor;
+use crate::secrets;
 use crate::shape;
+use crate::vars::{self, Layer, Vars};
 
 /// プロセスの終了コード。
 pub struct Outcome {
     pub code: i32,
 }
 
+const OK: Outcome = Outcome { code: 0 };
+
 pub async fn run(command: Command) -> Result<Outcome> {
-    if let Some((method, req)) = command.as_request() {
-        return request(method, req).await;
+    if let Some((method, a)) = command.as_request() {
+        return adhoc(method, a).await;
     }
     match command {
+        Command::Run(a) => saved(&a).await,
+        Command::Save(a) => save(&a),
+        Command::Ls => list_requests(),
+        Command::Env => list_envs(),
+        Command::Secret(c) => secret(&c),
         Command::Log(a) => log(&a),
         Command::Show(a) => show(&a),
         _ => unreachable!("リクエスト系は as_request で処理済み"),
     }
 }
 
-async fn request(method: &str, a: &RequestArgs) -> Result<Outcome> {
-    let method = Method::from_bytes(method.as_bytes()).expect("固定のメソッド名");
+// ------------------------------------------------------------------ リクエスト
 
-    let items: Vec<Item> = a
-        .items
+/// 送信前に確定させたテンプレート一式。アドホックと保存済みで共通。
+struct Recipe {
+    method: String,
+    url: String,
+    items: Vec<String>,
+    raw: Option<String>,
+    form: bool,
+    name: Option<String>,
+    capture_spec: BTreeMap<String, String>,
+    secret_names: Vec<String>,
+}
+
+async fn adhoc(method: &str, a: &RequestArgs) -> Result<Outcome> {
+    let recipe = Recipe {
+        method: method.to_string(),
+        url: a.url.clone(),
+        items: a.items.clone(),
+        raw: a.raw.clone(),
+        form: a.form,
+        name: None,
+        capture_spec: BTreeMap::new(),
+        secret_names: Vec::new(),
+    };
+    // `ailo save` の材料。直書きされた秘匿値は落としてから記録する。
+    record_last(&recipe)?;
+    execute(recipe, &a.common).await
+}
+
+/// 直書きされた秘匿値を含む item かどうか。含むならその項目名を返す。
+///
+/// 「秘匿らしいヘッダ名」と「秘匿らしいフィールド名」の両方を見る。ヘッダだけを見ていた
+/// ときは、ログインの `password=...` や `token=...` がそのままファイルに残った。
+fn literal_secret_name(raw: &str, r: &Redactor) -> Option<String> {
+    match args::parse_item(raw).ok()? {
+        Item::Header { name, value } if r.is_sensitive_header(&name) && !value.contains("{{") => {
+            Some(name)
+        }
+        Item::Field { name, value }
+            if crate::redact::is_sensitive_field(&name) && !value.contains("{{") =>
+        {
+            Some(name)
+        }
+        Item::RawField { name, value }
+            if crate::redact::is_sensitive_field(&name) && !value.to_string().contains("{{") =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// 直前のリクエストを記録する。直書きの秘匿値は値を落とし、名前だけ残す。
+fn record_last(recipe: &Recipe) -> Result<()> {
+    let r = Redactor::new(true);
+    let mut items = Vec::with_capacity(recipe.items.len());
+    let mut redacted = Vec::new();
+    for raw in &recipe.items {
+        match literal_secret_name(raw, &r) {
+            Some(name) => {
+                // 値そのものは書かない。何が落ちたかだけ残す。
+                redacted.push(name);
+            }
+            None => items.push(raw.clone()),
+        }
+    }
+    LastInvocation {
+        method: recipe.method.clone(),
+        url: recipe.url.clone(),
+        items,
+        raw: recipe.raw.clone(),
+        form: recipe.form,
+        redacted,
+    }
+    .record()
+}
+
+async fn saved(a: &RunArgs) -> Result<Outcome> {
+    let reqs = Requests::load()?;
+    let saved = reqs.get(&a.name).ok_or_else(|| {
+        let known = reqs.names().join(", ");
+        if known.is_empty() {
+            anyhow!("保存済みリクエストがありません。`ailo save <名前>` で保存してください")
+        } else {
+            anyhow!("`{}` は保存されていません。あるのは: {known}", a.name)
+        }
+    })?;
+
+    let mut items = saved.items.clone();
+    items.extend(a.items.clone());
+
+    execute(
+        Recipe {
+            method: saved.method.clone(),
+            url: saved.url.clone(),
+            items,
+            raw: saved.raw.clone(),
+            form: saved.form,
+            name: Some(a.name.clone()),
+            capture_spec: saved.capture.clone(),
+            secret_names: saved.secret.clone(),
+        },
+        &a.common,
+    )
+    .await
+}
+
+/// 変数の層を優先順に組む。先頭が最優先。
+fn build_vars(cfg: &Config, env: Option<&str>, cli_vars: &[String]) -> Result<Vars> {
+    let mut layers = Vec::new();
+
+    let cli: BTreeMap<String, String> = cli_vars
         .iter()
-        .map(|s| args::parse_item(s))
+        .map(|s| vars::parse_assignment(s))
         .collect::<Result<_>>()?;
+    layers.push(Layer::new("cli", cli, false));
+    layers.push(vars::layer_from_process_env());
 
-    let plan = crate::http::plan(method, &a.url, &items, a.form, a.raw.clone())?;
-    let sent = crate::http::send(&plan, a.timeout).await?;
+    if let Some(env) = env {
+        layers.push(Layer::new("keychain", secrets::load_env(env)?, true));
+        layers.push(Layer::new("state", State::load(env)?.vars, false));
+    }
 
-    let mut redactor = if a.no_redact {
+    layers.push(Layer::new("env-config", cfg.env_config(env).vars, false));
+    layers.push(Layer::new("config", cfg.vars.clone(), false));
+
+    Ok(Vars::from_layers(layers))
+}
+
+/// 設定の共通ヘッダと環境ヘッダを重ねる。item のヘッダが最後に勝つ。
+fn config_headers(cfg: &Config, env: Option<&str>) -> Vec<(String, String)> {
+    let mut merged: BTreeMap<String, String> = cfg.headers.clone();
+    merged.extend(cfg.env_config(env).headers);
+    merged.into_iter().collect()
+}
+
+/// item のテンプレートを展開する。クエリに秘匿値が載ったら警告する。
+fn expand_item(item: &Item, v: &Vars, warn: &mut Vec<String>) -> Result<Item> {
+    Ok(match item {
+        Item::Header { name, value } => Item::Header {
+            name: v.expand(name)?.text,
+            value: v.expand(value)?.text,
+        },
+        Item::Query { name, value } => {
+            let expanded = v.expand(value)?;
+            if expanded.used_secret {
+                // URL はサーバのアクセスログ、プロキシ、Referer に残る。
+                warn.push(format!("クエリ `{name}` に秘匿値を展開しました"));
+            }
+            Item::Query {
+                name: v.expand(name)?.text,
+                value: expanded.text,
+            }
+        }
+        Item::Field { name, value } => Item::Field {
+            name: v.expand(name)?.text,
+            value: v.expand(value)?.text,
+        },
+        Item::RawField { name, value } => {
+            // raw は JSON。文字列化して展開し、読み直す。
+            let expanded = v.expand(&value.to_string())?.text;
+            Item::RawField {
+                name: v.expand(name)?.text,
+                value: serde_json::from_str(&expanded).with_context(|| {
+                    format!("`{name}:=` は変数展開後に JSON でなくなりました: {expanded}")
+                })?,
+            }
+        }
+        Item::FileField { name, path } => Item::FileField {
+            name: v.expand(name)?.text,
+            path: v.expand(&path.to_string_lossy())?.text.into(),
+        },
+    })
+}
+
+/// 期限切れの秘匿値を使おうとしていないか、送信前に確かめる。
+fn check_expiry(state: &State, referenced: &[String], now: OffsetDateTime) -> Result<()> {
+    let expired: Vec<&str> = state
+        .expired(now)
+        .into_iter()
+        .filter(|name| referenced.iter().any(|r| r == name))
+        .collect();
+    if expired.is_empty() {
+        return Ok(());
+    }
+    // 黙って 401 を受けるより速く、原因も明確。
+    bail!(
+        "期限切れの値を使おうとしています: {}。取り直してから再実行してください (例: `ailo run login`)",
+        expired.join(", ")
+    );
+}
+
+async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
+    let cfg = Config::load()?;
+    let env = cfg.resolve_env(common.env.as_deref());
+    let palette = Palette::detect();
+
+    if let (Some(name), false) = (env.as_deref(), cfg.environments().is_empty()) {
+        if !cfg.knows_env(name) {
+            eprintln!(
+                "{}",
+                palette.dim(&format!(
+                    "環境 `{name}` は設定にありません。あるのは: {}",
+                    cfg.environments().join(", ")
+                ))
+            );
+        }
+    }
+
+    let v = build_vars(&cfg, env.as_deref(), &common.vars)?;
+
+    // テンプレートが参照している名前を集め、期限切れを送信前に捕まえる。
+    if let Some(env_name) = env.as_deref() {
+        let mut referenced = Vars::referenced_names(&recipe.url);
+        for item in &recipe.items {
+            referenced.extend(Vars::referenced_names(item));
+        }
+        check_expiry(&State::load(env_name)?, &referenced, OffsetDateTime::now_utc())?;
+    }
+
+    let mut redactor = if common.no_redact {
         Redactor::disabled()
     } else {
-        Redactor::new(true)
+        let mut r = Redactor::new(true);
+        for name in &cfg.redact_headers {
+            r.add_header_name(name);
+        }
+        r
     };
-    // 送った秘匿値を覚えさせる。API がリクエストヘッダを本文に反響して返す場合、
-    // ヘッダ名を見るだけのマスクでは token が本文経由で素通りする。
-    redactor.learn_from_headers(plan.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // 変数として解決した秘匿値は、どの経路で本文に現れても落とす。
+    for value in v.secret_values() {
+        redactor.add_literal(value);
+    }
 
-    let dump_path = if a.no_dump {
+    // 設定のヘッダを先に、item のヘッダを後に。後勝ちで item が上書きする。
+    let mut item_templates: Vec<Item> = config_headers(&cfg, env.as_deref())
+        .into_iter()
+        .map(|(name, value)| Item::Header { name, value })
+        .collect();
+    for raw in &recipe.items {
+        item_templates.push(args::parse_item(raw)?);
+    }
+
+    let mut warnings = Vec::new();
+    let items: Vec<Item> = item_templates
+        .iter()
+        .map(|i| expand_item(i, &v, &mut warnings))
+        .collect::<Result<_>>()?;
+    for w in &warnings {
+        eprintln!("{}", palette.dim(&format!("警告: {w}")));
+    }
+
+    let url = v.expand(&recipe.url)?.text;
+    let raw = recipe.raw.as_deref().map(|r| v.expand(r)).transpose()?.map(|e| e.text);
+
+    let method = Method::from_bytes(recipe.method.as_bytes())
+        .with_context(|| format!("メソッドとして使えません: {}", recipe.method))?;
+    let plan = crate::http::plan(method, &url, &items, recipe.form, raw)?;
+
+    redactor.learn_from_headers(plan.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // ボディに直書きされた秘匿値(`password=...`、`token=...`)も落とす。
+    // ヘッダ名だけを見ていると、ログインの本文がまるごとダンプに残る。
+    redactor.learn_from_fields(plan.fields.iter().map(|(k, v)| {
+        let text = match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        (k.as_str(), text)
+    }));
+
+    let sent = crate::http::send(&plan, common.timeout).await?;
+
+    // キャプチャはマスク前の本文から取る。取った秘匿値はこの後のマスクに登録する。
+    let captured = if recipe.capture_spec.is_empty() {
+        None
+    } else {
+        let body = body_as_json(&sent.response)
+            .context("capture はレスポンスが JSON のときだけ使えます")?;
+        let got = capture::capture(
+            &body,
+            &recipe.capture_spec,
+            &recipe.secret_names,
+            OffsetDateTime::now_utc(),
+        )?;
+        for value in got.secret_values() {
+            redactor.add_literal(value);
+        }
+        Some(got)
+    };
+
+    let dump_path = if common.no_dump {
         None
     } else {
         let record = Dump {
             ts: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "unknown".into()),
-            name: None,
-            env: None,
+            name: recipe.name.clone(),
+            env: env.clone(),
             redacted: redactor.is_enabled(),
             request: sent.request.clone(),
             response: sent.response.clone(),
         };
-        Some(dump::write(&record, &redactor, &Retention::default())?.path)
+        Some(
+            dump::write(
+                &record,
+                &redactor,
+                &Retention {
+                    keep_count: cfg.retention.keep_count,
+                    keep_days: cfg.retention.keep_days,
+                },
+            )?
+            .path,
+        )
     };
 
-    let palette = Palette::detect();
+    if let Some(got) = captured {
+        let env_name = env.as_deref().ok_or_else(|| {
+            anyhow!("capture には環境が要ります。`--env <名前>` を指定するか config に default_env を書いてください")
+        })?;
+        persist_capture(env_name, &got, &palette)?;
+    }
 
-    if let Some(expr) = &a.pick {
+    render(&sent.response, dump_path.as_deref(), common, &redactor, &palette)?;
+    Ok(exit_for(sent.response.status, common.fail))
+}
+
+fn persist_capture(env: &str, got: &capture::Captured, p: &Palette) -> Result<()> {
+    for (key, value) in &got.secrets {
+        secrets::set(env, key, value)?;
+    }
+    let mut state = State::load(env)?;
+    state.vars.extend(got.vars.clone());
+    state.expires_at.extend(got.expires_at.clone());
+    state.save(env)?;
+
+    let mut names: Vec<&str> = got.secrets.keys().map(String::as_str).collect();
+    names.extend(got.vars.keys().map(String::as_str));
+    if !names.is_empty() {
+        // 値は出さない。名前だけで「入った」ことは分かる。
+        eprintln!(
+            "{}",
+            p.dim(&format!("captured({env}): {}", names.join(", ")))
+        );
+    }
+    Ok(())
+}
+
+fn render(
+    res: &crate::dump::ResponseRecord,
+    dump_path: Option<&std::path::Path>,
+    common: &CommonArgs,
+    redactor: &Redactor,
+    palette: &Palette,
+) -> Result<()> {
+    if let Some(expr) = &common.pick {
         // ここだけは生の本文を使う。値そのものを取りに行く操作なので、
         // マスクすると `--pick '.token'` が意味を失う。
-        let body = body_as_json(&sent.response).with_context(|| {
-            "--pick はレスポンスが JSON のときだけ使えます。本文はダンプで確認してください"
-                .to_string()
-        })?;
+        let body = body_as_json(res)
+            .context("--pick はレスポンスが JSON のときだけ使えます")?;
         let found = pick::pick(&body, expr)?;
         if found.is_empty() {
             // 空を黙って返すと「値が空文字だった」と区別がつかない。
@@ -83,34 +411,31 @@ async fn request(method: &str, a: &RequestArgs) -> Result<Outcome> {
         } else {
             println!("{}", pick::render(&found));
         }
-        return Ok(exit_for(sent.response.status, a.fail));
+        return Ok(());
     }
 
     // 以降の表示はマスク済みの複製を使う。
-    let redacted = dump::redact_response(&sent.response, &redactor);
+    let redacted = dump::redact_response(res, redactor);
     let res = &redacted;
 
-    if a.shape {
-        let body = body_as_json(res).with_context(|| {
-            "--shape はレスポンスが JSON のときだけ使えます".to_string()
-        })?;
-        println!("{}", output::status_line(res, &palette));
-        if let Some(path) = &dump_path {
+    if common.shape {
+        let body = body_as_json(res).context("--shape はレスポンスが JSON のときだけ使えます")?;
+        println!("{}", output::status_line(res, palette));
+        if let Some(path) = dump_path {
             println!("{} {}", palette.key("dump:"), paths::tildify(path));
         }
         println!("{}", shape::of(&body).render());
-        return Ok(exit_for(res.status, a.fail));
+        return Ok(());
     }
 
-    let text = match a.format.resolve() {
-        Format::Pretty => output::pretty(res, dump_path.as_deref(), &palette),
-        Format::Digest => output::digest(res, dump_path.as_deref(), a.head_lines(), &palette),
-        Format::Json => output::machine(res, dump_path.as_deref()),
+    let text = match common.format.resolve() {
+        Format::Pretty => output::pretty(res, dump_path, palette),
+        Format::Digest => output::digest(res, dump_path, common.head_lines(), palette),
+        Format::Json => output::machine(res, dump_path),
         Format::Auto => unreachable!("resolve 済み"),
     };
     println!("{text}");
-
-    Ok(exit_for(res.status, a.fail))
+    Ok(())
 }
 
 fn exit_for(status: u16, fail: bool) -> Outcome {
@@ -122,15 +447,154 @@ fn exit_for(status: u16, fail: bool) -> Outcome {
 fn body_as_json(res: &crate::dump::ResponseRecord) -> Result<serde_json::Value> {
     match &res.body {
         crate::dump::BodyRecord::Json { value } => Ok(value.clone()),
-        _ => bail!("レスポンス本文が JSON ではありません"),
+        _ => bail!("レスポンス本文が JSON ではありません。本文はダンプで確認してください"),
     }
 }
+
+// -------------------------------------------------------------------- 保存系
+
+fn save(a: &SaveArgs) -> Result<Outcome> {
+    let last = LastInvocation::load()?.ok_or_else(|| {
+        anyhow!("保存できるリクエストがありません。先に 1 回送信してください")
+    })?;
+
+    if !last.redacted.is_empty() {
+        // 直書きの値を保存すると、平文の秘匿値が設定ファイルに残る。
+        bail!(
+            "{} に値が直書きされているため保存しません。`ailo secret set <env> <名前>` で預けたうえで `{{{{名前}}}}` を使う形に書き換えてから、もう一度送信して保存してください",
+            last.redacted.join(", ")
+        );
+    }
+
+    let capture: BTreeMap<String, String> = a
+        .captures
+        .iter()
+        .map(|s| vars::parse_assignment(s))
+        .collect::<Result<_>>()?;
+
+    for name in &a.secrets {
+        if !capture.contains_key(name) {
+            bail!("`--secret {name}` に対応する `--capture {name}=<式>` がありません");
+        }
+    }
+
+    let mut reqs = Requests::load()?;
+    reqs.put(
+        &a.name,
+        SavedRequest {
+            method: last.method,
+            url: last.url,
+            items: last.items,
+            raw: last.raw,
+            form: last.form,
+            capture,
+            secret: a.secrets.clone(),
+        },
+    );
+    reqs.save()?;
+    println!("保存しました: {}", a.name);
+    Ok(OK)
+}
+
+fn list_requests() -> Result<Outcome> {
+    let reqs = Requests::load()?;
+    if reqs.requests.is_empty() {
+        println!("保存済みリクエストはありません");
+        return Ok(OK);
+    }
+    let p = Palette::detect();
+    for (name, r) in &reqs.requests {
+        let captured = if r.capture.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = r.capture.keys().map(String::as_str).collect();
+            format!("  {}", p.dim(&format!("capture: {}", names.join(", "))))
+        };
+        println!("{:<20} {:<6} {}{}", name, r.method, r.url, captured);
+    }
+    Ok(OK)
+}
+
+fn list_envs() -> Result<Outcome> {
+    let cfg = Config::load()?;
+    let p = Palette::detect();
+    let default = cfg.default_env.clone().unwrap_or_default();
+    let mut names: Vec<String> = cfg.environments().iter().map(|s| s.to_string()).collect();
+    for e in secrets::Index::load()?.environments() {
+        if !names.iter().any(|n| n == e) {
+            names.push(e.to_string());
+        }
+    }
+    if names.is_empty() {
+        println!("環境はまだありません。{} に書いてください", paths::tildify(&Config::path()?));
+        return Ok(OK);
+    }
+    names.sort();
+    for name in names {
+        let mark = if name == default { "*" } else { " " };
+        let base = cfg
+            .env_config(Some(&name))
+            .vars
+            .get("base_url")
+            .cloned()
+            .unwrap_or_default();
+        println!("{mark} {:<12} {}", name, p.dim(&base));
+    }
+    Ok(OK)
+}
+
+fn secret(c: &SecretCommand) -> Result<Outcome> {
+    match c {
+        SecretCommand::Set { env, key } => {
+            // 値は引数で受けない。argv は同一ユーザーの他プロセスから見える。
+            let value = read_secret_from_stdin()?;
+            if value.is_empty() {
+                bail!("値が空です");
+            }
+            secrets::set(env, key, &value)?;
+            println!("保存しました: {env}/{key}");
+        }
+        SecretCommand::Ls { env } => {
+            let index = secrets::Index::load()?;
+            let envs: Vec<String> = match env {
+                Some(e) => vec![e.clone()],
+                None => index.environments().iter().map(|s| s.to_string()).collect(),
+            };
+            if envs.is_empty() {
+                println!("保存された秘匿値はありません");
+            }
+            for e in envs {
+                // 値は絶対に出さない。名前だけで足りる。
+                println!("{e}: {}", index.keys(&e).join(", "));
+            }
+        }
+        SecretCommand::Rm { env, key } => {
+            secrets::remove(env, key)?;
+            println!("削除しました: {env}/{key}");
+        }
+    }
+    Ok(OK)
+}
+
+fn read_secret_from_stdin() -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        eprint!("値を入力して Enter (画面には残ります): ");
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("標準入力から値を読めません")?;
+    Ok(buf.trim_end_matches(['\n', '\r']).to_string())
+}
+
+// ---------------------------------------------------------------------- 参照系
 
 fn log(a: &LogArgs) -> Result<Outcome> {
     let entries = dump::read_index(a.limit)?;
     if entries.is_empty() {
         println!("ダンプはまだありません");
-        return Ok(Outcome { code: 0 });
+        return Ok(OK);
     }
     let p = Palette::detect();
     for (i, e) in entries.iter().enumerate() {
@@ -146,7 +610,7 @@ fn log(a: &LogArgs) -> Result<Outcome> {
             p.dim(&e.dump),
         );
     }
-    Ok(Outcome { code: 0 })
+    Ok(OK)
 }
 
 fn show(a: &ShowArgs) -> Result<Outcome> {
@@ -163,7 +627,7 @@ fn show(a: &ShowArgs) -> Result<Outcome> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("{} を読めません", paths::tildify(&path)))?;
     print!("{content}");
-    Ok(Outcome { code: 0 })
+    Ok(OK)
 }
 
 #[cfg(test)]
@@ -194,5 +658,147 @@ mod tests {
             ms: 1,
         };
         assert!(body_as_json(&res).is_err());
+    }
+
+    #[test]
+    fn a_literal_token_in_a_sensitive_header_is_caught() {
+        let r = Redactor::new(true);
+        assert_eq!(
+            literal_secret_name("Authorization: Bearer s3cr3t-token-value", &r).as_deref(),
+            Some("Authorization")
+        );
+    }
+
+    #[test]
+    fn a_literal_secret_in_a_body_field_is_caught() {
+        // ヘッダだけを見ていたときは、これが requests.toml に平文で残った。
+        let r = Redactor::new(true);
+        assert_eq!(
+            literal_secret_name("password=hunter2-and-more", &r).as_deref(),
+            Some("password")
+        );
+        assert_eq!(
+            literal_secret_name("token=stg-token-abcdefgh", &r).as_deref(),
+            Some("token")
+        );
+    }
+
+    #[test]
+    fn a_templated_secret_is_fine_to_save() {
+        let r = Redactor::new(true);
+        assert!(literal_secret_name("Authorization: Bearer {{access_token}}", &r).is_none());
+        assert!(literal_secret_name("password={{password}}", &r).is_none());
+    }
+
+    #[test]
+    fn ordinary_items_never_block_saving() {
+        let r = Redactor::new(true);
+        for raw in ["X-Trace: abc", "name=taro", "limit==50", "age:=30"] {
+            assert!(literal_secret_name(raw, &r).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn recording_drops_the_value_and_keeps_only_the_name() {
+        let recipe = Recipe {
+            method: "POST".into(),
+            url: "https://example.com/login".into(),
+            items: vec![
+                "password=hunter2-and-more".into(),
+                "email=a@example.com".into(),
+            ],
+            raw: None,
+            form: false,
+            name: None,
+            capture_spec: BTreeMap::new(),
+            secret_names: Vec::new(),
+        };
+        // record_last はファイルに書くので、ここでは同じ選別ロジックだけを確かめる。
+        let r = Redactor::new(true);
+        let kept: Vec<&String> = recipe
+            .items
+            .iter()
+            .filter(|i| literal_secret_name(i, &r).is_none())
+            .collect();
+        assert_eq!(kept, vec!["email=a@example.com"]);
+    }
+
+    #[test]
+    fn an_expired_value_stops_the_request_before_it_is_sent() {
+        let now = OffsetDateTime::now_utc();
+        let state = State {
+            vars: Default::default(),
+            expires_at: BTreeMap::from([("access_token".into(), "2020-01-01T00:00:00Z".into())]),
+        };
+        let err = check_expiry(&state, &["access_token".into()], now)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("access_token"), "{err}");
+        assert!(err.contains("login"), "次にやることを示していない: {err}");
+    }
+
+    #[test]
+    fn an_expired_value_that_is_not_referenced_does_not_block() {
+        let now = OffsetDateTime::now_utc();
+        let state = State {
+            vars: Default::default(),
+            expires_at: BTreeMap::from([("other".into(), "2020-01-01T00:00:00Z".into())]),
+        };
+        assert!(check_expiry(&state, &["access_token".into()], now).is_ok());
+    }
+
+    #[test]
+    fn expanding_a_secret_into_a_query_produces_a_warning() {
+        // URL はサーバのログ、プロキシ、Referer に残る。
+        let v = Vars::from_layers(vec![Layer::new(
+            "keychain",
+            vars::map([("token".into(), "s3cr3t-token-value".into())]),
+            true,
+        )]);
+        let mut warn = Vec::new();
+        let item = args::parse_item("t=={{token}}").unwrap();
+        expand_item(&item, &v, &mut warn).unwrap();
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].contains('t'), "{warn:?}");
+    }
+
+    #[test]
+    fn expanding_a_secret_into_a_header_produces_no_warning() {
+        // ヘッダは通常ログに残らない。ここで警告すると、正しい使い方が騒がしくなる。
+        let v = Vars::from_layers(vec![Layer::new(
+            "keychain",
+            vars::map([("token".into(), "s3cr3t-token-value".into())]),
+            true,
+        )]);
+        let mut warn = Vec::new();
+        let item = args::parse_item("Authorization: Bearer {{token}}").unwrap();
+        let expanded = expand_item(&item, &v, &mut warn).unwrap();
+        assert!(warn.is_empty(), "{warn:?}");
+        assert_eq!(
+            expanded,
+            Item::Header {
+                name: "Authorization".into(),
+                value: "Bearer s3cr3t-token-value".into()
+            }
+        );
+    }
+
+    #[test]
+    fn raw_json_fields_survive_variable_expansion() {
+        let v = Vars::from_layers(vec![Layer::new(
+            "cli",
+            vars::map([("n".into(), "42".into())]),
+            false,
+        )]);
+        let mut warn = Vec::new();
+        let item = args::parse_item(r#"ids:=["{{n}}"]"#).unwrap();
+        let expanded = expand_item(&item, &v, &mut warn).unwrap();
+        assert_eq!(
+            expanded,
+            Item::RawField {
+                name: "ids".into(),
+                value: serde_json::json!(["42"])
+            }
+        );
     }
 }

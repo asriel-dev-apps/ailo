@@ -19,6 +19,32 @@ const DEFAULT_HEADERS: &[&str] = &[
     "x-csrf-token",
 ];
 
+/// 秘匿値が入っていそうなフィールド名の断片(小文字、部分一致)。
+///
+/// ヘッダ名だけを見ていると、ログインの `password=...` や `token=...` のように
+/// **ボディに直書きされた秘匿値**を丸ごと取りこぼす。名前で当たりを付けるのは
+/// 完全ではないが、実際に漏れるのはほぼこの語彙。取りこぼしより過剰マスクを選ぶ。
+/// 誤って隠れた場合は `--no-redact` で外せる。
+const SENSITIVE_FIELD_PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "apikey",
+    "api_key",
+    "credential",
+    "private_key",
+    "client_secret",
+    "session",
+];
+
+/// フィールド名が秘匿値を持ちそうか。
+pub fn is_sensitive_field(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SENSITIVE_FIELD_PARTS.iter().any(|p| lower.contains(p))
+}
+
 /// リテラル置換の下限長。これより短い値は置換しない。
 ///
 /// 短い秘匿値をそのまま置換対象にすると、ボディ中の無関係な `1` や `ok` まで `***` になり、
@@ -87,6 +113,21 @@ impl Redactor {
             self.add_literal(value);
             if let Some((_scheme, rest)) = value.split_once(' ') {
                 self.add_literal(rest.trim());
+            }
+        }
+    }
+
+    /// 送信するボディフィールドから秘匿値を学習する。
+    ///
+    /// `password=...` をそのまま送ると、ダンプの request 側に平文で残る。
+    /// サーバが受け取った値を反響する API なら response 側にも残る。
+    pub fn learn_from_fields<'a, I>(&mut self, fields: I)
+    where
+        I: IntoIterator<Item = (&'a str, String)>,
+    {
+        for (name, value) in fields {
+            if is_sensitive_field(name) {
+                self.add_literal(&value);
             }
         }
     }
@@ -221,6 +262,40 @@ mod tests {
         let mut r = Redactor::new(true);
         r.learn_from_headers([("Content-Type", "application/json")]);
         assert_eq!(r.text("application/json"), "application/json");
+    }
+
+    #[test]
+    fn secret_looking_field_names_are_recognised() {
+        for name in [
+            "password",
+            "Password",
+            "access_token",
+            "clientSecret",
+            "api_key",
+            "sessionId",
+        ] {
+            assert!(is_sensitive_field(name), "見逃した: {name}");
+        }
+        for name in ["name", "email", "age", "limit", "items"] {
+            assert!(!is_sensitive_field(name), "過剰に拾った: {name}");
+        }
+    }
+
+    #[test]
+    fn a_password_sent_in_the_body_is_scrubbed_from_the_dump() {
+        // ヘッダ名だけを見ていると、ログインの本文に書いた秘匿値を丸ごと取りこぼす。
+        let mut r = Redactor::new(true);
+        r.learn_from_fields([("password", "hunter2-and-more".to_string())]);
+        let out = r.text(r#"{"password":"hunter2-and-more","email":"a@example.com"}"#);
+        assert!(!out.contains("hunter2-and-more"), "{out}");
+        assert!(out.contains("a@example.com"), "{out}");
+    }
+
+    #[test]
+    fn ordinary_field_names_are_not_learned() {
+        let mut r = Redactor::new(true);
+        r.learn_from_fields([("name", "taro-yamada-san".to_string())]);
+        assert!(r.text("taro-yamada-san").contains("taro"));
     }
 
     #[test]
