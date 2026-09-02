@@ -66,6 +66,10 @@ fn single(name: &str, found: &[Value]) -> Result<String> {
     }
 }
 
+/// `now` には**リクエストを送り始めた時刻**を渡すこと。
+///
+/// レスポンスを読み終えた時刻を起点にすると、`expires_in` の起算がその分だけ後ろへずれる。
+/// 遅い回線で 45 秒かかった `expires_in=60` の token を、あと 30 秒有効だと記録してしまう。
 pub fn capture(
     body: &Value,
     spec: &BTreeMap<String, String>,
@@ -80,6 +84,11 @@ pub fn capture(
         let value = single(name, &found)?;
 
         if name == EXPIRES_IN {
+            if expiry.is_some() {
+                // どちらを採るかを暗黙に決めない。BTreeMap の並び順で勝敗が決まると、
+                // 書いた順と結果が一致せず、しかも誰も気づかない。
+                bail!("`{EXPIRES_IN}` と `{EXPIRES_AT}` は同時に capture できません。どちらか一方にしてください");
+            }
             let secs: i64 = value.trim().parse().map_err(|_| {
                 anyhow::anyhow!("`{EXPIRES_IN}` は秒数のはずですが `{value}` でした")
             })?;
@@ -87,6 +96,9 @@ pub fn capture(
             continue;
         }
         if name == EXPIRES_AT {
+            if expiry.is_some() {
+                bail!("`{EXPIRES_IN}` と `{EXPIRES_AT}` は同時に capture できません。どちらか一方にしてください");
+            }
             let at = OffsetDateTime::parse(value.trim(), &Rfc3339).map_err(|_| {
                 anyhow::anyhow!("`{EXPIRES_AT}` は RFC3339 のはずですが `{value}` でした")
             })?;
@@ -195,6 +207,28 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("soon"), "{err}");
+    }
+
+    #[test]
+    fn giving_both_kinds_of_expiry_is_rejected_rather_than_silently_ordered() {
+        // BTreeMap の並び順で勝敗が決まると、書いた順と結果が一致しない。
+        let body = json!({"token": "a", "in": 60, "at": "2030-01-01T00:00:00Z"});
+        let err = capture(
+            &body,
+            &spec(&[
+                ("access_token", ".token"),
+                ("expires_in", ".in"),
+                ("expires_at", ".at"),
+            ]),
+            &["access_token".into()],
+            now(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("expires_in") && err.contains("expires_at"),
+            "{err}"
+        );
     }
 
     #[test]

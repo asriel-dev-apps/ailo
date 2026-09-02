@@ -22,18 +22,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+/// 一時ファイルへ書いてから rename する。
+///
+/// 書き込み先を直接 truncate すると、途中で落ちたときに壊れたファイルが残る。
+/// `state/<env>.toml` が壊れると期限の記録ごと失われるので、ここは不可分にする。
+/// 一時ファイル名に pid を混ぜるのは、同時に走った ailo どうしが同じ一時ファイルを
+/// 奪い合わないようにするため。
 fn write_private(path: &Path, text: &str) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("{} を書けません", paths::tildify(path)))?;
-    f.write_all(text.as_bytes())?;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("{} を書けません", paths::tildify(&tmp)))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("{} を更新できません", paths::tildify(path)))?;
     Ok(())
 }
 
@@ -239,10 +250,19 @@ impl State {
     }
 
     pub fn load(env: &str) -> Result<Self> {
-        let Ok(text) = fs::read_to_string(Self::path(env)?) else {
+        let path = Self::path(env)?;
+        let Ok(text) = fs::read_to_string(&path) else {
+            // 未作成は普通の状態。エラーにしない。
             return Ok(Self::default());
         };
-        Ok(toml::from_str(&text).unwrap_or_default())
+        // 壊れていたら既定値で続けない。既定値には期限が入っていないので、
+        // 期限切れの token を無期限に送り続けることになる。破損は必ず知らせる。
+        toml::from_str(&text).with_context(|| {
+            format!(
+                "{} が壊れています。消せば再取得からやり直せます",
+                paths::tildify(&path)
+            )
+        })
     }
 
     pub fn save(&self, env: &str) -> Result<()> {

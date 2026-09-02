@@ -84,7 +84,7 @@ fn literal_secret_name(raw: &str, r: &Redactor) -> Option<String> {
         Item::Header { name, value } if r.is_sensitive_header(&name) && !value.contains("{{") => {
             Some(name)
         }
-        Item::Field { name, value }
+        Item::Field { name, value } | Item::Query { name, value }
             if crate::redact::is_sensitive_field(&name) && !value.contains("{{") =>
         {
             Some(name)
@@ -96,6 +96,53 @@ fn literal_secret_name(raw: &str, r: &Redactor) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// `--raw` の本文に秘匿値が直書きされていないか。
+///
+/// item と違って `--raw` は構造を持たない文字列なので、名前で当たりを付ける。
+/// JSON として読めればキーを見る。読めなければ `password=` `token=` のような
+/// 綴りを探す。ここを見ていなかったとき、`--raw '{"password":"hunter2"}'` が
+/// `last.toml` と `requests.toml` に平文で残った。
+fn raw_literal_secret(raw: &str) -> Option<String> {
+    fn walk(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Object(o) => o.iter().find_map(|(k, val)| {
+                if crate::redact::is_sensitive_field(k) {
+                    if let serde_json::Value::String(s) = val {
+                        if !s.contains("{{") {
+                            return Some(k.clone());
+                        }
+                    }
+                }
+                walk(val)
+            }),
+            serde_json::Value::Array(a) => a.iter().find_map(walk),
+            _ => None,
+        }
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
+        return walk(&v);
+    }
+    // JSON でない本文(フォーム形式など)。`名前=値` と `"名前": "値"` を素朴に探す。
+    let lower = raw.to_ascii_lowercase();
+    ["password", "passwd", "token", "secret", "api_key", "apikey"]
+        .iter()
+        .find(|word| lower.contains(&format!("{word}=")) || lower.contains(&format!("\"{word}\"")))
+        .filter(|_| !raw.contains("{{"))
+        .map(|w| (*w).to_string())
+}
+
+/// URL のクエリに秘匿値が直書きされていないか。
+fn url_literal_secret(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.password().is_some_and(|p| !p.contains("{{")) {
+        return Some("URL のパスワード".to_string());
+    }
+    parsed.query_pairs().find_map(|(k, v)| {
+        (crate::redact::is_sensitive_field(&k) && !v.contains("{{")).then(|| k.to_string())
+    })
 }
 
 /// 直前のリクエストを記録する。直書きの秘匿値は値を落とし、名前だけ残す。
@@ -112,11 +159,24 @@ fn record_last(recipe: &Recipe) -> Result<()> {
             None => items.push(raw.clone()),
         }
     }
+
+    // `--raw` と URL も同じ扱いにする。片方だけ守っても意味がない。
+    let mut raw_body = recipe.raw.clone();
+    if let Some(name) = recipe.raw.as_deref().and_then(raw_literal_secret) {
+        redacted.push(format!("--raw の {name}"));
+        raw_body = None;
+    }
+    let mut url = recipe.url.clone();
+    if let Some(name) = url_literal_secret(&recipe.url) {
+        redacted.push(name);
+        url = r.url(&recipe.url);
+    }
+
     LastInvocation {
         method: recipe.method.clone(),
-        url: recipe.url.clone(),
+        url,
         items,
-        raw: recipe.raw.clone(),
+        raw: raw_body,
         form: recipe.form,
         redacted,
     }
@@ -162,7 +222,7 @@ fn build_vars(cfg: &Config, env: Option<&str>, cli_vars: &[String]) -> Result<Va
         .map(|s| vars::parse_assignment(s))
         .collect::<Result<_>>()?;
     layers.push(Layer::new("cli", cli, false));
-    layers.push(vars::layer_from_process_env());
+    layers.extend(vars::layer_from_process_env());
 
     if let Some(env) = env {
         layers.push(Layer::new("keychain", secrets::load_env(env)?, true));
@@ -209,9 +269,9 @@ fn expand_item(item: &Item, v: &Vars, warn: &mut Vec<String>) -> Result<Item> {
             let expanded = v.expand(&value.to_string())?.text;
             Item::RawField {
                 name: v.expand(name)?.text,
-                value: serde_json::from_str(&expanded).with_context(|| {
-                    format!("`{name}:=` は変数展開後に JSON でなくなりました: {expanded}")
-                })?,
+                // 展開後の文字列そのものは載せない。秘匿値が入っている可能性がある。
+                value: serde_json::from_str(&expanded)
+                    .with_context(|| format!("`{name}:=` は変数展開後に JSON でなくなりました"))?,
             }
         }
         Item::FileField { name, path } => Item::FileField {
@@ -219,6 +279,22 @@ fn expand_item(item: &Item, v: &Vars, warn: &mut Vec<String>) -> Result<Item> {
             path: v.expand(&path.to_string_lossy())?.text.into(),
         },
     })
+}
+
+/// エラーの連鎖から秘匿値を落として組み直す。
+///
+/// `main` は `err.chain()` をすべて標準エラーへ出す。展開後の URL や JSON 本文が
+/// context に載る経路があるので、そのままでは失敗のたびに秘匿値が表示される。
+/// 連鎖の構造は保ったまま、各段の文言だけマスクを通す。
+fn redact_error(r: &Redactor, err: anyhow::Error) -> anyhow::Error {
+    let mut messages: Vec<String> = err.chain().map(|c| r.text(&c.to_string())).collect();
+    // 一番奥から積み直す。
+    let deepest = messages.pop().unwrap_or_else(|| "不明なエラー".into());
+    let mut rebuilt = anyhow!(deepest);
+    for message in messages.into_iter().rev() {
+        rebuilt = rebuilt.context(message);
+    }
+    rebuilt
 }
 
 /// 期限切れの秘匿値を使おうとしていないか、送信前に確かめる。
@@ -258,10 +334,21 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
     let v = build_vars(&cfg, env.as_deref(), &common.vars)?;
 
     // テンプレートが参照している名前を集め、期限切れを送信前に捕まえる。
+    //
+    // URL と item だけを見ていると、`--raw '{"token":"{{access_token}}"}'` や
+    // 設定側の `[env.prd.headers] Authorization = "Bearer {{access_token}}"` を
+    // 取りこぼし、期限切れの token をそのまま送ってしまう。参照元は全部並べる。
     if let Some(env_name) = env.as_deref() {
         let mut referenced = Vars::referenced_names(&recipe.url);
         for item in &recipe.items {
             referenced.extend(Vars::referenced_names(item));
+        }
+        if let Some(raw) = &recipe.raw {
+            referenced.extend(Vars::referenced_names(raw));
+        }
+        for (name, value) in config_headers(&cfg, env.as_deref()) {
+            referenced.extend(Vars::referenced_names(&name));
+            referenced.extend(Vars::referenced_names(&value));
         }
         check_expiry(
             &State::load(env_name)?,
@@ -302,7 +389,15 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         eprintln!("{}", palette.dim(&format!("警告: {w}")));
     }
 
-    let url = v.expand(&recipe.url)?.text;
+    let expanded_url = v.expand(&recipe.url)?;
+    if expanded_url.used_secret {
+        // `{{base_url}}/x?key={{api_key}}` のように URL に直接書く形が一番自然なので、
+        // item のクエリだけ警告していても意味がない。URL はサーバのアクセスログ、
+        // プロキシ、Referer に残る。
+        warnings.push("URL に秘匿値を展開しました".to_string());
+        eprintln!("{}", palette.dim("警告: URL に秘匿値を展開しました"));
+    }
+    let url = expanded_url.text;
     let raw = recipe
         .raw
         .as_deref()
@@ -312,9 +407,21 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
 
     let method = Method::from_bytes(recipe.method.as_bytes())
         .with_context(|| format!("メソッドとして使えません: {}", recipe.method))?;
-    let plan = crate::http::plan(method, &url, &items, recipe.form, raw)?;
+    // ここから先のエラー文には展開後の値が載りうる(URL、JSON 本文)。
+    // main は原因の連鎖をすべて標準エラーへ出すので、その前に落とす。
+    let plan = crate::http::plan(method, &url, &items, recipe.form, raw)
+        .map_err(|e| redact_error(&redactor, e))?;
 
     redactor.learn_from_headers(plan.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // URL のクエリと userinfo。名前で URL 自体は落とせるが、値を覚えていないと
+    // それを本文に反響して返す API で素通りする。
+    redactor.learn_from_url(&plan.url);
+    // `--raw` はフィールドに分解されないので、JSON として読めるなら中を見る。
+    if let Some(body) = &plan.raw {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            redactor.learn_from_json(&parsed);
+        }
+    }
     // ボディに直書きされた秘匿値(`password=...`、`token=...`)も落とす。
     // ヘッダ名だけを見ていると、ログインの本文がまるごとダンプに残る。
     redactor.learn_from_fields(plan.fields.iter().map(|(k, v)| {
@@ -325,7 +432,9 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         (k.as_str(), text)
     }));
 
-    let sent = crate::http::send(&plan, common.timeout).await?;
+    let sent = crate::http::send(&plan, common.timeout)
+        .await
+        .map_err(|e| redact_error(&redactor, e))?;
 
     // キャプチャはマスク前の本文から取る。取った秘匿値はこの後のマスクに登録する。
     let captured = if recipe.capture_spec.is_empty() {
@@ -394,6 +503,12 @@ fn persist_capture(env: &str, got: &capture::Captured, p: &Palette) -> Result<()
     }
     let mut state = State::load(env)?;
     state.vars.extend(got.vars.clone());
+    // 取り直した値の古い期限は必ず捨てる。`extend` だけだと、期限を返さないログインで
+    // 過去の `expires_at` が残り続け、再ログインしても「期限切れ」と言われ続ける。
+    // 自律で動くエージェントはそこで無限に往復する。
+    for name in got.secrets.keys().chain(got.vars.keys()) {
+        state.expires_at.remove(name);
+    }
     state.expires_at.extend(got.expires_at.clone());
     state.save(env)?;
 
@@ -417,10 +532,21 @@ fn render(
     palette: &Palette,
 ) -> Result<()> {
     if let Some(expr) = &common.pick {
-        // ここだけは生の本文を使う。値そのものを取りに行く操作なので、
-        // マスクすると `--pick '.token'` が意味を失う。
         let body = body_as_json(res).context("--pick はレスポンスが JSON のときだけ使えます")?;
         let found = pick::pick(&body, expr)?;
+        // マスクを外すのは**単一の値**を取りに行ったときだけ。`--pick '.token'` を
+        // 成り立たせるための例外であって、`--pick '$'` で本文まるごとを無マスクで
+        // 引き出すための穴ではない。オブジェクトや配列が返ってきたら通常どおり落とす。
+        let found: Vec<serde_json::Value> = if found.iter().all(|v| {
+            !matches!(
+                v,
+                serde_json::Value::Object(_) | serde_json::Value::Array(_)
+            )
+        }) {
+            found
+        } else {
+            found.iter().map(|v| redactor.json(v)).collect()
+        };
         if found.is_empty() {
             // 空を黙って返すと「値が空文字だった」と区別がつかない。
             eprintln!(
@@ -598,12 +724,23 @@ fn secret(c: &SecretCommand) -> Result<Outcome> {
 }
 
 fn read_secret_from_stdin() -> Result<String> {
-    use std::io::{IsTerminal, Read};
-    if std::io::stdin().is_terminal() {
-        eprint!("値を入力して Enter (画面には残ります): ");
+    use std::io::{BufRead, IsTerminal, Read};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        // 端末では 1 行だけ読む。EOF まで待つと Enter を押しても返らず、
+        // 「入力して Enter」という案内が嘘になる。
+        eprint!("値を入力して Enter (入力は画面に表示されます): ");
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .context("標準入力から値を読めません")?;
+        return Ok(line.trim_end_matches(['\n', '\r']).to_string());
     }
+    // パイプ経由(`printf ... | ailo secret set`)では、末尾改行だけを落として全部使う。
     let mut buf = String::new();
-    std::io::stdin()
+    stdin
+        .lock()
         .read_to_string(&mut buf)
         .context("標準入力から値を読めません")?;
     Ok(buf.trim_end_matches(['\n', '\r']).to_string())
@@ -643,7 +780,23 @@ fn show(a: &ShowArgs) -> Result<Outcome> {
                 .with_context(|| format!("{n} 件目のダンプはありません"))?;
             dump::dump_path(entry)?
         }
-        _ => paths::dumps_dir()?.join(&a.target),
+        _ => {
+            // ダンプ置き場の外へ出さない。このツールの主利用者はエージェントで、
+            // レスポンスの中身に誘導されてパスを組み立てうる。任意のファイルを
+            // 標準出力に流せる口を残さない。
+            let dir = paths::dumps_dir()?;
+            let name = std::path::Path::new(&a.target);
+            let unsafe_component = name
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)));
+            if unsafe_component {
+                bail!(
+                    "`{}` は指定できません。`ailo log` に出るファイル名か、新しいものからの番号で指定してください",
+                    a.target
+                );
+            }
+            dir.join(name)
+        }
     };
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("{} を読めません", paths::tildify(&path)))?;

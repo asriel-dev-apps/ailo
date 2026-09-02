@@ -52,12 +52,28 @@ pub struct Vars {
 }
 
 /// プロセスの環境変数から `AILO_VAR_*` を集める。
-pub fn layer_from_process_env() -> Layer {
-    let values = std::env::vars()
-        .filter_map(|(k, v)| k.strip_prefix(ENV_PREFIX).map(|name| (name.to_string(), v)))
-        .collect();
-    // 環境変数で token を渡す運用(CI など)があるので秘匿扱いにする。
-    Layer::new("env", values, true)
+///
+/// 秘匿かどうかは**名前で判断する**。層ごと秘匿にすると `AILO_VAR_base_url` の値まで
+/// マスク対象になり、ダンプの索引が `{"url":"***/users"}` になる。
+/// 索引を grep して 1 件に辿り着けることは、このツールの中核機能なので壊せない。
+/// 秘匿として渡したい値は名前でそう分かるようにするか、`AILO_SECRET_*` を使う。
+pub fn layer_from_process_env() -> Vec<Layer> {
+    let mut plain = BTreeMap::new();
+    let mut secret = BTreeMap::new();
+    for (k, v) in std::env::vars() {
+        let Some(name) = k.strip_prefix(ENV_PREFIX) else {
+            continue;
+        };
+        if crate::redact::is_sensitive_field(name) {
+            secret.insert(name.to_string(), v);
+        } else {
+            plain.insert(name.to_string(), v);
+        }
+    }
+    vec![
+        Layer::new("env", secret, true),
+        Layer::new("env", plain, false),
+    ]
 }
 
 impl Vars {
@@ -93,8 +109,45 @@ impl Vars {
             .collect()
     }
 
+    /// 変数の値が変数を含む場合に、何回まで展開し直すか。
+    ///
+    /// `A = "{{B}}"` のような設定は普通に書かれる。1 回しか展開しないと `{{B}}` が
+    /// そのまま送信され、未解決を送信前に止めるという約束が破れる。
+    /// 循環参照で止まらなくならないよう上限を置く。
+    const MAX_PASSES: usize = 8;
+
     /// テンプレートを展開する。未解決があれば送信前に落とす。
+    ///
+    /// 展開結果にまだ変数が残っていれば、解決できなくなるまで繰り返す。
     pub fn expand(&self, template: &str) -> Result<Expanded> {
+        let mut current = self.expand_once(template)?;
+        for _ in 1..Self::MAX_PASSES {
+            if !current.text.contains("{{") {
+                return Ok(current);
+            }
+            let next = self.expand_once(&current.text)?;
+            if next.text == current.text {
+                // これ以上変わらない。閉じていない `{{` などが残っているだけ。
+                return Ok(current);
+            }
+            current = Expanded {
+                text: next.text,
+                used_secret: current.used_secret || next.used_secret,
+            };
+        }
+        if Self::referenced_names(&current.text)
+            .iter()
+            .any(|n| self.resolved.contains_key(n))
+        {
+            bail!(
+                "変数の展開が {} 回で終わりませんでした。変数どうしが循環参照している可能性があります",
+                Self::MAX_PASSES
+            );
+        }
+        Ok(current)
+    }
+
+    fn expand_once(&self, template: &str) -> Result<Expanded> {
         let mut out = String::with_capacity(template.len());
         let mut missing: Vec<String> = Vec::new();
         let mut used_secret = false;
@@ -256,6 +309,50 @@ mod tests {
     }
 
     #[test]
+    fn a_variable_whose_value_is_itself_a_variable_is_fully_expanded() {
+        // 1 回しか展開しないと `{{token}}` がそのまま送信され、
+        // 「未解決は送信前に止める」という約束が破れる。
+        let v = Vars::from_layers(vec![
+            Layer::new(
+                "cli",
+                map([("auth".into(), "Bearer {{token}}".into())]),
+                false,
+            ),
+            Layer::new(
+                "keychain",
+                map([("token".into(), "s3cr3t-token-value".into())]),
+                true,
+            ),
+        ]);
+        let e = v.expand("{{auth}}").unwrap();
+        assert_eq!(e.text, "Bearer s3cr3t-token-value");
+        // 間接的に秘匿値を使ったことも伝わること。伝わらないとマスクから漏れる。
+        assert!(e.used_secret, "間接参照で秘匿の印が落ちている");
+    }
+
+    #[test]
+    fn an_unresolvable_variable_introduced_by_expansion_is_reported() {
+        let v = Vars::from_layers(vec![Layer::new(
+            "cli",
+            map([("auth".into(), "Bearer {{nope}}".into())]),
+            false,
+        )]);
+        let err = v.expand("{{auth}}").unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[test]
+    fn a_reference_cycle_stops_instead_of_looping_forever() {
+        let v = Vars::from_layers(vec![Layer::new(
+            "cli",
+            map([("a".into(), "{{b}}".into()), ("b".into(), "{{a}}".into())]),
+            false,
+        )]);
+        let err = v.expand("{{a}}").unwrap_err().to_string();
+        assert!(err.contains("循環"), "{err}");
+    }
+
+    #[test]
     fn text_without_variables_passes_through_unchanged() {
         assert_eq!(vars().expand("plain").unwrap().text, "plain");
     }
@@ -288,13 +385,36 @@ mod tests {
         // 裸の環境変数名を拾うと PATH や HOME まで変数になる。
         std::env::set_var("AILO_VAR_from_env", "yes");
         std::env::set_var("NOT_AN_AILO_VAR", "no");
-        let layer = layer_from_process_env();
-        assert_eq!(
-            layer.values.get("from_env").map(String::as_str),
-            Some("yes")
-        );
-        assert!(!layer.values.contains_key("NOT_AN_AILO_VAR"));
+        let layers = layer_from_process_env();
+        let found = layers
+            .iter()
+            .find_map(|l| l.values.get("from_env"))
+            .map(String::as_str);
+        assert_eq!(found, Some("yes"));
+        assert!(layers
+            .iter()
+            .all(|l| !l.values.contains_key("NOT_AN_AILO_VAR")));
         std::env::remove_var("AILO_VAR_from_env");
         std::env::remove_var("NOT_AN_AILO_VAR");
+    }
+
+    #[test]
+    fn a_plain_env_variable_is_not_treated_as_a_secret() {
+        // 層ごと秘匿にすると base_url の値までマスク対象になり、
+        // ダンプの索引が `{"url":"***/users"}` になって grep が壊れる。
+        std::env::set_var("AILO_VAR_base_url", "https://example.com");
+        std::env::set_var("AILO_VAR_api_token", "s3cr3t-token-value");
+        let v = Vars::from_layers(layer_from_process_env());
+        assert!(
+            !v.get("base_url").unwrap().secret,
+            "base_url が秘匿扱いになっている"
+        );
+        assert!(
+            v.get("api_token").unwrap().secret,
+            "token が秘匿扱いになっていない"
+        );
+        assert_eq!(v.secret_values(), vec!["s3cr3t-token-value"]);
+        std::env::remove_var("AILO_VAR_base_url");
+        std::env::remove_var("AILO_VAR_api_token");
     }
 }

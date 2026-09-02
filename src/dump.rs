@@ -140,15 +140,27 @@ fn timestamps() -> (String, String) {
 }
 
 /// 同一秒に複数リクエストを投げてもファイル名が衝突しないようにする短い接尾辞。
-fn suffix() -> String {
+///
+/// `attempt` は衝突したときのやり直し回数。同じナノ秒・同じ pid で当たった場合でも
+/// 別の綴りになるようにする。
+fn suffix_for(attempt: u32) -> String {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    format!("{:04x}", (nanos ^ std::process::id()) & 0xffff)
+    format!(
+        "{:04x}",
+        (nanos ^ std::process::id() ^ attempt.wrapping_mul(0x9e37)) & 0xffff
+    )
 }
 
 fn ensure_dir(dir: &Path) -> Result<()> {
+    // すでにあるディレクトリのパーミッションは触らない。
+    // `AILO_DUMP_DIR` が既存の共有ディレクトリを指していた場合、こちらの都合で
+    // 0700 に書き換えてしまう。作るときだけ絞る。
+    if dir.exists() {
+        return Ok(());
+    }
     fs::create_dir_all(dir).with_context(|| format!("{} を作成できません", dir.display()))?;
     // 認証情報が入りうるので、他ユーザーからは見せない。
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
@@ -161,20 +173,37 @@ pub fn write(dump: &Dump, redactor: &Redactor, retention: &Retention) -> Result<
     let dir = paths::dumps_dir()?;
     ensure_dir(&dir)?;
 
-    let (_, file_ts) = timestamps();
-    let filename = format!("{file_ts}-{}.json", suffix());
-    let path = dir.join(&filename);
-
     let mut redacted = dump.clone();
     apply(&mut redacted, redactor);
-
     let json = serde_json::to_string_pretty(&redacted)?;
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("{} を作成できません", path.display()))?;
+
+    // 接尾辞は 16 ビットしかないので衝突しうる。`create_new` なので既存を壊しはしないが、
+    // **リクエストは既に送り終えている**。ここで諦めると記録だけが失われるので、
+    // 別の接尾辞で数回やり直す。
+    let (filename, path, mut f) = {
+        let (_, file_ts) = timestamps();
+        let mut chosen = None;
+        for attempt in 0..8 {
+            let filename = format!("{file_ts}-{}.json", suffix_for(attempt));
+            let path = dir.join(&filename);
+            match OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(f) => {
+                    chosen = Some((filename, path, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("{} を作成できません", path.display()))
+                }
+            }
+        }
+        chosen.ok_or_else(|| anyhow::anyhow!("{} にダンプを作成できません", dir.display()))?
+    };
     f.write_all(json.as_bytes())?;
     f.write_all(b"\n")?;
 
@@ -201,7 +230,7 @@ pub fn write(dump: &Dump, redactor: &Redactor, retention: &Retention) -> Result<
 /// ダンプ全体にマスクを適用する。書き出す直前に必ず通す。
 fn apply(dump: &mut Dump, r: &Redactor) {
     dump.redacted = r.is_enabled();
-    dump.request.url = r.text(&dump.request.url);
+    dump.request.url = r.url(&dump.request.url);
     dump.request.headers = dump
         .request
         .headers
@@ -247,8 +276,60 @@ fn append_index(entry: &IndexEntry, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// 掃除中であることを示すロック。これより古いロックは残骸とみなして奪う。
+const PRUNE_LOCK_STALE_SECS: u64 = 60;
+
+/// 掃除の排他を取る。取れなければ `None`。
+///
+/// 索引の追記は O_APPEND の 1 行書きなので競合しない。危ないのは掃除のほうで、
+/// 「全部読む → 書き直す → rename」の途中に別プロセスが追記すると、その行が消える。
+/// 掃除は後回しにしても困らないので、取れなければ黙って見送る。
+fn acquire_prune_lock(dir: &Path) -> Option<PruneLock> {
+    let path = dir.join("prune.lock");
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+    {
+        Ok(_) => Some(PruneLock { path }),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // 掃除の途中で落ちるとロックが残る。古すぎるものは奪って進む。
+            let stale = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .and_then(|t| {
+                    SystemTime::now()
+                        .duration_since(t)
+                        .map_err(|_| std::io::Error::other("時刻が巻き戻っている"))
+                })
+                .map(|age| age.as_secs() > PRUNE_LOCK_STALE_SECS)
+                .unwrap_or(false);
+            if stale {
+                let _ = fs::remove_file(&path);
+            }
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+struct PruneLock {
+    path: PathBuf,
+}
+
+impl Drop for PruneLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// 保持条件を超えたダンプを消し、索引からも該当行を落とす。
 fn prune(dir: &Path, retention: &Retention) -> Result<()> {
+    // 排他が取れなければ見送る。別プロセスが掃除中か、直後に掃除される。
+    let Some(_lock) = acquire_prune_lock(dir) else {
+        return Ok(());
+    };
+
     let index = dir.join("index.jsonl");
     let Ok(content) = fs::read_to_string(&index) else {
         return Ok(());
@@ -274,16 +355,14 @@ fn prune(dir: &Path, retention: &Retention) -> Result<()> {
         return Ok(());
     }
 
-    for (_, e) in &dropped {
-        let _ = fs::remove_file(dir.join(&e.dump));
-    }
-
+    // 先に索引を差し替え、そのあとで実体を消す。逆にすると、途中で落ちたときに
+    // 「索引にあるのにファイルが無い」状態になり、`ailo show` が理由なく失敗する。
     let rewritten: String = kept
         .iter()
         .filter_map(|(_, e)| serde_json::to_string(e).ok())
         .map(|l| format!("{l}\n"))
         .collect();
-    let tmp = index.with_extension("jsonl.tmp");
+    let tmp = index.with_extension(format!("jsonl.tmp.{}", std::process::id()));
     {
         let mut f = OpenOptions::new()
             .create(true)
@@ -292,8 +371,56 @@ fn prune(dir: &Path, retention: &Retention) -> Result<()> {
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(rewritten.as_bytes())?;
+        f.sync_all()?;
     }
     fs::rename(&tmp, &index)?;
+
+    for (_, e) in &dropped {
+        let _ = fs::remove_file(dir.join(&e.dump));
+    }
+
+    let referenced: std::collections::HashSet<&str> =
+        kept.iter().map(|(_, e)| e.dump.as_str()).collect();
+    remove_orphans(dir, &referenced, retention)?;
+    Ok(())
+}
+
+/// 索引から辿れなくなったダンプを消す。
+///
+/// 削除の対象を索引の行からしか辿らないと、何かの拍子に索引から落ちたダンプが
+/// **保持期間を超えて永久に残る**。ダンプには認証情報が入りうるので、
+/// 残留そのものがリスクになる。実体側からも掃く。
+fn remove_orphans(
+    dir: &Path,
+    referenced: &std::collections::HashSet<&str>,
+    retention: &Retention,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let max_age = std::time::Duration::from_secs(retention.keep_days * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(".json") || referenced.contains(name) {
+            continue;
+        }
+        // 書かれた直後のダンプを消さないよう、保持期間を過ぎたものだけにする。
+        // 並行して走っている別プロセスが、まだ索引に載せていない可能性がある。
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| {
+                SystemTime::now()
+                    .duration_since(t)
+                    .map_err(|_| std::io::Error::other("時刻が巻き戻っている"))
+            })
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if too_old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
     Ok(())
 }
 

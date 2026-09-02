@@ -13,7 +13,7 @@ const SERVICE: &str = "ailo";
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error(
-        "この OS の永続的な認証情報ストアには対応していません。AILO_SECRET_<ENV>_<KEY> を使ってください"
+        "この OS の永続的な認証情報ストアには対応していません。環境変数 AILO_SECRET_<ENV>_<KEY> を使ってください"
     )]
     UnsupportedPlatform,
     #[error("security コマンドの起動に失敗しました: {0}")]
@@ -23,20 +23,20 @@ pub enum AuthError {
     #[error("認証情報に制御文字を含めることはできません ({field})")]
     InvalidInput { field: &'static str },
     #[error(
-        "libsecret が見つかりません。デスクトップ環境では libsecret を導入、headless では AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
+        "libsecret が見つかりません。デスクトップ環境では libsecret を導入、headless では環境変数 AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
     )]
     LibsecretUnavailable(String),
     #[error(
-        "libsecret の必要な機能を読み込めません。libsecret を更新するか AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
+        "libsecret の必要な機能を読み込めません。libsecret を更新するか環境変数 AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
     )]
     LibsecretSymbol(String),
     #[error(
-        "Secret Service へのアクセスに失敗しました。デスクトップのキーリングを確認するか、headless では AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
+        "Secret Service へのアクセスに失敗しました。デスクトップのキーリングを確認するか、headless では環境変数 AILO_SECRET_<ENV>_<KEY> を使ってください: {0}"
     )]
     SecretService(String),
     #[error("Secret Service が不正な文字列を返しました")]
     InvalidSecret,
-    #[error("Keychain の保存値を読み取れません。logout して再ログインしてください")]
+    #[error("保存された値を読み取れません。`ailo secret set <env> <キー>` で入れ直してください")]
     InvalidStoredSecret,
 }
 
@@ -325,7 +325,8 @@ mod security_cli {
             let error = map_load_result(true, Some(0), b"not-hex\n", b"")
                 .expect_err("invalid stored value");
             assert!(matches!(error, AuthError::InvalidStoredSecret));
-            assert!(error.to_string().contains("logout して再ログイン"));
+            // 復旧手段は ailo に実在するコマンドで示すこと。流用元の `logout` は無い。
+            assert!(error.to_string().contains("ailo secret set"));
         }
 
         #[test]

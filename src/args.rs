@@ -54,7 +54,7 @@ fn split_on_separator(input: &str) -> Option<(String, &'static str, String)> {
     let mut i = 0usize;
 
     while i < bytes.len() {
-        if bytes[i] == '\\' && i + 1 < bytes.len() {
+        if bytes[i] == '\\' && i + 1 < bytes.len() && is_escapable(bytes[i + 1]) {
             head.push(bytes[i + 1]);
             i += 2;
             continue;
@@ -70,14 +70,26 @@ fn split_on_separator(input: &str) -> Option<(String, &'static str, String)> {
     None
 }
 
+/// `\` が escape として働く相手。
+///
+/// 何でも escape してしまうと、`file@C:\tmp\auth.txt` が `C:tmpauth.txt` になり、
+/// **指定したのと違うファイルを送る**。escape の目的は区切り文字を値に入れることなので、
+/// 相手は区切り文字と `\` 自身だけでよい。
+fn is_escapable(c: char) -> bool {
+    matches!(c, ':' | '=' | '@' | '\\')
+}
+
 fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            if let Some(next) = chars.next() {
-                out.push(next);
-                continue;
+            if let Some(&next) = chars.peek() {
+                if is_escapable(next) {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
             }
         }
         out.push(c);
@@ -111,11 +123,22 @@ pub fn parse_item(input: &str) -> Result<Item> {
             name,
             path: PathBuf::from(value),
         },
-        ":" => Item::Header {
-            name,
-            // `Name: value` と `Name:value` の両方を受ける。
-            value: value.trim_start().to_string(),
-        },
+        ":" => {
+            // `filter:status==open` は「`filter` というヘッダ」とも
+            // 「`filter:status` というクエリ」とも読める。黙ってどちらかに決めると、
+            // 意図と違うリクエストがエラーも出さずに飛ぶ。曖昧なら落とす。
+            if value.contains("==") || value.contains(":=") {
+                bail!(
+                    "`{input}` はヘッダともクエリとも読めます。ヘッダなら `\\:` で区切りを escape し、キーに `:` を含むクエリなら `{}` のように書いてください",
+                    input.replacen(':', "\\:", 1)
+                );
+            }
+            Item::Header {
+                name,
+                // `Name: value` と `Name:value` の両方を受ける。
+                value: value.trim_start().to_string(),
+            }
+        }
         _ => unreachable!("SEPARATORS に無い区切りが返された"),
     })
 }
@@ -215,6 +238,58 @@ mod tests {
                 path: PathBuf::from("./a.png")
             }
         );
+    }
+
+    #[test]
+    fn an_item_that_reads_as_both_header_and_query_is_rejected_loudly() {
+        // 黙ってヘッダにすると、意図したクエリが飛ばないままエラーも出ない。
+        let err = parse_item("filter:status==open").unwrap_err().to_string();
+        assert!(err.contains("ヘッダ"), "{err}");
+        assert!(err.contains("escape"), "次にやることを示していない: {err}");
+    }
+
+    #[test]
+    fn escaping_the_colon_resolves_the_ambiguity_towards_a_query() {
+        assert_eq!(
+            parse_item(r"filter\:status==open").unwrap(),
+            Item::Query {
+                name: "filter:status".into(),
+                value: "open".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_normal_header_whose_value_contains_a_single_equals_is_still_fine() {
+        // `==` を含まない限り曖昧ではない。ここまで拒むとヘッダが書けなくなる。
+        assert_eq!(
+            parse_item("Cookie: sid=abc").unwrap(),
+            Item::Header {
+                name: "Cookie".into(),
+                value: "sid=abc".into()
+            }
+        );
+    }
+
+    #[test]
+    fn backslashes_that_are_not_escaping_a_separator_are_kept() {
+        // 何でも escape すると、Windows のパスや正規表現が黙って壊れる。
+        assert_eq!(
+            parse_item(r"file@C:\tmp\auth.txt").unwrap(),
+            Item::FileField {
+                name: "file".into(),
+                path: PathBuf::from(r"C:\tmp\auth.txt"),
+            }
+        );
+        assert_eq!(
+            parse_item(r"pattern=\d+\w+").unwrap(),
+            field("pattern", r"\d+\w+")
+        );
+    }
+
+    #[test]
+    fn a_backslash_can_still_escape_itself() {
+        assert_eq!(parse_item(r"a=b\\c").unwrap(), field("a", r"b\c"));
     }
 
     #[test]

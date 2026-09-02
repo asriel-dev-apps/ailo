@@ -124,10 +124,33 @@ pub struct Sent {
     pub response: ResponseRecord,
 }
 
+/// https から http へ落とすリダイレクトを拒む。
+///
+/// reqwest は host か実効ポートが変われば `Authorization` を落とすが、
+/// **scheme だけが変わる場合**は同一 origin とみなして落とさない。
+/// `https://host:443/` → `http://host:443/` はホストもポートも同じなので、
+/// 認証ヘッダが平文で流れる。既定のリダイレクト上限は保ったまま、これだけ止める。
+fn no_downgrade_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let previous_was_https = attempt
+            .previous()
+            .last()
+            .is_some_and(|u| u.scheme() == "https");
+        if previous_was_https && attempt.url().scheme() == "http" {
+            return attempt.error("https から http へのリダイレクトを拒否しました");
+        }
+        if attempt.previous().len() >= 10 {
+            return attempt.error("リダイレクトが 10 回を超えました");
+        }
+        attempt.follow()
+    })
+}
+
 pub async fn send(plan: &Plan, timeout_secs: u64) -> Result<Sent> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .user_agent(concat!("ailo/", env!("CARGO_PKG_VERSION")))
+        .redirect(no_downgrade_policy())
         .build()
         .context("HTTP クライアントを初期化できません")?;
 
@@ -194,10 +217,14 @@ pub async fn send(plan: &Plan, timeout_secs: u64) -> Result<Sent> {
     req = req.headers(header_map(&plan.headers)?);
 
     let started = Instant::now();
-    let res = req
-        .send()
-        .await
-        .with_context(|| format!("{} へのリクエストが失敗しました", plan.url))?;
+    // エラー文には展開後の URL を載せない。クエリや userinfo に秘匿値が入っていると、
+    // 失敗のたびに標準エラーへ出る。原因の切り分けに要るのは宛先だけ。
+    let res = req.send().await.with_context(|| {
+        format!(
+            "{} へのリクエストが失敗しました",
+            plan.url.host_str().unwrap_or("宛先")
+        )
+    })?;
     let status = res.status();
 
     let res_headers: BTreeMap<String, String> = res
