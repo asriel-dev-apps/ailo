@@ -30,10 +30,16 @@ pub const DEFAULT_KEEP_DAYS: u64 = 7;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BodyRecord {
-    Json { value: Value },
-    Text { text: String },
+    Json {
+        value: Value,
+    },
+    Text {
+        text: String,
+    },
     /// 本文が JSON でもテキストでもない場合。中身は保存せず大きさだけ残す。
-    Binary { bytes: usize },
+    Binary {
+        bytes: usize,
+    },
     Empty,
 }
 
@@ -255,9 +261,7 @@ fn prune(dir: &Path, retention: &Retention) -> Result<()> {
         .collect();
 
     let cutoff = OffsetDateTime::now_utc() - time::Duration::days(retention.keep_days as i64);
-    let too_old = |e: &IndexEntry| {
-        OffsetDateTime::parse(&e.ts, &Rfc3339).is_ok_and(|t| t < cutoff)
-    };
+    let too_old = |e: &IndexEntry| OffsetDateTime::parse(&e.ts, &Rfc3339).is_ok_and(|t| t < cutoff);
 
     // 新しいほうから keep_count 件だけ残す。
     let start = entries.len().saturating_sub(retention.keep_count);
@@ -316,7 +320,9 @@ pub fn dump_path(entry: &IndexEntry) -> Result<PathBuf> {
 
 /// ダンプディレクトリが存在することだけ確かめる(`ailo log` などで使う)。
 pub fn dumps_exist() -> bool {
-    paths::index_path().map(|p| File::open(p).is_ok()).unwrap_or(false)
+    paths::index_path()
+        .map(|p| File::open(p).is_ok())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -400,7 +406,9 @@ mod tests {
 
     #[test]
     fn body_text_renders_json_for_the_digest() {
-        let b = BodyRecord::Json { value: json!({"a": 1}) };
+        let b = BodyRecord::Json {
+            value: json!({"a": 1}),
+        };
         assert!(b.as_text().unwrap().contains("\"a\""));
         assert!(BodyRecord::Binary { bytes: 3 }.as_text().is_none());
     }

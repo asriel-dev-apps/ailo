@@ -9,7 +9,9 @@ use time::OffsetDateTime;
 
 use crate::args::{self, Item};
 use crate::capture;
-use crate::cli::{Command, CommonArgs, LogArgs, RequestArgs, RunArgs, SaveArgs, SecretCommand, ShowArgs};
+use crate::cli::{
+    Command, CommonArgs, LogArgs, RequestArgs, RunArgs, SaveArgs, SecretCommand, ShowArgs,
+};
 use crate::config::{Config, LastInvocation, Requests, SavedRequest, State};
 use crate::dump::{self, Dump, Retention};
 use crate::output::{self, Format, Palette};
@@ -261,7 +263,11 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         for item in &recipe.items {
             referenced.extend(Vars::referenced_names(item));
         }
-        check_expiry(&State::load(env_name)?, &referenced, OffsetDateTime::now_utc())?;
+        check_expiry(
+            &State::load(env_name)?,
+            &referenced,
+            OffsetDateTime::now_utc(),
+        )?;
     }
 
     let mut redactor = if common.no_redact {
@@ -297,7 +303,12 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
     }
 
     let url = v.expand(&recipe.url)?.text;
-    let raw = recipe.raw.as_deref().map(|r| v.expand(r)).transpose()?.map(|e| e.text);
+    let raw = recipe
+        .raw
+        .as_deref()
+        .map(|r| v.expand(r))
+        .transpose()?
+        .map(|e| e.text);
 
     let method = Method::from_bytes(recipe.method.as_bytes())
         .with_context(|| format!("メソッドとして使えません: {}", recipe.method))?;
@@ -367,7 +378,13 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         persist_capture(env_name, &got, &palette)?;
     }
 
-    render(&sent.response, dump_path.as_deref(), common, &redactor, &palette)?;
+    render(
+        &sent.response,
+        dump_path.as_deref(),
+        common,
+        &redactor,
+        &palette,
+    )?;
     Ok(exit_for(sent.response.status, common.fail))
 }
 
@@ -402,12 +419,14 @@ fn render(
     if let Some(expr) = &common.pick {
         // ここだけは生の本文を使う。値そのものを取りに行く操作なので、
         // マスクすると `--pick '.token'` が意味を失う。
-        let body = body_as_json(res)
-            .context("--pick はレスポンスが JSON のときだけ使えます")?;
+        let body = body_as_json(res).context("--pick はレスポンスが JSON のときだけ使えます")?;
         let found = pick::pick(&body, expr)?;
         if found.is_empty() {
             // 空を黙って返すと「値が空文字だった」と区別がつかない。
-            eprintln!("{}", palette.dim(&format!("`{expr}` に一致する値はありません")));
+            eprintln!(
+                "{}",
+                palette.dim(&format!("`{expr}` に一致する値はありません"))
+            );
         } else {
             println!("{}", pick::render(&found));
         }
@@ -454,9 +473,8 @@ fn body_as_json(res: &crate::dump::ResponseRecord) -> Result<serde_json::Value> 
 // -------------------------------------------------------------------- 保存系
 
 fn save(a: &SaveArgs) -> Result<Outcome> {
-    let last = LastInvocation::load()?.ok_or_else(|| {
-        anyhow!("保存できるリクエストがありません。先に 1 回送信してください")
-    })?;
+    let last = LastInvocation::load()?
+        .ok_or_else(|| anyhow!("保存できるリクエストがありません。先に 1 回送信してください"))?;
 
     if !last.redacted.is_empty() {
         // 直書きの値を保存すると、平文の秘匿値が設定ファイルに残る。
@@ -526,7 +544,10 @@ fn list_envs() -> Result<Outcome> {
         }
     }
     if names.is_empty() {
-        println!("環境はまだありません。{} に書いてください", paths::tildify(&Config::path()?));
+        println!(
+            "環境はまだありません。{} に書いてください",
+            paths::tildify(&Config::path()?)
+        );
         return Ok(OK);
     }
     names.sort();

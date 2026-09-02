@@ -111,7 +111,9 @@ fn content_type(res: &ResponseRecord) -> &str {
 
 /// `200 OK  312ms  4.2 KB  application/json`
 pub fn status_line(res: &ResponseRecord, p: &Palette) -> String {
-    let head = format!("{} {}", res.status, res.status_text).trim_end().to_string();
+    let head = format!("{} {}", res.status, res.status_text)
+        .trim_end()
+        .to_string();
     format!(
         "{}  {}  {}  {}",
         p.status(res.status, &head),
@@ -142,9 +144,7 @@ pub fn digest(
                 out.push(p.key(&format!("body ({total} lines):")));
                 out.push(text);
             } else {
-                out.push(p.key(&format!(
-                    "body (first {head_lines} lines of {total}):"
-                )));
+                out.push(p.key(&format!("body (first {head_lines} lines of {total}):")));
                 let head: Vec<&str> = text.lines().take(head_lines).collect();
                 out.push(head.join("\n"));
                 out.push(p.dim(&format!(
@@ -211,7 +211,10 @@ mod tests {
         ResponseRecord {
             status: 200,
             status_text: "OK".into(),
-            headers: BTreeMap::from([("content-type".into(), "application/json; charset=utf-8".into())]),
+            headers: BTreeMap::from([(
+                "content-type".into(),
+                "application/json; charset=utf-8".into(),
+            )]),
             body,
             bytes,
             ms: 312,
@@ -252,7 +255,11 @@ mod tests {
         assert!(out.contains("first 20 lines of"), "{out}");
         assert!(out.contains("残り"), "{out}");
         // 打ち切りが効いていること。効いていなければ 300 行以上になる。
-        assert!(out.lines().count() < 30, "打ち切れていない: {}", out.lines().count());
+        assert!(
+            out.lines().count() < 30,
+            "打ち切れていない: {}",
+            out.lines().count()
+        );
     }
 
     #[test]
@@ -278,13 +285,21 @@ mod tests {
 
     #[test]
     fn binary_bodies_report_size_instead_of_contents() {
-        let out = digest(&res(BodyRecord::Binary { bytes: 2048 }, 2048), None, 20, &Palette::plain());
+        let out = digest(
+            &res(BodyRecord::Binary { bytes: 2048 }, 2048),
+            None,
+            20,
+            &Palette::plain(),
+        );
         assert!(out.contains("2.0 KB"), "{out}");
     }
 
     #[test]
     fn machine_output_is_one_line_and_carries_no_body() {
-        let out = machine(&res(long_json(), 4300), Some(std::path::Path::new("/tmp/x.json")));
+        let out = machine(
+            &res(long_json(), 4300),
+            Some(std::path::Path::new("/tmp/x.json")),
+        );
         assert!(!out.contains('\n'), "{out}");
         assert!(!out.contains("items"), "本文が漏れている: {out}");
         assert!(out.contains("\"status\":200"), "{out}");

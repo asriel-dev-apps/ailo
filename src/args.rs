@@ -20,11 +20,26 @@ use anyhow::{bail, Context, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
-    Header { name: String, value: String },
-    Query { name: String, value: String },
-    Field { name: String, value: String },
-    RawField { name: String, value: serde_json::Value },
-    FileField { name: String, path: PathBuf },
+    Header {
+        name: String,
+        value: String,
+    },
+    Query {
+        name: String,
+        value: String,
+    },
+    Field {
+        name: String,
+        value: String,
+    },
+    RawField {
+        name: String,
+        value: serde_json::Value,
+    },
+    FileField {
+        name: String,
+        path: PathBuf,
+    },
 }
 
 /// 長いものから順に見る。`:=` を `:` より先に、`==` を `=` より先に判定する必要がある。
@@ -85,7 +100,10 @@ pub fn parse_item(input: &str) -> Result<Item> {
             let parsed = serde_json::from_str(value.trim()).with_context(|| {
                 format!("`{name}:=` の値が JSON として読めません: {value}。文字列を渡すなら `{name}=` を使ってください")
             })?;
-            Item::RawField { name, value: parsed }
+            Item::RawField {
+                name,
+                value: parsed,
+            }
         }
         "==" => Item::Query { name, value },
         "=" => Item::Field { name, value },

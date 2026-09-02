@@ -72,7 +72,10 @@ pub fn load_env(env: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     // 索引に無くても環境変数で渡されたものは拾う。
-    let prefix = format!("{ENV_PREFIX}{}_", env.to_ascii_uppercase().replace(['-', '.'], "_"));
+    let prefix = format!(
+        "{ENV_PREFIX}{}_",
+        env.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(&prefix) {
             if !v.is_empty() {
@@ -161,8 +164,14 @@ mod tests {
 
     #[test]
     fn env_var_names_are_upper_case_and_underscored() {
-        assert_eq!(env_var_name("stg", "access_token"), "AILO_SECRET_STG_ACCESS_TOKEN");
-        assert_eq!(env_var_name("my-env", "api.key"), "AILO_SECRET_MY_ENV_API_KEY");
+        assert_eq!(
+            env_var_name("stg", "access_token"),
+            "AILO_SECRET_STG_ACCESS_TOKEN"
+        );
+        assert_eq!(
+            env_var_name("my-env", "api.key"),
+            "AILO_SECRET_MY_ENV_API_KEY"
+        );
     }
 
     #[test]

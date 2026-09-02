@@ -234,7 +234,10 @@ mod tests {
     #[test]
     fn an_unresolved_variable_stops_the_request_and_names_it() {
         // 空文字で送ってしまうと、返ってきた 401 の原因が分からなくなる。
-        let err = vars().expand("{{base_url}}/{{nope}}").unwrap_err().to_string();
+        let err = vars()
+            .expand("{{base_url}}/{{nope}}")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("nope"), "{err}");
         assert!(err.contains("--var"), "次にやることを示していない: {err}");
     }
@@ -286,7 +289,10 @@ mod tests {
         std::env::set_var("AILO_VAR_from_env", "yes");
         std::env::set_var("NOT_AN_AILO_VAR", "no");
         let layer = layer_from_process_env();
-        assert_eq!(layer.values.get("from_env").map(String::as_str), Some("yes"));
+        assert_eq!(
+            layer.values.get("from_env").map(String::as_str),
+            Some("yes")
+        );
         assert!(!layer.values.contains_key("NOT_AN_AILO_VAR"));
         std::env::remove_var("AILO_VAR_from_env");
         std::env::remove_var("NOT_AN_AILO_VAR");

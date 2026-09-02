@@ -90,16 +90,7 @@ fn merge(a: Shape, b: Shape) -> Shape {
             }
             Shape::Object(xs)
         }
-        (
-            Shape::Array {
-                len: la,
-                elem: ea,
-            },
-            Shape::Array {
-                len: lb,
-                elem: eb,
-            },
-        ) => Shape::Array {
+        (Shape::Array { len: la, elem: ea }, Shape::Array { len: lb, elem: eb }) => Shape::Array {
             // 要素数が違えば代表値を出せないので、大きいほうを見せる。
             len: la.max(lb),
             elem: Box::new(merge(*ea, *eb)),

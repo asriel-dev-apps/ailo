@@ -146,7 +146,10 @@ mod tests {
         .unwrap();
         assert_eq!(got.secrets["access_token"], "abc");
         assert_eq!(got.vars["user_id"], "7");
-        assert!(!got.vars.contains_key("access_token"), "秘匿値が平文側にいる");
+        assert!(
+            !got.vars.contains_key("access_token"),
+            "秘匿値が平文側にいる"
+        );
     }
 
     #[test]
@@ -223,13 +226,7 @@ mod tests {
     #[test]
     fn captured_secret_values_are_offered_for_masking() {
         let body = json!({"token": "s3cr3t-token-value"});
-        let got = capture(
-            &body,
-            &spec(&[("t", ".token")]),
-            &["t".into()],
-            now(),
-        )
-        .unwrap();
+        let got = capture(&body, &spec(&[("t", ".token")]), &["t".into()], now()).unwrap();
         assert_eq!(got.secret_values(), vec!["s3cr3t-token-value"]);
     }
 

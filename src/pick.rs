@@ -29,9 +29,8 @@ fn normalize(expr: &str) -> String {
 
 pub fn pick(value: &Value, expr: &str) -> Result<Vec<Value>> {
     let normalized = normalize(expr);
-    let path = JsonPath::parse(&normalized).with_context(|| {
-        format!("`{expr}` を式として解釈できません(JSONPath: `{normalized}`)")
-    })?;
+    let path = JsonPath::parse(&normalized)
+        .with_context(|| format!("`{expr}` を式として解釈できません(JSONPath: `{normalized}`)"))?;
     Ok(path.query(value).into_iter().cloned().collect())
 }
 

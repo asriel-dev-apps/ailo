@@ -376,7 +376,10 @@ mod security_cli {
             let _ = delete(service, account);
             let _cleanup = Cleanup { service, account };
             save(service, account, token).expect("save");
-            assert_eq!(load(service, account).expect("load").as_deref(), Some(token));
+            assert_eq!(
+                load(service, account).expect("load").as_deref(),
+                Some(token)
+            );
             delete(service, account).expect("delete");
             assert_eq!(load(service, account).expect("load after delete"), None);
         }
@@ -385,7 +388,7 @@ mod security_cli {
 
 #[allow(dead_code)] // 全 OS で型検査するが、呼び出すのは Linux dispatcher だけ。
 mod libsecret {
-    use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
+    use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
     use std::ptr;
 
     use libloading::{Library, Symbol};

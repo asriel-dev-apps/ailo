@@ -95,9 +95,7 @@ impl Config {
         let Ok(text) = fs::read_to_string(&path) else {
             return Ok(Self::default());
         };
-        toml::from_str(&text).with_context(|| {
-            format!("{} を読めません", paths::tildify(&path))
-        })
+        toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
     }
 
     /// 環境名を解決する。`--env` > `default_env`。
@@ -108,7 +106,9 @@ impl Config {
     }
 
     pub fn env_config(&self, env: Option<&str>) -> EnvConfig {
-        env.and_then(|e| self.env.get(e)).cloned().unwrap_or_default()
+        env.and_then(|e| self.env.get(e))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// 環境名が設定に存在するか。打ち間違いを送信前に捕まえるために使う。
@@ -254,9 +254,7 @@ impl State {
         use time::format_description::well_known::Rfc3339;
         self.expires_at
             .iter()
-            .filter(|(_, at)| {
-                time::OffsetDateTime::parse(at, &Rfc3339).is_ok_and(|t| t <= now)
-            })
+            .filter(|(_, at)| time::OffsetDateTime::parse(at, &Rfc3339).is_ok_and(|t| t <= now))
             .map(|(name, _)| name.as_str())
             .collect()
     }
