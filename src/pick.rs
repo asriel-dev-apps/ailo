@@ -24,11 +24,67 @@ fn normalize(expr: &str) -> String {
     // `.` と `[` を続けられない。これを許さないと、**トップレベルが配列のレスポンス**
     // (一覧系の API はたいていこれ)に対して `.[].title` が書けなくなる。
     let body = body.replace(".[", "[");
-    if body.starts_with('.') || body.starts_with('[') {
-        format!("${body}")
-    } else {
-        format!("$.{body}")
+    format!("${}", quote_awkward_names(&body))
+}
+
+/// ドット記法で書けない名前を `['...']` に直す。
+///
+/// JSONPath のドット記法は英数字と `_` しか使えない。`.headers.X-Tenant` や
+/// `.data.user-id` はそのままでは構文エラーになる。**HTTP クライアントなのに
+/// ヘッダ名が引けない**のは実用にならないので、ここで包み直す。
+fn quote_awkward_names(body: &str) -> String {
+    let is_plain_name = |s: &str| {
+        !s.is_empty()
+            && !s.starts_with(|c: char| c.is_ascii_digit())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        match chars[i] {
+            // 角括弧の中は JSONPath の構文そのものなので触らない。
+            '[' => {
+                let start = i;
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    if chars[i] == '[' {
+                        depth += 1;
+                    } else if chars[i] == ']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                out.extend(&chars[start..i]);
+            }
+            _ => {
+                if chars[i] == '.' {
+                    i += 1;
+                }
+                let start = i;
+                while i < chars.len() && chars[i] != '.' && chars[i] != '[' {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                if name.is_empty() {
+                    continue;
+                }
+                if is_plain_name(&name) {
+                    out.push('.');
+                    out.push_str(&name);
+                } else {
+                    out.push_str(&format!("['{}']", name.replace('\'', "\\'")));
+                }
+            }
+        }
     }
+    out
 }
 
 pub fn pick(value: &Value, expr: &str) -> Result<Vec<Value>> {
@@ -105,6 +161,35 @@ mod tests {
             pick(&doc(), ".data.items.[0].id").unwrap(),
             vec![json!("1")]
         );
+    }
+
+    #[test]
+    fn a_key_with_a_hyphen_can_be_reached() {
+        // HTTP クライアントなのでヘッダ名を引く場面が多い。ハイフンは普通に出る。
+        let v = json!({"headers": {"X-Tenant": "acme", "Content-Type": "application/json"}});
+        assert_eq!(pick(&v, ".headers.X-Tenant").unwrap(), vec![json!("acme")]);
+        assert_eq!(
+            pick(&v, ".headers.Content-Type").unwrap(),
+            vec![json!("application/json")]
+        );
+    }
+
+    #[test]
+    fn keys_needing_quotes_work_inside_longer_paths() {
+        let v = json!({"a": {"b-c": [{"d-e": 1}, {"d-e": 2}]}});
+        assert_eq!(pick(&v, ".a.b-c[].d-e").unwrap(), vec![json!(1), json!(2)]);
+    }
+
+    #[test]
+    fn a_key_that_starts_with_a_digit_is_reachable() {
+        let v = json!({"2fa": {"enabled": true}});
+        assert_eq!(pick(&v, ".2fa.enabled").unwrap(), vec![json!(true)]);
+    }
+
+    #[test]
+    fn plain_names_keep_dot_notation() {
+        // 包み直すのは必要なときだけ。無条件に括ると式が読みにくくなる。
+        assert_eq!(normalize(".data.items[*].id"), "$.data.items[*].id");
     }
 
     #[test]
