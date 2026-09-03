@@ -244,8 +244,29 @@ pub struct State {
     pub expires_at: BTreeMap<String, String>,
 }
 
+/// 環境名として使える文字。
+///
+/// 環境名はファイル名とキーチェーンの account 名の一部になる。素通しにすると
+/// `--env ../../../../tmp/x` で state ファイルをデータディレクトリの外へ書き出せる
+/// (実際に書けることを確認した)。名前は英数と `-` `_` `.` に限る。
+/// `.` は許すが、`.` だけ・`..` だけの名前は弾く。
+pub fn validate_env_name(env: &str) -> Result<()> {
+    let ok = !env.is_empty()
+        && env != "."
+        && env != ".."
+        && env
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("環境名 `{env}` は使えません。英数字と `-` `_` `.` だけで指定してください")
+    }
+}
+
 impl State {
     fn path(env: &str) -> Result<PathBuf> {
+        validate_env_name(env)?;
         Ok(paths::data_dir()?.join("state").join(format!("{env}.toml")))
     }
 
@@ -367,6 +388,23 @@ mod tests {
         .unwrap();
         assert!(text.contains("{{token}}"), "{text}");
         assert!(!text.contains("Bearer s3cr3t"), "{text}");
+    }
+
+    #[test]
+    fn an_environment_name_cannot_escape_the_data_directory() {
+        // 素通しにすると `--env ../../../../tmp/x` で state ファイルを
+        // データディレクトリの外へ書き出せた。実際に書けることを確認済み。
+        for bad in ["../x", "a/b", "..", ".", "", "a\0b", "x/../../y"] {
+            assert!(validate_env_name(bad).is_err(), "通してしまった: {bad:?}");
+        }
+        assert!(State::path("../evil").is_err());
+    }
+
+    #[test]
+    fn ordinary_environment_names_are_accepted() {
+        for good in ["stg", "prd", "dev-1", "my_env", "v1.2"] {
+            assert!(validate_env_name(good).is_ok(), "弾いてしまった: {good}");
+        }
     }
 
     #[test]

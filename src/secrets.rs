@@ -26,6 +26,25 @@ fn account(env: &str, key: &str) -> String {
     format!("{env}/{key}")
 }
 
+/// 環境名とキー名を検証する。
+///
+/// どちらも account 名の一部になり、環境名は state のファイル名にもなる。
+/// 素通しにすると `--env ../../x` でデータディレクトリの外へ書き出せる。
+/// キー名も同じ規則に揃える。環境ごとの名前空間が `/` で切られているので、
+/// キー名に `/` を許すと別の環境の値を指せてしまう。
+fn validate(env: &str, key: &str) -> Result<()> {
+    crate::config::validate_env_name(env)?;
+    let ok = !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        anyhow::bail!("キー名 `{key}` は使えません。英数字と `-` `_` `.` だけで指定してください")
+    }
+}
+
 /// `AILO_SECRET_<ENV>_<KEY>`。どちらも大文字にし、`-` は `_` に寄せる。
 pub fn env_var_name(env: &str, key: &str) -> String {
     let norm = |s: &str| s.to_ascii_uppercase().replace(['-', '.'], "_");
@@ -37,6 +56,7 @@ pub fn env_var_name(env: &str, key: &str) -> String {
 /// キーチェーンの無い環境(CI、コンテナ)でも動かせる経路を必ず残しておく。
 /// ここが無いと、キーチェーンが使えない場所で平文ファイルに書く誘惑が生まれる。
 pub fn get(env: &str, key: &str) -> Result<Option<String>> {
+    validate(env, key)?;
     if let Ok(v) = std::env::var(env_var_name(env, key)) {
         if !v.is_empty() {
             return Ok(Some(v));
@@ -47,6 +67,7 @@ pub fn get(env: &str, key: &str) -> Result<Option<String>> {
 }
 
 pub fn set(env: &str, key: &str, value: &str) -> Result<()> {
+    validate(env, key)?;
     crate::keychain::save(&account(env, key), value)
         .with_context(|| format!("`{env}` の `{key}` を保存できません"))?;
     Index::load()?.add(env, key)?;
@@ -54,6 +75,7 @@ pub fn set(env: &str, key: &str, value: &str) -> Result<()> {
 }
 
 pub fn remove(env: &str, key: &str) -> Result<()> {
+    validate(env, key)?;
     crate::keychain::delete(&account(env, key))
         .with_context(|| format!("`{env}` の `{key}` を削除できません"))?;
     Index::load()?.remove(env, key)?;
@@ -65,6 +87,7 @@ pub fn remove(env: &str, key: &str) -> Result<()> {
 /// 索引にあるのに読めないキーは黙って飛ばす。別のマシンで登録した索引を
 /// 同期した場合など、値だけが無い状態は普通に起こる。
 pub fn load_env(env: &str) -> Result<BTreeMap<String, String>> {
+    crate::config::validate_env_name(env)?;
     let mut out = BTreeMap::new();
     for key in Index::load()?.keys(env) {
         if let Ok(Some(v)) = get(env, &key) {
@@ -154,6 +177,15 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_name_cannot_reach_into_another_environment() {
+        // account 名は `env/key`。キー名に `/` を許すと別環境の値を指せる。
+        assert!(validate("stg", "../prd/access_token").is_err());
+        assert!(validate("stg", "a/b").is_err());
+        assert!(validate("../x", "token").is_err());
+        assert!(validate("stg", "access_token").is_ok());
+    }
 
     #[test]
     fn accounts_are_namespaced_by_environment() {
