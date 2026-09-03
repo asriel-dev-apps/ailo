@@ -1,1 +1,6 @@
 /target
+
+# エージェント向けの作業文書。手元には置くが公開しない。
+/AGENTS.md
+/HANDOFF.md
+/REQUIREMENTS.md
