@@ -57,7 +57,14 @@ pub fn plan(
                 Item::Query { name, value } => {
                     query.append_pair(name, value);
                 }
-                Item::Header { name, value } => headers.push((name.clone(), value.clone())),
+                Item::Header { name, value } => {
+                    // 同じ名前が既にあれば差し替える。設定の `[headers]` を
+                    // コマンドラインで上書きしたいのが普通の意図なのに、そのまま
+                    // 積むと**両方が送られる**。受け取り側の挙動はサーバ次第で、
+                    // どちらが効いたのか分からないまま話が進む。
+                    headers.retain(|(n, _): &(String, String)| !n.eq_ignore_ascii_case(name));
+                    headers.push((name.clone(), value.clone()));
+                }
                 Item::Field { name, value } => {
                     fields.push((name.clone(), Value::String(value.clone())))
                 }
@@ -402,6 +409,51 @@ mod tests {
     #[test]
     fn empty_response_is_distinguishable_from_an_empty_string() {
         assert_eq!(decode_body(b"", "application/json"), BodyRecord::Empty);
+    }
+
+    #[test]
+    fn a_later_header_replaces_an_earlier_one_of_the_same_name() {
+        // 設定の [headers] を後ろのコマンドライン指定で上書きするのが普通の意図。
+        // 積むと両方送られ、どちらが効いたのか分からないまま話が進む。
+        let p = plan(
+            Method::GET,
+            "https://example.com/u",
+            &items(&["Accept: application/json", "Accept: text/csv"]),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            p.headers,
+            vec![("Accept".to_string(), "text/csv".to_string())]
+        );
+    }
+
+    #[test]
+    fn header_replacement_ignores_case_in_the_name() {
+        let p = plan(
+            Method::GET,
+            "https://example.com/u",
+            &items(&["accept: application/json", "Accept: text/csv"]),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.headers.len(), 1, "{:?}", p.headers);
+        assert_eq!(p.headers[0].1, "text/csv");
+    }
+
+    #[test]
+    fn different_header_names_are_all_kept() {
+        let p = plan(
+            Method::GET,
+            "https://example.com/u",
+            &items(&["Accept: application/json", "X-Trace: abc"]),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.headers.len(), 2);
     }
 
     #[test]
