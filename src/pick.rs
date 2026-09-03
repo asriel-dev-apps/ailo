@@ -20,7 +20,11 @@ fn normalize(expr: &str) -> String {
     }
     // `.items[]` は「配列を展開する」の意。JSONPath では `[*]`。
     let body = trimmed.replace("[]", "[*]");
-    if body.starts_with('.') {
+    // jq は添字の前にも `.` を書ける(`.[]`、`.[0]`、`.items.[0]`)が、JSONPath では
+    // `.` と `[` を続けられない。これを許さないと、**トップレベルが配列のレスポンス**
+    // (一覧系の API はたいていこれ)に対して `.[].title` が書けなくなる。
+    let body = body.replace(".[", "[");
+    if body.starts_with('.') || body.starts_with('[') {
         format!("${body}")
     } else {
         format!("$.{body}")
@@ -73,6 +77,33 @@ mod tests {
         assert_eq!(
             pick(&doc(), ".data.items[].id").unwrap(),
             vec![json!("1"), json!("2")]
+        );
+    }
+
+    #[test]
+    fn a_top_level_array_can_be_expanded() {
+        // 一覧系の API はトップレベルが配列。`.[]` が書けないと使い物にならない。
+        let list = json!([{"title": "a"}, {"title": "b"}]);
+        assert_eq!(
+            pick(&list, ".[].title").unwrap(),
+            vec![json!("a"), json!("b")]
+        );
+    }
+
+    #[test]
+    fn a_top_level_array_can_be_indexed() {
+        let list = json!([{"title": "a"}, {"title": "b"}]);
+        assert_eq!(pick(&list, ".[0].title").unwrap(), vec![json!("a")]);
+        // `.` を省いた jq 以外の書き方も受ける。
+        assert_eq!(pick(&list, "[1].title").unwrap(), vec![json!("b")]);
+    }
+
+    #[test]
+    fn a_dot_before_an_index_is_accepted_mid_path() {
+        // jq は `.data.items.[0]` とも書ける。JSONPath は `.` と `[` を続けられない。
+        assert_eq!(
+            pick(&doc(), ".data.items.[0].id").unwrap(),
+            vec![json!("1")]
         );
     }
 
