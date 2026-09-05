@@ -76,6 +76,13 @@ struct Request {
 }
 
 fn handle(mut stream: TcpStream) -> std::io::Result<()> {
+    // **必ず時間で切る。** クライアント側の送り方が変わって(chunked など)
+    // 宣言された本文が来なくなったとき、待ち続けると失敗ではなく**ハング**になる。
+    // CI が無期限に止まるのは、テストが赤くなるより遥かにたちが悪い。
+    let limit = std::time::Duration::from_secs(5);
+    stream.set_read_timeout(Some(limit))?;
+    stream.set_write_timeout(Some(limit))?;
+
     let Some(req) = read_request(&mut stream)? else {
         return Ok(());
     };
@@ -198,6 +205,18 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
         }
     }
 
+    // chunked は扱わない。**黙って空の本文として扱わず、ここで落とす。**
+    // 対応していない送り方を「本文なし」と解釈すると、テストは緑のまま
+    // 検査対象が消える。
+    if headers
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"))
+    {
+        return Err(std::io::Error::other(
+            "テストサーバは chunked を扱えない。送り方が変わったので土台を直すこと",
+        ));
+    }
+
     let len: usize = headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
@@ -269,10 +288,13 @@ impl Sandbox {
         )
     }
 
-    /// データディレクトリ配下の全ファイルを 1 本のテキストにする。
+    /// 保存された全ファイルを 1 本のテキストにする。
     ///
     /// 漏洩の監査は「どこに出たか」ではなく「どこかに出たか」を見る必要がある。
     /// ダンプ本体・索引・state を個別に見ていると、必ずどれかを見落とす。
+    ///
+    /// **UTF-8 として読めないファイルも捨てない。** 読めたものだけを対象にすると、
+    /// 「全ファイルを見た」と言いながら一部を素通りさせることになる。
     pub fn all_stored_text(&self) -> String {
         let mut out = String::new();
         collect(&self.data_dir(), &mut out);
@@ -289,8 +311,12 @@ fn collect(dir: &Path, out: &mut String) {
         let path = entry.path();
         if path.is_dir() {
             collect(&path, out);
-        } else if let Ok(text) = std::fs::read_to_string(&path) {
-            out.push_str(&format!("--- {}\n{}\n", path.display(), text));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            out.push_str(&format!(
+                "--- {}\n{}\n",
+                path.display(),
+                String::from_utf8_lossy(&bytes)
+            ));
         }
     }
 }
