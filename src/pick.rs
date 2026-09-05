@@ -114,76 +114,163 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn doc() -> Value {
+    /// 式ひとつぶんの期待。**正規化後の JSONPath と結果を対で書く。**
+    ///
+    /// 結果だけを見ていると、たまたま同じ値に行き着く別解釈を見逃す。
+    /// 逆に JSONPath だけを見ていると、正規化は正しいのに問い合わせが空という
+    /// 組み合わせを見逃す。両方を並べて初めて「解釈」を固定できる。
+    struct Case {
+        /// 何を模しているか。落ちたときに読む。
+        about: &'static str,
+        expr: &'static str,
+        /// `normalize` が返すべき JSONPath。
+        path: &'static str,
+        /// 取り出せるべき値。
+        want: Vec<Value>,
+    }
+
+    /// 実物に寄せた入力。
+    ///
+    /// 以前の fixture は**オブジェクト始まり・英数字だけのキー**しか持っておらず、
+    /// 一覧系 API(トップレベルが配列)もヘッダ名(ハイフン)も表現できていなかった。
+    /// 実使用で最初に当たった 2 つがどちらもここだったので、形のほうを直す。
+    fn object_doc() -> Value {
         json!({
             "data": {
                 "token": "abc",
                 "items": [{"id": "1", "n": 1}, {"id": "2", "n": 2}]
-            }
+            },
+            "headers": {"X-Tenant": "acme", "Content-Type": "application/json"},
+            "2fa": {"enabled": true},
+            "a": {"b-c": [{"d-e": 1}, {"d-e": 2}]}
         })
     }
 
-    #[test]
-    fn jq_style_path_works() {
-        assert_eq!(pick(&doc(), ".data.token").unwrap(), vec![json!("abc")]);
+    fn array_doc() -> Value {
+        json!([{"title": "a", "author-name": "taro"}, {"title": "b", "author-name": "hanako"}])
+    }
+
+    fn object_cases() -> Vec<Case> {
+        vec![
+            Case {
+                about: "jq 風のドット記法",
+                expr: ".data.token",
+                path: "$.data.token",
+                want: vec![json!("abc")],
+            },
+            Case {
+                about: "先頭の `.` は省ける",
+                expr: "data.token",
+                path: "$.data.token",
+                want: vec![json!("abc")],
+            },
+            Case {
+                about: "JSONPath はそのまま通す",
+                expr: "$.data.items[*].id",
+                path: "$.data.items[*].id",
+                want: vec![json!("1"), json!("2")],
+            },
+            Case {
+                about: "jq 風の配列展開",
+                expr: ".data.items[].id",
+                path: "$.data.items[*].id",
+                want: vec![json!("1"), json!("2")],
+            },
+            Case {
+                about: "jq は添字の前にも `.` を書ける",
+                expr: ".data.items.[0].id",
+                path: "$.data.items[0].id",
+                want: vec![json!("1")],
+            },
+            Case {
+                about: "ハイフンを含むキー(ヘッダ名で必ず出る)",
+                expr: ".headers.X-Tenant",
+                path: "$.headers['X-Tenant']",
+                want: vec![json!("acme")],
+            },
+            Case {
+                about: "ハイフンを含むキーが 2 つ続く",
+                expr: ".headers.Content-Type",
+                path: "$.headers['Content-Type']",
+                want: vec![json!("application/json")],
+            },
+            Case {
+                about: "ハイフンと配列展開の組み合わせ",
+                expr: ".a.b-c[].d-e",
+                path: "$.a['b-c'][*]['d-e']",
+                want: vec![json!(1), json!(2)],
+            },
+            Case {
+                about: "数字で始まるキー",
+                expr: ".2fa.enabled",
+                path: "$['2fa'].enabled",
+                want: vec![json!(true)],
+            },
+            Case {
+                about: "無い経路は空。エラーにしない(存在確認に使うため)",
+                expr: ".data.nope",
+                path: "$.data.nope",
+                want: vec![],
+            },
+        ]
+    }
+
+    fn array_cases() -> Vec<Case> {
+        vec![
+            Case {
+                about: "トップレベルが配列。一覧系 API はこの形",
+                expr: ".[].title",
+                path: "$[*].title",
+                want: vec![json!("a"), json!("b")],
+            },
+            Case {
+                about: "トップレベル配列の添字",
+                expr: ".[0].title",
+                path: "$[0].title",
+                want: vec![json!("a")],
+            },
+            Case {
+                about: "`.` を省いた書き方も受ける",
+                expr: "[1].title",
+                path: "$[1].title",
+                want: vec![json!("b")],
+            },
+            Case {
+                about: "トップレベル配列 × ハイフン",
+                expr: ".[].author-name",
+                path: "$[*]['author-name']",
+                want: vec![json!("taro"), json!("hanako")],
+            },
+        ]
+    }
+
+    fn check(cases: Vec<Case>, doc: &Value) {
+        for c in cases {
+            assert_eq!(
+                normalize(c.expr),
+                c.path,
+                "{}: `{}` の正規化がずれている",
+                c.about,
+                c.expr
+            );
+            assert_eq!(
+                pick(doc, c.expr).unwrap(),
+                c.want,
+                "{}: `{}` の結果がずれている",
+                c.about,
+                c.expr
+            );
+        }
     }
 
     #[test]
-    fn jq_style_array_expansion_works() {
-        assert_eq!(
-            pick(&doc(), ".data.items[].id").unwrap(),
-            vec![json!("1"), json!("2")]
-        );
+    fn expressions_over_an_object_document() {
+        check(object_cases(), &object_doc());
     }
 
     #[test]
-    fn a_top_level_array_can_be_expanded() {
-        // 一覧系の API はトップレベルが配列。`.[]` が書けないと使い物にならない。
-        let list = json!([{"title": "a"}, {"title": "b"}]);
-        assert_eq!(
-            pick(&list, ".[].title").unwrap(),
-            vec![json!("a"), json!("b")]
-        );
-    }
-
-    #[test]
-    fn a_top_level_array_can_be_indexed() {
-        let list = json!([{"title": "a"}, {"title": "b"}]);
-        assert_eq!(pick(&list, ".[0].title").unwrap(), vec![json!("a")]);
-        // `.` を省いた jq 以外の書き方も受ける。
-        assert_eq!(pick(&list, "[1].title").unwrap(), vec![json!("b")]);
-    }
-
-    #[test]
-    fn a_dot_before_an_index_is_accepted_mid_path() {
-        // jq は `.data.items.[0]` とも書ける。JSONPath は `.` と `[` を続けられない。
-        assert_eq!(
-            pick(&doc(), ".data.items.[0].id").unwrap(),
-            vec![json!("1")]
-        );
-    }
-
-    #[test]
-    fn a_key_with_a_hyphen_can_be_reached() {
-        // HTTP クライアントなのでヘッダ名を引く場面が多い。ハイフンは普通に出る。
-        let v = json!({"headers": {"X-Tenant": "acme", "Content-Type": "application/json"}});
-        assert_eq!(pick(&v, ".headers.X-Tenant").unwrap(), vec![json!("acme")]);
-        assert_eq!(
-            pick(&v, ".headers.Content-Type").unwrap(),
-            vec![json!("application/json")]
-        );
-    }
-
-    #[test]
-    fn keys_needing_quotes_work_inside_longer_paths() {
-        let v = json!({"a": {"b-c": [{"d-e": 1}, {"d-e": 2}]}});
-        assert_eq!(pick(&v, ".a.b-c[].d-e").unwrap(), vec![json!(1), json!(2)]);
-    }
-
-    #[test]
-    fn a_key_that_starts_with_a_digit_is_reachable() {
-        let v = json!({"2fa": {"enabled": true}});
-        assert_eq!(pick(&v, ".2fa.enabled").unwrap(), vec![json!(true)]);
+    fn expressions_over_a_top_level_array() {
+        check(array_cases(), &array_doc());
     }
 
     #[test]
@@ -193,27 +280,8 @@ mod tests {
     }
 
     #[test]
-    fn jsonpath_is_accepted_as_is() {
-        assert_eq!(
-            pick(&doc(), "$.data.items[*].id").unwrap(),
-            vec![json!("1"), json!("2")]
-        );
-    }
-
-    #[test]
-    fn leading_dot_is_optional() {
-        assert_eq!(pick(&doc(), "data.token").unwrap(), vec![json!("abc")]);
-    }
-
-    #[test]
-    fn a_missing_path_yields_nothing_rather_than_an_error() {
-        // 「無い」はエラーではない。あるかどうかを調べる用途があるため。
-        assert!(pick(&doc(), ".data.nope").unwrap().is_empty());
-    }
-
-    #[test]
     fn a_malformed_expression_is_an_error_naming_the_input() {
-        let err = pick(&doc(), ".data[").unwrap_err().to_string();
+        let err = pick(&object_doc(), ".data[").unwrap_err().to_string();
         assert!(err.contains(".data["), "入力を示していない: {err}");
     }
 
