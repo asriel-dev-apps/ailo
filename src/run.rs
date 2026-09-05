@@ -146,8 +146,15 @@ fn url_literal_secret(url: &str) -> Option<String> {
 }
 
 /// 直前のリクエストを記録する。直書きの秘匿値は値を落とし、名前だけ残す。
+///
+/// **設定の `redact_headers` をここでも読む。** 送信側の Redactor にだけ足していた
+/// ときは、`X-Tenant` のように利用者が秘匿指定したヘッダが、ダンプでは `***` なのに
+/// `last.toml` には平文で残った。マスクの定義は 1 か所から両方へ配る。
 fn record_last(recipe: &Recipe) -> Result<()> {
-    let r = Redactor::new(true);
+    let mut r = Redactor::new(true);
+    for name in &Config::load()?.redact_headers {
+        r.add_header_name(name);
+    }
     let mut items = Vec::with_capacity(recipe.items.len());
     let mut redacted = Vec::new();
     for raw in &recipe.items {
@@ -236,10 +243,17 @@ fn build_vars(cfg: &Config, env: Option<&str>, cli_vars: &[String]) -> Result<Va
 }
 
 /// 設定の共通ヘッダと環境ヘッダを重ねる。item のヘッダが最後に勝つ。
+///
+/// **突き合わせは名前を小文字にしてから行う。** 設定は綴りをそのままキーにした表なので、
+/// `[headers] accept` と `[env.stg.headers] Accept` を別物として持ててしまう。綴りの違いで
+/// 層の優先順位が入れ替わると、環境ごとに上書きしたつもりの指定が黙って無視される。
+/// 送る綴りは後から来たほう(環境側)に合わせる。
 fn config_headers(cfg: &Config, env: Option<&str>) -> Vec<(String, String)> {
-    let mut merged: BTreeMap<String, String> = cfg.headers.clone();
-    merged.extend(cfg.env_config(env).headers);
-    merged.into_iter().collect()
+    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (name, value) in cfg.headers.iter().chain(cfg.env_config(env).headers.iter()) {
+        merged.insert(name.to_ascii_lowercase(), (name.clone(), value.clone()));
+    }
+    merged.into_values().collect()
 }
 
 /// item のテンプレートを展開する。クエリに秘匿値が載ったら警告する。
