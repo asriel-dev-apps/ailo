@@ -147,7 +147,7 @@ fn route(req: &Request, path: &str, query: &str) -> Response {
         }
         // **`Content-Length` を出さない。** 本文の終わりは接続が閉じることで示す。
         "/no-length" => {
-            let mut res = Response::json(list_body());
+            let mut res = Response::json(reflection(req, path, query).to_string());
             res.send_content_length = false;
             res
         }

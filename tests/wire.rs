@@ -288,14 +288,9 @@ fn a_gzip_encoded_response_is_decoded_before_picking() {
     let server = TestServer::start();
     let sb = Sandbox::new();
 
-    let run = sb.run(&[
-        "get",
-        &server.url("/gzip"),
-        "X-Tenant: acme",
-        "--pick",
-        ".headers.X-Tenant",
-    ]);
-    assert_eq!(run.ok(), "acme");
+    // 式は最も単純な形にする。ここで見たいのは復号であって `--pick` ではない。
+    let run = sb.run(&["get", &server.url("/gzip"), "--pick", ".path"]);
+    assert_eq!(run.ok(), "/gzip");
 }
 
 /// `Content-Length` を出さず、接続を閉じることで本文の終わりを示す応答も扱えること。
@@ -304,8 +299,8 @@ fn a_response_without_a_content_length_is_read_to_the_end() {
     let server = TestServer::start();
     let sb = Sandbox::new();
 
-    let run = sb.run(&["get", &server.url("/no-length"), "--pick", ".[].title"]);
-    assert_eq!(run.ok(), "1 つめ\n2 つめ");
+    let run = sb.run(&["get", &server.url("/no-length"), "--pick", ".path"]);
+    assert_eq!(run.ok(), "/no-length");
 }
 
 /// 本文の無い応答(204)でも落ちず、状態が伝わること。
