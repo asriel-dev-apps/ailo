@@ -131,25 +131,53 @@ pub struct Sent {
     pub response: ResponseRecord,
 }
 
-/// https から http へ落とすリダイレクトを拒む。
+/// リダイレクトを追ってよいか。
+///
+/// **判断はここに置き、クロージャからは呼ぶだけにする。** クロージャの中に書くと
+/// テストから触れず、送信層で唯一の自作の安全策だけが検証範囲の外に残る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redirect {
+    Follow,
+    /// 拒む理由。そのままエラー文になる。
+    Refuse(&'static str),
+}
+
+/// 追ってよいリダイレクトの上限。
+const MAX_HOPS: usize = 10;
+
+/// `previous_scheme` は直前の URL の scheme(初回は `None`)、`hops` はここまでに
+/// 追った回数。
 ///
 /// reqwest は host か実効ポートが変われば `Authorization` を落とすが、
 /// **scheme だけが変わる場合**は同一 origin とみなして落とさない。
 /// `https://host:443/` → `http://host:443/` はホストもポートも同じなので、
 /// 認証ヘッダが平文で流れる。既定のリダイレクト上限は保ったまま、これだけ止める。
+pub fn redirect_decision(
+    previous_scheme: Option<&str>,
+    next_scheme: &str,
+    hops: usize,
+) -> Redirect {
+    if previous_scheme == Some("https") && next_scheme == "http" {
+        return Redirect::Refuse("https から http へのリダイレクトを拒否しました");
+    }
+    if hops >= MAX_HOPS {
+        return Redirect::Refuse("リダイレクトが 10 回を超えました");
+    }
+    Redirect::Follow
+}
+
 fn no_downgrade_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        let previous_was_https = attempt
-            .previous()
-            .last()
-            .is_some_and(|u| u.scheme() == "https");
-        if previous_was_https && attempt.url().scheme() == "http" {
-            return attempt.error("https から http へのリダイレクトを拒否しました");
+        let previous = attempt.previous();
+        let decision = redirect_decision(
+            previous.last().map(|u| u.scheme()),
+            attempt.url().scheme(),
+            previous.len(),
+        );
+        match decision {
+            Redirect::Follow => attempt.follow(),
+            Redirect::Refuse(why) => attempt.error(why),
         }
-        if attempt.previous().len() >= 10 {
-            return attempt.error("リダイレクトが 10 回を超えました");
-        }
-        attempt.follow()
     })
 }
 
@@ -454,6 +482,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.headers.len(), 2);
+    }
+
+    #[test]
+    fn a_downgrade_to_plain_http_is_refused() {
+        // ホストもポートも同じなら reqwest は Authorization を落とさない。
+        // ここで止めないと認証ヘッダが平文で流れる。
+        assert_eq!(
+            redirect_decision(Some("https"), "http", 1),
+            Redirect::Refuse("https から http へのリダイレクトを拒否しました")
+        );
+    }
+
+    #[test]
+    fn ordinary_redirects_are_followed() {
+        for (prev, next) in [
+            (None, "https"),
+            (None, "http"),
+            (Some("https"), "https"),
+            (Some("http"), "http"),
+            // 平文から TLS へ上がるのは止める理由がない。
+            (Some("http"), "https"),
+        ] {
+            assert_eq!(
+                redirect_decision(prev, next, 0),
+                Redirect::Follow,
+                "{prev:?} -> {next} を追わないのはおかしい"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hop_limit_is_enforced_and_only_at_the_limit() {
+        assert_eq!(
+            redirect_decision(Some("https"), "https", 9),
+            Redirect::Follow
+        );
+        assert_eq!(
+            redirect_decision(Some("https"), "https", 10),
+            Redirect::Refuse("リダイレクトが 10 回を超えました")
+        );
+    }
+
+    #[test]
+    fn a_downgrade_is_refused_before_the_hop_limit_is_even_reached() {
+        // 上限に達していない段階でもダウングレードは拒む。順序を取り違えると、
+        // 「9 ホップまでは平文へ落ちてよい」になる。
+        assert_eq!(
+            redirect_decision(Some("https"), "http", 0),
+            Redirect::Refuse("https から http へのリダイレクトを拒否しました")
+        );
     }
 
     #[test]

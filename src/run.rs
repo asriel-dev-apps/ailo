@@ -248,6 +248,22 @@ fn build_vars(cfg: &Config, env: Option<&str>, cli_vars: &[String]) -> Result<Va
 /// `[headers] accept` と `[env.stg.headers] Accept` を別物として持ててしまう。綴りの違いで
 /// 層の優先順位が入れ替わると、環境ごとに上書きしたつもりの指定が黙って無視される。
 /// 送る綴りは後から来たほう(環境側)に合わせる。
+/// 同じテーブルに `Accept` と `accept` を両方書いた場合に、その名前を返す。
+///
+/// 送られるのは片方だけになる。しかも設定は `BTreeMap` なので反復順は綴りの
+/// ソート順で、**ファイルの記述順とも一致しない**。黙って捨てると
+/// 「書いたヘッダが理由なく消える」ように見えるので、名前を出して知らせる。
+fn duplicate_header_spellings(headers: &BTreeMap<String, String>) -> Vec<String> {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let mut dupes = Vec::new();
+    for name in headers.keys() {
+        if let Some(first) = seen.insert(name.to_ascii_lowercase(), name.clone()) {
+            dupes.push(format!("{first} と {name}"));
+        }
+    }
+    dupes
+}
+
 fn config_headers(cfg: &Config, env: Option<&str>) -> Vec<(String, String)> {
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     for (name, value) in cfg.headers.iter().chain(cfg.env_config(env).headers.iter()) {
@@ -383,6 +399,21 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
     // 変数として解決した秘匿値は、どの経路で本文に現れても落とす。
     for value in v.secret_values() {
         redactor.add_literal(value);
+    }
+
+    for dupe in
+        duplicate_header_spellings(&cfg.headers)
+            .into_iter()
+            .chain(duplicate_header_spellings(
+                &cfg.env_config(env.as_deref()).headers,
+            ))
+    {
+        eprintln!(
+            "{}",
+            palette.dim(&format!(
+                "警告: 同じ設定に大文字小文字だけが違うヘッダがあります({dupe})。送られるのは片方だけです"
+            ))
+        );
     }
 
     // 設定のヘッダを先に、item のヘッダを後に。後勝ちで item が上書きする。

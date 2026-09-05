@@ -142,7 +142,9 @@ mod tests {
             },
             "headers": {"X-Tenant": "acme", "Content-Type": "application/json"},
             "2fa": {"enabled": true},
-            "a": {"b-c": [{"d-e": 1}, {"d-e": 2}]}
+            "a": {"b-c": [{"d-e": 1}, {"d-e": 2}]},
+            "user.name": "taro",
+            "it's": 1
         })
     }
 
@@ -205,6 +207,18 @@ mod tests {
                 expr: ".2fa.enabled",
                 path: "$['2fa'].enabled",
                 want: vec![json!(true)],
+            },
+            Case {
+                about: "キー自体に `.` を含む(ドット記法では表現できない)",
+                expr: "['user.name']",
+                path: "$['user.name']",
+                want: vec![json!("taro")],
+            },
+            Case {
+                about: "キーに `'` を含む。包み直すときにエスケープが要る",
+                expr: ".it's",
+                path: "$['it\\'s']",
+                want: vec![json!(1)],
             },
             Case {
                 about: "無い経路は空。エラーにしない(存在確認に使うため)",
@@ -271,6 +285,13 @@ mod tests {
     #[test]
     fn expressions_over_a_top_level_array() {
         check(array_cases(), &array_doc());
+    }
+
+    #[test]
+    fn a_top_level_scalar_document_can_be_taken_whole() {
+        // 本文が JSON のスカラだけ、という API も実在する。
+        assert_eq!(pick(&json!("ok"), "$").unwrap(), vec![json!("ok")]);
+        assert_eq!(pick(&json!(42), "$").unwrap(), vec![json!(42)]);
     }
 
     #[test]

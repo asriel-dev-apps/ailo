@@ -71,14 +71,14 @@ fn a_command_line_header_replaces_the_configured_one_on_the_wire() {
 fn configured_headers_that_are_not_overridden_still_reach_the_server() {
     let server = TestServer::start();
     let sb = Sandbox::new();
-    sb.write_config("[headers]\nAccept = \"application/json\"\nX-App = \"ailo\"\n");
+    sb.write_config("[headers]\nAccept = \"application/json\"\nFrom = \"ailo\"\n");
 
     let run = sb.run(&[
         "get",
         &server.url("/reflect"),
         "Accept: text/csv",
         "--pick",
-        ".headers.X-App",
+        ".headers.From",
     ]);
     assert_eq!(run.ok(), "ailo");
 }
@@ -91,11 +91,10 @@ fn header_layers_resolve_common_then_env_then_command_line() {
     sb.write_config(
         r#"
 [headers]
-X-Layer = "common"
-X-From-Common = "yes"
+Accept = "common"
 
 [env.stg.headers]
-X-Layer = "env"
+Accept = "env"
 "#,
     );
 
@@ -105,7 +104,7 @@ X-Layer = "env"
         "-e",
         "stg",
         "--pick",
-        ".headers.X-Layer",
+        ".headers.Accept",
     ]);
     assert_eq!(env_wins.ok(), "env");
 
@@ -114,9 +113,9 @@ X-Layer = "env"
         &server.url("/reflect"),
         "-e",
         "stg",
-        "X-Layer: cli",
+        "Accept: cli",
         "--pick",
-        ".headers.X-Layer",
+        ".headers.Accept",
     ]);
     assert_eq!(cli_wins.ok(), "cli");
 }
@@ -199,7 +198,7 @@ fn a_pick_that_matches_nothing_says_so_on_stderr() {
     let server = TestServer::start();
     let sb = Sandbox::new();
 
-    let run = sb.run(&["get", &server.url("/list"), "--pick", ".[].nope"]);
+    let run = sb.run(&["get", &server.url("/reflect"), "--pick", ".nope"]);
     assert_eq!(run.ok(), "");
     assert!(
         run.stderr.contains("一致する値はありません"),
@@ -261,4 +260,85 @@ fn header_layers_merge_regardless_of_letter_case() {
             "共通 `{common}` / 環境 `{env}` の組み合わせで環境側が勝っていない"
         );
     }
+}
+
+/// 隔離が「今のテストがその経路を踏まないから」ではなく**仕組みで**成り立っていること。
+///
+/// これが落ちたら、キーチェーンを触るテストを書いた瞬間に開発者本人の
+/// login keychain へ書き込む状態に戻っている。
+#[test]
+fn the_sandbox_cannot_reach_the_real_keychain() {
+    let sb = Sandbox::new();
+    let run = sb.run(&["secret", "rm", "stg", "token"]);
+    assert_ne!(run.code, 0, "キーチェーンに到達してしまっている");
+    assert!(
+        run.stderr.contains("AILO_NO_KEYCHAIN"),
+        "止まった理由が違う: {}",
+        run.stderr
+    );
+}
+
+/// 圧縮されたレスポンスでも中身を扱えること。
+///
+/// ailo は自分で gzip を有効にしており、実 API の大半も圧縮して返す。
+/// この経路を通らない fixture は、リクエスト側で直したのと同じ穴を
+/// レスポンス側に残すことになる。
+#[test]
+fn a_gzip_encoded_response_is_decoded_before_picking() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&[
+        "get",
+        &server.url("/gzip"),
+        "X-Tenant: acme",
+        "--pick",
+        ".headers.X-Tenant",
+    ]);
+    assert_eq!(run.ok(), "acme");
+}
+
+/// `Content-Length` を出さず、接続を閉じることで本文の終わりを示す応答も扱えること。
+#[test]
+fn a_response_without_a_content_length_is_read_to_the_end() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&["get", &server.url("/no-length"), "--pick", ".[].title"]);
+    assert_eq!(run.ok(), "1 つめ\n2 つめ");
+}
+
+/// 本文の無い応答(204)でも落ちず、状態が伝わること。
+#[test]
+fn an_empty_response_is_reported_rather_than_treated_as_a_failure() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&["get", &server.url("/empty")]);
+    assert!(run.ok().contains("204"), "{}", run.stdout);
+}
+
+/// 同じテーブルに大文字小文字だけが違うヘッダを書いたら、黙って捨てずに知らせること。
+///
+/// 送られるのは片方だけで、しかもどちらが残るかは綴りのソート順で決まる。
+/// 記述順と一致しないので、警告が無いと「書いたヘッダが理由なく消える」ように見える。
+#[test]
+fn two_spellings_of_one_header_in_the_same_table_are_reported() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    sb.write_config("[headers]\nAccept = \"upper\"\naccept = \"lower\"\n");
+
+    let run = sb.run(&[
+        "get",
+        &server.url("/reflect"),
+        "--pick",
+        ".header_values.accept",
+    ]);
+    // 実際に送られるのは 1 本だけ。
+    assert_eq!(run.ok(), "[\"lower\"]");
+    assert!(
+        run.stderr.contains("大文字小文字だけが違うヘッダ"),
+        "警告が出ていない: {}",
+        run.stderr
+    );
 }

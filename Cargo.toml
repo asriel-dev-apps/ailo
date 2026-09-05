@@ -40,6 +40,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
 
 [dev-dependencies]
+# 実 API の大半は gzip を返す。ailo は自分で gzip/brotli を有効にしているのに、
+# テストのレスポンスが常に非圧縮では復号経路を一度も通らない。
+flate2 = "1"
 tempfile = "3"
 
 [profile.release]

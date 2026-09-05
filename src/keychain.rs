@@ -38,9 +38,30 @@ pub enum AuthError {
     InvalidSecret,
     #[error("保存された値を読み取れません。`ailo secret set <env> <キー>` で入れ直してください")]
     InvalidStoredSecret,
+    #[error("{AILO_NO_KEYCHAIN} が立っているため、OS の認証情報ストアには触れません")]
+    Blocked,
+}
+
+/// これが立っていると、この module は OS の認証情報ストアに一切触れずエラーを返す。
+///
+/// **テストが開発者本人の login keychain に書き込むのを、仕組みで止めるためにある。**
+/// macOS 側は `/usr/bin/security` を絶対パスで起動するので、`PATH` を絞っても
+/// 環境変数を消しても止まらない。「今のテストはその経路を踏まないから安全」は
+/// 不変条件ではなく、次に capture のテストを書いた人が踏み抜く。
+///
+/// 秘匿値が要るなら `AILO_SECRET_<ENV>_<KEY>` を使う。平文ファイルへ落ちる経路は
+/// 用意しない(塞いだ結果として平文保存が始まっては本末転倒なので)。
+pub const AILO_NO_KEYCHAIN: &str = "AILO_NO_KEYCHAIN";
+
+fn blocked() -> bool {
+    std::env::var_os(AILO_NO_KEYCHAIN).is_some_and(|v| !v.is_empty())
 }
 
 pub fn save(account: &str, token: &str) -> Result<(), AuthError> {
+    if blocked() {
+        let _ = (account, token);
+        return Err(AuthError::Blocked);
+    }
     #[cfg(target_os = "macos")]
     {
         security_cli::save(SERVICE, account, token)
@@ -57,6 +78,10 @@ pub fn save(account: &str, token: &str) -> Result<(), AuthError> {
 }
 
 pub fn load(account: &str) -> Result<Option<String>, AuthError> {
+    if blocked() {
+        let _ = account;
+        return Err(AuthError::Blocked);
+    }
     #[cfg(target_os = "macos")]
     {
         security_cli::load(SERVICE, account)
@@ -73,6 +98,10 @@ pub fn load(account: &str) -> Result<Option<String>, AuthError> {
 }
 
 pub fn delete(account: &str) -> Result<(), AuthError> {
+    if blocked() {
+        let _ = account;
+        return Err(AuthError::Blocked);
+    }
     #[cfg(target_os = "macos")]
     {
         security_cli::delete(SERVICE, account)

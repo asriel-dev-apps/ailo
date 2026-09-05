@@ -92,45 +92,103 @@ fn handle(mut stream: TcpStream) -> std::io::Result<()> {
         None => (req.target.as_str(), ""),
     };
 
-    let (status, content_type, body) = route(&req, path, query);
+    let res = route(&req, path, query);
 
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes())?;
+    let mut head = format!("HTTP/1.1 {}\r\nContent-Type: {}\r\n", res.status, res.kind);
+    if let Some(encoding) = res.encoding {
+        head.push_str(&format!("Content-Encoding: {encoding}\r\n"));
+    }
+    if res.send_content_length {
+        head.push_str(&format!("Content-Length: {}\r\n", res.body.len()));
+    }
+    head.push_str("Connection: close\r\n\r\n");
+
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(&res.body)?;
     stream.flush()?;
+    // Content-Length を出さない応答は、閉じることが本文の終わりを意味する。
     let _ = stream.shutdown(Shutdown::Write);
     Ok(())
 }
 
-fn route(req: &Request, path: &str, query: &str) -> (&'static str, &'static str, String) {
+struct Response {
+    status: &'static str,
+    kind: &'static str,
+    encoding: Option<&'static str>,
+    /// `Content-Length` を出すか。出さない応答は実 API にも普通にある。
+    send_content_length: bool,
+    body: Vec<u8>,
+}
+
+impl Response {
+    fn json(body: String) -> Self {
+        Self {
+            status: "200 OK",
+            kind: "application/json",
+            encoding: None,
+            send_content_length: true,
+            body: body.into_bytes(),
+        }
+    }
+}
+
+fn route(req: &Request, path: &str, query: &str) -> Response {
     match path {
         // 一覧系の API。**トップレベルが配列**。`--pick '.[].title'` が要る形。
-        "/list" => (
-            "200 OK",
-            "application/json",
-            json!([
-                {"id": 1, "title": "1 つめ", "author-name": "taro"},
-                {"id": 2, "title": "2 つめ", "author-name": "hanako"}
-            ])
-            .to_string(),
-        ),
-        "/text" => ("200 OK", "text/plain; charset=utf-8", "ただの文章".into()),
-        "/empty" => ("204 No Content", "text/plain", String::new()),
-        "/notfound" => (
-            "404 Not Found",
-            "application/json",
-            json!({"error": "no such thing"}).to_string(),
-        ),
+        "/list" => Response::json(list_body()),
+        // **gzip で返す。** ailo は gzip/brotli を有効にしてビルドされており、実 API の
+        // 大半も圧縮して返す。ここを通らない fixture は、リクエスト側で直したのと
+        // 同じ「都合のよい形」をレスポンス側に残すことになる。
+        "/gzip" => {
+            let mut res = Response::json(reflection(req, path, query).to_string());
+            res.body = gzip(&res.body);
+            res.encoding = Some("gzip");
+            res
+        }
+        // **`Content-Length` を出さない。** 本文の終わりは接続が閉じることで示す。
+        "/no-length" => {
+            let mut res = Response::json(list_body());
+            res.send_content_length = false;
+            res
+        }
+        "/text" => Response {
+            status: "200 OK",
+            kind: "text/plain; charset=utf-8",
+            encoding: None,
+            send_content_length: true,
+            body: "ただの文章".into(),
+        },
+        "/empty" => Response {
+            status: "204 No Content",
+            kind: "text/plain",
+            encoding: None,
+            send_content_length: true,
+            body: Vec::new(),
+        },
+        "/notfound" => {
+            let mut res = Response::json(json!({"error": "no such thing"}).to_string());
+            res.status = "404 Not Found";
+            res
+        }
         // httpbin と同じく、受け取ったものをそのまま返す。マスク漏れと
         // ヘッダの重複はここでしか見えない。
-        _ => (
-            "200 OK",
-            "application/json",
-            reflection(req, path, query).to_string(),
-        ),
+        _ => Response::json(reflection(req, path, query).to_string()),
     }
+}
+
+fn list_body() -> String {
+    json!([
+        {"id": 1, "title": "1 つめ", "author-name": "taro"},
+        {"id": 2, "title": "2 つめ", "author-name": "hanako"}
+    ])
+    .to_string()
+}
+
+fn gzip(body: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(body).expect("gzip に失敗");
+    encoder.finish().expect("gzip に失敗")
 }
 
 /// 受け取ったリクエストを JSON にして返す。
@@ -244,7 +302,12 @@ use std::process::{Command, Output};
 ///
 /// 環境変数は**全部落としてから**必要なものだけ入れる。親のシェルに
 /// `AILO_VAR_*` や `AILO_SECRET_*` が残っていると、テストの結果がマシンごとに変わる。
-/// 秘匿値の索引も空になるので、キーチェーンへは一度も触らない。
+///
+/// **キーチェーンは `AILO_NO_KEYCHAIN` で塞ぐ。** 「索引が空だから到達しない」は
+/// 不変条件ではない。macOS の実装は `/usr/bin/security` を絶対パスで起動するので、
+/// `PATH` を絞っても環境変数を消しても止まらず、capture のテストを書いた瞬間に
+/// 開発者本人の login keychain へ書き込む。塞がれていることは
+/// `the_sandbox_cannot_reach_the_real_keychain` で毎回確かめている。
 pub struct Sandbox {
     dir: tempfile::TempDir,
 }
@@ -275,7 +338,8 @@ impl Sandbox {
             .env("HOME", self.dir.path())
             .env("PATH", "/usr/bin:/bin")
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .env("XDG_DATA_HOME", self.dir.path().join("data"));
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env("AILO_NO_KEYCHAIN", "1");
         cmd
     }
 
@@ -295,10 +359,21 @@ impl Sandbox {
     ///
     /// **UTF-8 として読めないファイルも捨てない。** 読めたものだけを対象にすると、
     /// 「全ファイルを見た」と言いながら一部を素通りさせることになる。
+    ///
+    /// 走査するのは設定・データの 2 か所ではなく**サンドボックスの HOME 全体**。
+    /// `AILO_DUMP_DIR` で置き場所は動かせるし、将来キャッシュが別の場所に増えても
+    /// 監査から外れない。外れたことは緑としてしか現れないので、決め打ちにしない。
+    ///
+    /// 空を返したら panic する。ダンプは既定で必ず 1 本出るので、空は
+    /// 「漏れていない」ではなく**走査が死んでいる**ことを意味する。
     pub fn all_stored_text(&self) -> String {
         let mut out = String::new();
-        collect(&self.data_dir(), &mut out);
-        collect(&self.config_dir(), &mut out);
+        collect(self.dir.path(), &mut out);
+        assert!(
+            !out.is_empty(),
+            "保存物が 1 つも読めていない。監査そのものが働いていない: {}",
+            self.dir.path().display()
+        );
         out
     }
 }

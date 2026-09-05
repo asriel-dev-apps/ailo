@@ -35,8 +35,9 @@ fn variants(secret: &str) -> Vec<String> {
     vec![
         secret.to_string(),
         percent_encode(secret),
-        // 前後のクォートを外した、エスケープ済みの中身。
-        json.trim_matches('"').to_string(),
+        // 前後のクォートだけを外した、エスケープ済みの中身。
+        // `trim_matches` は繰り返し削るので、`"` で終わる値の変形が短く切れる。
+        json[1..json.len() - 1].to_string(),
     ]
 }
 
@@ -308,5 +309,23 @@ fn redact_headers_in_the_config_are_honoured() {
     assert!(
         appears_anywhere(&run, &sb, secret),
         "コントロールがヒットしない。既定では出るはずの値が出ていない"
+    );
+}
+
+/// 圧縮された応答に反響された秘匿値も落ちること。
+///
+/// マスクは復号の後段にある。圧縮経路を通らない検査は、そこが壊れても緑になる。
+#[test]
+fn a_secret_reflected_in_a_gzip_encoded_response_is_masked() {
+    let server = TestServer::start();
+    let secret = "Bearer gzipped-token";
+    assert_masked_with_control(
+        "gzipped-token",
+        Sending::new(&[
+            "get",
+            &server.url("/gzip"),
+            &format!("Authorization: {secret}"),
+            "--full",
+        ]),
     );
 }
