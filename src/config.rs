@@ -191,8 +191,17 @@ impl Config {
     ///
     /// `ailo config` は `Config` に読み込んで書き戻すのではなく、本文を直接扱う。
     /// 読み込んで書き戻すと、人が書いたコメントと並びが消える。
+    ///
+    /// **「無い」以外の読み取り失敗は握り潰さない。** 権限や I/O の失敗まで
+    /// 空文字にすると、`config set` がその空文字を土台にして**既存の設定を
+    /// 丸ごと置き換える**。読めなかったことは、消えたことより先に伝える。
     pub fn read_text() -> Result<String> {
-        Ok(fs::read_to_string(Self::path()?).unwrap_or_default())
+        let path = Self::path()?;
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(e).with_context(|| format!("{} を読めません", paths::tildify(&path))),
+        }
     }
 
     /// 設定ファイルを丸ごと置き換える。一時ファイル + rename、0600。

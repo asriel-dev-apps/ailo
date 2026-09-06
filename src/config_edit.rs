@@ -53,6 +53,14 @@ pub fn resolve_path(env: Option<&str>, key: &str) -> Result<Vec<String>> {
             // 黙って片方を選ばない。どちらの意味にも取れる。
             bail!("`{key}` はフルパスなので `-e` と同時には使えません。`-e` を外すか、キーを短い形で書いてください");
         }
+        // **フルパスでも環境名は検証する。** `-e` のときだけ通していると、
+        // `env.bad/name.vars.x` で「作れるのに使えない環境」ができる。
+        // 実行時に `State::load` が弾くので、原因が設定の書き方にあるとは気づきにくい。
+        if segments[0] == "env" {
+            if let Some(name) = segments.get(1) {
+                validate_env_name(name)?;
+            }
+        }
         return Ok(segments);
     }
 
@@ -100,7 +108,11 @@ fn refuse_secret(path: &[String], value: &str) -> Result<()> {
              `ailo secret set <環境> {last}` を使ってください(秘匿値ではないなら `ailo config edit` で直接書けます)"
         );
     }
-    if under("headers") && crate::redact::Redactor::new(true).is_sensitive_header(last) {
+    // ヘッダは既定リストの完全一致だけだと `X-Client-Secret` のような
+    // 独自の認証ヘッダを取りこぼす。変数と同じ「名前の断片」判定も併せて見る。
+    let sensitive_header = crate::redact::Redactor::new(true).is_sensitive_header(last)
+        || crate::redact::is_sensitive_field(last);
+    if under("headers") && sensitive_header {
         bail!(
             "ヘッダ `{last}` の値を平文で書こうとしています。\n\
              `ailo secret set <環境> <キー>` で入れて、ここには `{{{{<キー>}}}}` と書いてください"
@@ -440,6 +452,30 @@ mod tests {
         )
         .unwrap();
         assert!(d.to_string().contains("Bearer"));
+    }
+
+    #[test]
+    fn a_full_path_with_an_unusable_environment_name_is_refused() {
+        // 作れるのに使えない環境を作らせない。実行時に弾かれると原因が分かりにくい。
+        let err = resolve_path(None, "env.bad/name.vars.base_url")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("環境名"), "{err}");
+        assert!(resolve_path(None, "env.stg.vars.base_url").is_ok());
+    }
+
+    #[test]
+    fn a_custom_authentication_header_is_refused_too() {
+        // 既定リストの完全一致だけだと、独自の認証ヘッダを取りこぼす。
+        let mut d = doc("");
+        let err = set(
+            &mut d,
+            &["headers".into(), "X-Client-Secret".into()],
+            "abcdef123456",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ailo secret set"), "{err}");
     }
 
     #[test]

@@ -802,6 +802,16 @@ fn edit_config(change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -
     change(&mut doc)?;
     let updated = doc.to_string();
     config_edit::check(&updated)?;
+
+    // **ロックだけに頼らない。** ロックは置き去り対策として古いものを奪うので、
+    // I/O が詰まって処理が長引いたプロセスから奪ってしまう可能性が残る。奪われた側が
+    // 黙って上書きしないよう、書く直前に「読んだときから変わっていないこと」を見る。
+    if Config::read_text()? != text {
+        bail!(
+            "書き込む直前に {} が別のプロセスに書き換えられました。何も変更していません。やり直してください",
+            paths::tildify(&path)
+        );
+    }
     Config::write_text(&updated)
 }
 
