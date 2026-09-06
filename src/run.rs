@@ -40,6 +40,7 @@ pub async fn run(command: Command) -> Result<Outcome> {
     match command {
         Command::Run(a) => saved(&a).await,
         Command::Save(a) => save(&a),
+        Command::New { name } => new_request(&name),
         Command::Ls => list_requests(),
         Command::Env(a) => match a.action {
             None => list_envs(),
@@ -891,46 +892,148 @@ fn load_document() -> Result<toml_edit::DocumentMut> {
         .with_context(|| format!("{} が TOML として読めません", paths::tildify(&path)))
 }
 
+/// `$EDITOR`(無ければ `$VISUAL`、それも無ければ `vi`)で 1 ファイルを開く。
+///
+/// 空文字は「設定されていない」と同じに扱う。素通しにすると一時ファイル自体を
+/// 実行しようとして "Permission denied" になり、原因が分からない。
+fn run_editor(path: &std::path::Path) -> Result<std::process::ExitStatus> {
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
+
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()
+        .with_context(|| format!("エディタを起動できません: {editor}"))
+}
+
+/// 編集用の一時ファイルを 0600 で作る。
+///
+/// 中身は設定や定義の複製なので、本体を 0600 で書いておきながらここが 0644 では、
+/// 編集している間だけ同じ内容が誰にでも読める状態になる。
+fn write_scratch(path: &std::path::Path, text: &str) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("{} を作れません", paths::tildify(path)))?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+/// `ailo new` の雛形。**コメントで書き方を示す。** ヘルプを読み直させない。
+const TEMPLATE: &str = r#"# 送らずに登録するリクエスト。保存すると `ailo run <名前>` で実行できる。
+method = "GET"
+url = "{{base_url}}/path"
+
+# 足す item。`Name: 値`(ヘッダ) / `key=値`(フィールド) / `key==値`(クエリ)
+items = []
+
+# ボディを文字列で直接送るとき
+# raw = '{"name": "taro"}'
+
+# capture のうちキーチェーンへ入れるもの(名前だけ)
+secret = []
+
+# レスポンスから変数へ束縛する式
+[capture]
+# access_token = ".data.token"
+"#;
+
+/// 送らずにリクエストを定義する。
+///
+/// `ailo save` は**直前に送ったリクエスト**しか保存できない。先に定義してから送りたい
+/// (Postman がやっていること)ので、雛形を `$EDITOR` で開いて登録できるようにする。
+/// 既にある名前なら、その定義を開いて直す。
+fn new_request(name: &str) -> Result<Outcome> {
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        bail!("名前 `{name}` は使えません。空白を含まない名前にしてください");
+    }
+
+    let existing = Requests::load()?.get(name).cloned();
+    let initial = match &existing {
+        Some(req) => toml::to_string_pretty(req)?,
+        None => TEMPLATE.to_string(),
+    };
+
+    let dir = paths::config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("new.{name}.{}.toml", std::process::id()));
+    write_scratch(&tmp, &initial)?;
+
+    let status = run_editor(&tmp)?;
+    let edited = std::fs::read_to_string(&tmp)?;
+    if !status.success() {
+        if edited == initial {
+            let _ = std::fs::remove_file(&tmp);
+            bail!("エディタが異常終了しました。何も登録していません");
+        }
+        bail!(
+            "エディタが異常終了しました。何も登録していません。\n書いたものは {} に残してあります",
+            paths::tildify(&tmp)
+        );
+    }
+
+    let req: SavedRequest = toml::from_str(&edited).map_err(|e| {
+        anyhow!(
+            "{e}\n定義として読めませんでした。書いたものは {} に残してあります",
+            paths::tildify(&tmp)
+        )
+    })?;
+    if req.url.trim().is_empty() {
+        bail!(
+            "`url` が空です。書いたものは {} に残してあります",
+            paths::tildify(&tmp)
+        );
+    }
+    for secret in &req.secret {
+        if !req.capture.contains_key(secret) {
+            bail!(
+                "`secret` の `{secret}` に対応する `[capture]` がありません。書いたものは {} に残してあります",
+                paths::tildify(&tmp)
+            );
+        }
+    }
+
+    {
+        // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
+        let _lock = crate::config::lock_config()?;
+        let mut reqs = Requests::load()?;
+        reqs.put(name, req);
+        reqs.save()?;
+    }
+    let _ = std::fs::remove_file(&tmp);
+
+    let what = if existing.is_some() {
+        "直しました"
+    } else {
+        "登録しました"
+    };
+    println!("{what}: {name} ({})", crate::workspace::current().label());
+    Ok(OK)
+}
+
 /// `$EDITOR` で設定を開く。
 ///
 /// **編集は一時ファイルで行い、読めることを確かめてから本体に書く。** 直接開かせると、
 /// 保存した瞬間に壊れた設定が正本になる。壊れていたら一時ファイルの場所を伝えて、
 /// 書いたものを捨てさせない。
 fn edit_in_editor() -> Result<Outcome> {
-    // 空文字は「設定されていない」と同じに扱う。素通しにすると一時ファイル自体を
-    // 実行しようとして "Permission denied" になり、原因が分からない。
-    let editor = ["VISUAL", "EDITOR"]
-        .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
-        .unwrap_or_else(|| "vi".to_string());
-
     let dir = paths::config_dir()?;
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("config.edit.{}.toml", std::process::id()));
-    // **一時ファイルも 0600 で作る。** 中身は設定ファイルの複製なので、本体を
-    // 0600 で書いておきながらここが 0644 では、編集している間だけ同じ内容が
-    // 誰にでも読める状態になる。
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("{} を作れません", paths::tildify(&tmp)))?;
-        f.write_all(Config::read_text()?.as_bytes())?;
-    }
+    write_scratch(&tmp, &Config::read_text()?)?;
 
     let before = Config::read_text()?;
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\"", editor = editor))
-        .arg("sh")
-        .arg(&tmp)
-        .status()
-        .with_context(|| format!("エディタを起動できません: {editor}"))?;
+    let status = run_editor(&tmp)?;
     let edited = std::fs::read_to_string(&tmp)?;
 
     if !status.success() {

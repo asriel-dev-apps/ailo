@@ -26,14 +26,24 @@ fn xdg(var: &str, fallback: &str) -> Result<PathBuf> {
     Ok(home()?.join(fallback))
 }
 
-/// `~/.local/share/ailo`
+/// `~/.local/share/ailo`（名前付き workspace なら `.../workspaces/<名前>`）
 pub fn data_dir() -> Result<PathBuf> {
-    Ok(xdg("XDG_DATA_HOME", ".local/share")?.join("ailo"))
+    Ok(crate::workspace::scoped(
+        xdg("XDG_DATA_HOME", ".local/share")?.join("ailo"),
+        crate::workspace::current(),
+    ))
 }
 
-/// `~/.config/ailo`
+/// `~/.config/ailo`（名前付き workspace なら `.../workspaces/<名前>`）
+///
+/// **workspace は置き場所ごと分ける。** 設定・保存済みリクエスト・秘匿値の索引・
+/// ダンプが同じ木の下に揃うので、「いまどの workspace か」を 1 か所で決めれば
+/// 残りは自動的に付いてくる。
 pub fn config_dir() -> Result<PathBuf> {
-    Ok(xdg("XDG_CONFIG_HOME", ".config")?.join("ailo"))
+    Ok(crate::workspace::scoped(
+        xdg("XDG_CONFIG_HOME", ".config")?.join("ailo"),
+        crate::workspace::current(),
+    ))
 }
 
 /// ダンプの置き場所。`AILO_DUMP_DIR` で上書きできる。

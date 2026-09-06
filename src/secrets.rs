@@ -21,9 +21,17 @@ use crate::paths;
 /// 環境変数から秘匿値を渡すときの接頭辞。headless や CI 用のフォールバック。
 pub const ENV_PREFIX: &str = "AILO_SECRET_";
 
-/// キーチェーン上の account 名。環境ごとに名前空間を分ける。
+/// キーチェーン上の account 名。**workspace と環境で名前空間を分ける。**
+///
+/// 既定の workspace は `<env>/<キー>` のまま。名前を足すと、これまで保存した値が
+/// 読めなくなる（破壊的変更を入れないと決めている）。
+/// 名前付きは `<workspace>/<env>/<キー>` にして、workspace をまたいで同じ account に
+/// ならないようにする。workspace 名に `/` と `.` を許していないのはこのため。
 fn account(env: &str, key: &str) -> String {
-    format!("{env}/{key}")
+    match crate::workspace::current().name() {
+        None => format!("{env}/{key}"),
+        Some(ws) => format!("{ws}/{env}/{key}"),
+    }
 }
 
 /// 環境名とキー名を検証する。
@@ -46,9 +54,27 @@ fn validate(env: &str, key: &str) -> Result<()> {
 }
 
 /// `AILO_SECRET_<ENV>_<KEY>`。どちらも大文字にし、`-` は `_` に寄せる。
+///
+/// **名前付き workspace では `AILO_SECRET_<WS>_<ENV>_<KEY>`。** 環境変数だけ
+/// workspace をまたいで効くと、「またいで漏れない」が成り立たなくなる。
 pub fn env_var_name(env: &str, key: &str) -> String {
-    let norm = |s: &str| s.to_ascii_uppercase().replace(['-', '.'], "_");
-    format!("{ENV_PREFIX}{}_{}", norm(env), norm(key))
+    format!("{}{}", env_prefix_for(env), normalize_part(key))
+}
+
+fn normalize_part(s: &str) -> String {
+    s.to_ascii_uppercase().replace(['-', '.'], "_")
+}
+
+/// その環境の秘匿値に付く接頭辞。末尾の `_` まで含む。
+fn env_prefix_for(env: &str) -> String {
+    match crate::workspace::current().name() {
+        None => format!("{ENV_PREFIX}{}_", normalize_part(env)),
+        Some(ws) => format!(
+            "{ENV_PREFIX}{}_{}_",
+            normalize_part(ws),
+            normalize_part(env)
+        ),
+    }
 }
 
 /// 1 件読む。環境変数が最優先。
@@ -95,10 +121,7 @@ pub fn load_env(env: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     // 索引に無くても環境変数で渡されたものは拾う。
-    let prefix = format!(
-        "{ENV_PREFIX}{}_",
-        env.to_ascii_uppercase().replace(['-', '.'], "_")
-    );
+    let prefix = env_prefix_for(env);
     for (k, v) in std::env::vars() {
         if let Some(name) = k.strip_prefix(&prefix) {
             if !v.is_empty() {

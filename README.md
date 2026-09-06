@@ -169,6 +169,33 @@ ailo env use stg                                          # 既定の環境を�
   (0) と区別できる。
 - 同時に走らせても互いの書き込みを捨てない。設定ファイルはロックで直列化する。
 
+### workspace
+
+プロジェクトごとに、設定と保存済みリクエストを分けられる。
+
+```bash
+echo my-project > .ailo          # リポジトリ直下に置く。中身は名前 1 行だけ
+ailo config set -e stg base_url https://stg.example.com   # この workspace の設定になる
+ailo -w other config list        # 明示指定はいつでも勝つ
+```
+
+- 置き場所は `~/.config/ailo/workspaces/<名前>/`。**定義本体も秘匿値も `.ailo` には
+  入らない**ので、git に入れても安全。
+- `.ailo` は親ディレクトリを遡って探す（git と同じ）。サブディレクトリで叩いても効く。
+- `.ailo` が無いディレクトリは、これまでどおりの置き場所で動く。
+- 優先順位は `--workspace` > `AILO_WORKSPACE` > `.ailo` > 既定。
+- 秘匿値も分かれる。キーチェーンの名前空間は `<workspace>/<環境>/<キー>`、
+  環境変数は `AILO_SECRET_<WS>_<ENV>_<KEY>`（既定の workspace はどちらも従来どおり）。
+
+### 送らずに登録する
+
+```bash
+ailo new login       # 雛形を $EDITOR で開く。既にある名前ならその定義を開く
+ailo run login
+```
+
+`ailo save` は直前に送ったリクエストしか保存できない。先に定義しておきたいときはこちら。
+
 ### 秘匿値
 
 値は OS のセキュアストアに入る。平文ファイルには書かない。

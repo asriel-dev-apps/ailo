@@ -14,6 +14,12 @@ use crate::output::{Format, DEFAULT_HEAD_LINES};
     long_about = None,
 )]
 pub struct Cli {
+    /// 使う workspace (省略時は `.ailo` を上へ辿って探す)
+    ///
+    /// どのサブコマンドの後ろにも書ける。`AILO_WORKSPACE` より優先する。
+    #[arg(long, short = 'w', global = true, value_name = "名前")]
+    pub workspace: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -38,6 +44,11 @@ pub enum Command {
     Run(RunArgs),
     /// 直前のリクエストに名前を付けて保存する
     Save(SaveArgs),
+    /// 送らずにリクエストを定義する ($EDITOR で開く)
+    New {
+        /// 付ける名前 (既にあればその定義を開く)
+        name: String,
+    },
     /// 保存済みのリクエストを一覧する
     Ls,
     /// 環境を一覧する / 切り替える

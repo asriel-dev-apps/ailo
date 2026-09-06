@@ -120,6 +120,13 @@ ailo env use stg                                           # 既定の環境を�
 平文ファイルに残るため。`ailo secret set` に預けて `{{名前}}` で参照する。
 `config get` / `config unset` は対象が無ければ終了コード 1(値が空文字なら 0)。
 
+## workspace
+
+リポジトリ直下に `.ailo`（中身は workspace 名 1 行）があれば、設定・保存済みリクエスト・
+秘匿値・ダンプがその workspace のものになる。無ければ既定の置き場所。
+`--workspace <名前>` で明示指定でき、そちらが勝つ。
+**秘匿値は workspace をまたがない**（環境変数は `AILO_SECRET_<WS>_<ENV>_<KEY>`）。
+
 ## コマンド一覧
 
 | | |
@@ -127,7 +134,9 @@ ailo env use stg                                           # 既定の環境を�
 | `ailo <get\|post\|put\|patch\|delete\|head\|options> <URL> [item...]` | 送る |
 | `ailo run <名前> [item...]` | 保存済みを実行 |
 | `ailo save <名前> [--capture 名前=式] [--secret 名前]` | 直前のリクエストを保存 |
+| `ailo new <名前>` | 送らずにリクエストを定義する（$EDITOR） |
 | `ailo ls` / `ailo env` | 保存済み / 環境の一覧 |
+| `ailo -w <名前> ...` | workspace を明示する（既定は `.ailo` を上へ辿って探す） |
 | `ailo config set\|get\|unset\|list\|edit` | 設定の読み書き(`git config` 相当) |
 | `ailo env use <名前>` | 既定の環境を切り替える |
 | `ailo secret set\|ls\|rm <env> [キー]` | 秘匿値の出し入れ |

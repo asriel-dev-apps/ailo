@@ -19,3 +19,4 @@ pub mod run;
 pub mod secrets;
 pub mod shape;
 pub mod vars;
+pub mod workspace;

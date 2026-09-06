@@ -361,6 +361,29 @@ impl Sandbox {
         )
     }
 
+    /// 作業ディレクトリを変えて動かす。workspace の自動切り替えを見るため。
+    pub fn run_in(&self, dir: &Path, args: &[&str]) -> Run {
+        Run::of(
+            self.command()
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("ailo を起動できない"),
+        )
+    }
+
+    /// サンドボックス配下に作業用のディレクトリを作る。
+    pub fn dir(&self, name: &str) -> PathBuf {
+        let path = self.dir.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// そのディレクトリに `.ailo` を置く。
+    pub fn mark(&self, dir: &Path, workspace: &str) {
+        std::fs::write(dir.join(".ailo"), format!("{workspace}\n")).unwrap();
+    }
+
     /// 保存された全ファイルを 1 本のテキストにする。
     ///
     /// 漏洩の監査は「どこに出たか」ではなく「どこかに出たか」を見る必要がある。
