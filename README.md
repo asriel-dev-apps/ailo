@@ -185,7 +185,10 @@ ailo -w other config list        # 明示指定はいつでも勝つ
 - `.ailo` が無いディレクトリは、これまでどおりの置き場所で動く。
 - 優先順位は `--workspace` > `AILO_WORKSPACE` > `.ailo` > 既定。
 - 秘匿値も分かれる。キーチェーンの名前空間は `<workspace>/<環境>/<キー>`、
-  環境変数は `AILO_SECRET_<WS>_<ENV>_<KEY>`（既定の workspace はどちらも従来どおり）。
+  環境変数は `AILO_SECRET_<WS>__<ENV>_<KEY>`（workspace の後ろだけ `__`。既定の
+  workspace はどちらも従来どおり）。
+- workspace 名は英数字と `-` だけ。`_` を許すと `foo-bar` と `foo_bar` が同じ
+  環境変数名になり、別の workspace の秘匿値を読めてしまう。
 
 ### 送らずに登録する
 

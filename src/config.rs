@@ -240,7 +240,7 @@ pub struct Requests {
     pub requests: BTreeMap<String, SavedRequest>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SavedRequest {
     pub method: String,
     pub url: String,

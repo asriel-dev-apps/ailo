@@ -128,12 +128,13 @@ fn secrets_do_not_leak_between_workspaces() {
     let secret = "alpha-only-token";
     let url = format!("{}?key={{{{token}}}}", server.url("/reflect"));
 
-    // alpha 側の名前で渡した秘匿値は、alpha でだけ解決する。
+    // alpha の名前で渡した秘匿値は、alpha でだけ解決する。
+    // 区切りが `__` なのは、`a` + `b_c` と `a_b` + `c` を別物にするため。
     let in_alpha = Run::of_command(
         sb.command()
             .current_dir(&a)
             .args(["get", &url, "-e", "stg", "--pick", ".query"])
-            .env("AILO_SECRET_ALPHA_STG_TOKEN", secret),
+            .env("AILO_SECRET_ALPHA__STG_TOKEN", secret),
     );
     assert_eq!(in_alpha.ok(), format!("key={secret}"));
 
@@ -142,17 +143,72 @@ fn secrets_do_not_leak_between_workspaces() {
         sb.command()
             .current_dir(&b)
             .args(["get", &url, "-e", "stg", "--pick", ".query"])
-            .env("AILO_SECRET_ALPHA_STG_TOKEN", secret),
+            .env("AILO_SECRET_ALPHA__STG_TOKEN", secret),
     );
     assert_ne!(in_beta.code, 0, "beta 側で解決してしまっている");
     assert!(
         !in_beta.stdout.contains(secret) && !in_beta.stderr.contains(secret),
         "秘匿値が出力に出ている"
     );
+}
 
-    // 秘匿値の索引も混ざらない。
-    let ls_in_beta = sb.run_in(&b, &["secret", "ls"]).ok().to_string();
-    assert!(!ls_in_beta.contains("token"), "{ls_in_beta}");
+/// **秘匿値の索引も workspace をまたがないこと。**
+///
+/// 索引は「どのキーを預けたか」の一覧で、値は持たないが、
+/// 別プロジェクトのキー名が見えること自体が分離の破れ。
+#[test]
+fn the_secret_index_does_not_leak_between_workspaces() {
+    let sb = Sandbox::new();
+    let a = sb.dir("project-a");
+    let b = sb.dir("project-b");
+    sb.mark(&a, "alpha");
+    sb.mark(&b, "beta");
+
+    // alpha の索引にだけキー名を入れる(値はキーチェーン側なのでここには無い)。
+    std::fs::write(
+        sb.workspace_config_dir("alpha").join("secret-index.toml"),
+        "[envs]\nstg = [\"alpha-key\"]\n",
+    )
+    .unwrap();
+
+    assert!(sb.run_in(&a, &["secret", "ls"]).ok().contains("alpha-key"));
+    let in_beta = sb.run_in(&b, &["secret", "ls"]).ok().to_string();
+    assert!(!in_beta.contains("alpha-key"), "{in_beta}");
+    let in_default = sb.run(&["secret", "ls"]).ok().to_string();
+    assert!(!in_default.contains("alpha-key"), "{in_default}");
+}
+
+/// ダンプの索引も workspace をまたがないこと。`AILO_DUMP_DIR` で上書きしても同じ。
+#[test]
+fn dumps_do_not_leak_between_workspaces_even_with_an_override() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    let a = sb.dir("project-a");
+    let b = sb.dir("project-b");
+    sb.mark(&a, "alpha");
+    sb.mark(&b, "beta");
+    let shared = sb.dir("shared-dumps");
+
+    Run::of_command(
+        sb.command()
+            .current_dir(&a)
+            .args(["get", &server.url("/alpha-only")])
+            .env("AILO_DUMP_DIR", &shared),
+    )
+    .ok();
+
+    let log_in_beta = Run::of_command(
+        sb.command()
+            .current_dir(&b)
+            .args(["log"])
+            .env("AILO_DUMP_DIR", &shared),
+    );
+    log_in_beta.ok();
+    assert!(
+        !log_in_beta.stdout.contains("/alpha-only"),
+        "別 workspace のダンプが見えている:\n{}",
+        log_in_beta.stdout
+    );
 }
 
 /// 使えない workspace 名は、どこから来たかを添えて拒むこと。
@@ -204,5 +260,21 @@ fn new_refuses_a_broken_definition_and_keeps_the_work() {
 
     assert_ne!(run.code, 0);
     assert!(run.stderr.contains("残してあります"), "{}", run.stderr);
+    assert!(sb.run(&["ls"]).ok().contains("ありません"));
+}
+
+/// **`ailo new` も `ailo save` と同じ秘匿値のガードを通ること。**
+///
+/// 新しい入口だけが素通しだと、既存の安全境界を迂回できてしまう。
+#[test]
+fn new_refuses_a_definition_with_a_literal_secret() {
+    let sb = Sandbox::new();
+    let editor = sb.editor(
+        "printf 'method = \"GET\"\nurl = \"https://example.com\"\nitems = [\"Authorization: Bearer real-secret\"]\n' > \"$1\"\n",
+    );
+    let run = Run::of_command(sb.command().args(["new", "leaky"]).env("EDITOR", &editor));
+
+    assert_ne!(run.code, 0, "平文の秘匿値が登録できてしまった");
+    assert!(run.stderr.contains("ailo secret set"), "{}", run.stderr);
     assert!(sb.run(&["ls"]).ok().contains("ありません"));
 }

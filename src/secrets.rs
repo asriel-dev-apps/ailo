@@ -28,7 +28,14 @@ pub const ENV_PREFIX: &str = "AILO_SECRET_";
 /// 名前付きは `<workspace>/<env>/<キー>` にして、workspace をまたいで同じ account に
 /// ならないようにする。workspace 名に `/` と `.` を許していないのはこのため。
 fn account(env: &str, key: &str) -> String {
-    match crate::workspace::current().name() {
+    account_in(crate::workspace::current().name(), env, key)
+}
+
+/// workspace を引数で受ける純関数。**形をテストで固定できるようにするため。**
+/// プロセス全体で 1 つのグローバルに依存していると、名前付きの形を単体テストで
+/// 押さえられず、旧形式に戻しても緑のままになる。
+fn account_in(workspace: Option<&str>, env: &str, key: &str) -> String {
+    match workspace {
         None => format!("{env}/{key}"),
         Some(ws) => format!("{ws}/{env}/{key}"),
     }
@@ -61,20 +68,29 @@ pub fn env_var_name(env: &str, key: &str) -> String {
     format!("{}{}", env_prefix_for(env), normalize_part(key))
 }
 
+/// workspace を引数で受ける純関数。形をテストで固定するため。
+fn env_prefix_in(workspace: Option<&str>, env: &str) -> String {
+    match workspace {
+        None => format!("{ENV_PREFIX}{}_", normalize_part(env)),
+        // **境界は `__`。** workspace 名は `_` を許さず `--` も許さないので、
+        // 正規化しても `__` は名前の中に現れない。単一の `_` で区切ると
+        // workspace `a` + 環境 `b_c` と workspace `a_b` + 環境 `c` が同じ名前になり、
+        // 別の workspace の秘匿値を読めてしまう。
+        Some(ws) => format!(
+            "{ENV_PREFIX}{}__{}_",
+            normalize_part(ws),
+            normalize_part(env)
+        ),
+    }
+}
+
 fn normalize_part(s: &str) -> String {
     s.to_ascii_uppercase().replace(['-', '.'], "_")
 }
 
 /// その環境の秘匿値に付く接頭辞。末尾の `_` まで含む。
 fn env_prefix_for(env: &str) -> String {
-    match crate::workspace::current().name() {
-        None => format!("{ENV_PREFIX}{}_", normalize_part(env)),
-        Some(ws) => format!(
-            "{ENV_PREFIX}{}_{}_",
-            normalize_part(ws),
-            normalize_part(env)
-        ),
-    }
+    env_prefix_in(crate::workspace::current().name(), env)
 }
 
 /// 1 件読む。環境変数が最優先。
@@ -266,5 +282,37 @@ mod tests {
         std::env::remove_var("AILO_SECRET_UNITTEST2_TOKEN");
         // キーチェーンに無ければ None。エラーではない。
         assert!(matches!(got, Ok(None) | Err(_)));
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_workspace_keeps_the_old_names() {
+        // 名前を足すと、既に保存した値が読めなくなる。
+        assert_eq!(account_in(None, "stg", "token"), "stg/token");
+        assert_eq!(env_prefix_in(None, "stg"), "AILO_SECRET_STG_");
+    }
+
+    #[test]
+    fn a_named_workspace_gets_its_own_namespace() {
+        assert_eq!(account_in(Some("proj"), "stg", "token"), "proj/stg/token");
+        assert_eq!(env_prefix_in(Some("proj"), "stg"), "AILO_SECRET_PROJ__STG_");
+    }
+
+    #[test]
+    fn two_workspaces_never_share_an_environment_variable_name() {
+        // 単一の `_` で区切ると、この 2 つが同じ名前になる。
+        assert_ne!(
+            env_prefix_in(Some("a"), "b_c"),
+            env_prefix_in(Some("a_b"), "c")
+        );
+        // `-` は `_` に寄るので、`_` を許すと潰れる(workspace 名の検証で塞いである)。
+        assert_ne!(
+            env_prefix_in(Some("foo-bar"), "stg"),
+            env_prefix_in(None, "stg")
+        );
     }
 }

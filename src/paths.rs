@@ -47,11 +47,15 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// ダンプの置き場所。`AILO_DUMP_DIR` で上書きできる。
+///
+/// **上書きしても workspace の分けは残す。** 素通しにすると、同じ `AILO_DUMP_DIR` を
+/// 設定した別 workspace どうしで `log` と `show` が互いのダンプを開き、
+/// `--no-redact` で保存した本文にも届いてしまう。
 pub fn dumps_dir() -> Result<PathBuf> {
     if let Some(v) = std::env::var_os("AILO_DUMP_DIR") {
         let p = PathBuf::from(v);
         if !p.as_os_str().is_empty() {
-            return Ok(p);
+            return Ok(crate::workspace::scoped(p, crate::workspace::current()));
         }
     }
     Ok(data_dir()?.join("dumps"))

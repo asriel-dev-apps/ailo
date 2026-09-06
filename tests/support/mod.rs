@@ -379,6 +379,13 @@ impl Sandbox {
         path
     }
 
+    /// 名前付き workspace の設定ディレクトリ。
+    pub fn workspace_config_dir(&self, workspace: &str) -> PathBuf {
+        let path = self.config_dir().join("workspaces").join(workspace);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     /// そのディレクトリに `.ailo` を置く。
     pub fn mark(&self, dir: &Path, workspace: &str) {
         std::fs::write(dir.join(".ailo"), format!("{workspace}\n")).unwrap();

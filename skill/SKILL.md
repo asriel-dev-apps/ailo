@@ -125,7 +125,7 @@ ailo env use stg                                           # 既定の環境を�
 リポジトリ直下に `.ailo`（中身は workspace 名 1 行）があれば、設定・保存済みリクエスト・
 秘匿値・ダンプがその workspace のものになる。無ければ既定の置き場所。
 `--workspace <名前>` で明示指定でき、そちらが勝つ。
-**秘匿値は workspace をまたがない**（環境変数は `AILO_SECRET_<WS>_<ENV>_<KEY>`）。
+**秘匿値は workspace をまたがない**（環境変数は `AILO_SECRET_<WS>__<ENV>_<KEY>`）。
 
 ## コマンド一覧
 

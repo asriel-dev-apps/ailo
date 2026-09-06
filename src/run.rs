@@ -929,6 +929,41 @@ fn write_scratch(path: &std::path::Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// 定義として成り立っているか。**`ailo save` と同じ秘匿値のガードを通す。**
+///
+/// `save` は直書きされた `Authorization:` や `password=` を見つけると保存を拒む。
+/// `new` だけが通してしまうと、既存の安全境界を新しい入口が迂回することになる。
+fn check_definition(req: &SavedRequest) -> Result<()> {
+    if req.url.trim().is_empty() {
+        bail!("`url` が空です");
+    }
+    for secret in &req.secret {
+        if !req.capture.contains_key(secret) {
+            bail!("`secret` の `{secret}` に対応する `[capture]` がありません");
+        }
+    }
+
+    let r = Redactor::new(true);
+    let mut found: Vec<String> = req
+        .items
+        .iter()
+        .filter_map(|raw| literal_secret_name(raw, &r))
+        .collect();
+    if let Some(name) = req.raw.as_deref().and_then(raw_literal_secret) {
+        found.push(format!("--raw の {name}"));
+    }
+    if let Some(name) = url_literal_secret(&req.url) {
+        found.push(name);
+    }
+    if !found.is_empty() {
+        bail!(
+            "秘匿値が直接書かれています({})。平文のファイルには残せません。\n             `ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照してください",
+            found.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// `ailo new` の雛形。**コメントで書き方を示す。** ヘルプを読み直させない。
 const TEMPLATE: &str = r#"# 送らずに登録するリクエスト。保存すると `ailo run <名前>` で実行できる。
 method = "GET"
@@ -988,25 +1023,25 @@ fn new_request(name: &str) -> Result<Outcome> {
             paths::tildify(&tmp)
         )
     })?;
-    if req.url.trim().is_empty() {
-        bail!(
-            "`url` が空です。書いたものは {} に残してあります",
+    check_definition(&req).map_err(|e| {
+        anyhow!(
+            "{e}\n書いたものは {} に残してあります",
             paths::tildify(&tmp)
-        );
-    }
-    for secret in &req.secret {
-        if !req.capture.contains_key(secret) {
-            bail!(
-                "`secret` の `{secret}` に対応する `[capture]` がありません。書いたものは {} に残してあります",
-                paths::tildify(&tmp)
-            );
-        }
-    }
+        )
+    })?;
 
     {
         // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
         let _lock = crate::config::lock_config()?;
         let mut reqs = Requests::load()?;
+        // **開いてから保存するまでの間に同じ名前が変わっていたら上書きしない。**
+        // ロックは書き込み 1 回を守るだけで、編集中の変更は防げない。
+        if reqs.get(name).cloned() != existing {
+            bail!(
+                "編集している間に `{name}` が書き換えられました。上書きしていません。\n書いたものは {} に残してあります",
+                paths::tildify(&tmp)
+            );
+        }
         reqs.put(name, req);
         reqs.save()?;
     }
