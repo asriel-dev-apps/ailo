@@ -332,6 +332,15 @@ impl Sandbox {
         std::fs::write(self.config_dir().join("config.toml"), toml).unwrap();
     }
 
+    /// `$EDITOR` として使える 1 行スクリプトを置き、その起動文字列を返す。
+    ///
+    /// スクリプトは編集対象のパスを `$1` で受け取る。
+    pub fn editor(&self, script: &str) -> String {
+        let path = self.dir.path().join("editor.sh");
+        std::fs::write(&path, script).unwrap();
+        format!("sh {}", path.display())
+    }
+
     pub fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ailo"));
         cmd.env_clear()

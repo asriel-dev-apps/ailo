@@ -80,18 +80,30 @@ pub struct EnvConfig {
     pub headers: BTreeMap<String, String>,
 }
 
+/// **片方だけ書けるようにしておく。** 両方必須だと、`keep_count` を変えたい人が
+/// `keep_days` も書かされ、書き忘れると設定全体が読めなくなる。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
+    #[serde(default = "default_keep_count")]
     pub keep_count: usize,
+    #[serde(default = "default_keep_days")]
     pub keep_days: u64,
+}
+
+fn default_keep_count() -> usize {
+    crate::dump::DEFAULT_KEEP_COUNT
+}
+
+fn default_keep_days() -> u64 {
+    crate::dump::DEFAULT_KEEP_DAYS
 }
 
 impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
-            keep_count: crate::dump::DEFAULT_KEEP_COUNT,
-            keep_days: crate::dump::DEFAULT_KEEP_DAYS,
+            keep_count: default_keep_count(),
+            keep_days: default_keep_days(),
         }
     }
 }
@@ -107,6 +119,19 @@ impl Config {
             return Ok(Self::default());
         };
         toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
+    }
+
+    /// 設定ファイルの中身をそのまま読む。無ければ空文字。
+    ///
+    /// `ailo config` は `Config` に読み込んで書き戻すのではなく、本文を直接扱う。
+    /// 読み込んで書き戻すと、人が書いたコメントと並びが消える。
+    pub fn read_text() -> Result<String> {
+        Ok(fs::read_to_string(Self::path()?).unwrap_or_default())
+    }
+
+    /// 設定ファイルを丸ごと置き換える。一時ファイル + rename、0600。
+    pub fn write_text(text: &str) -> Result<()> {
+        write_private(&Self::path()?, text)
     }
 
     /// 環境名を解決する。`--env` > `default_env`。
@@ -169,6 +194,19 @@ impl Requests {
             return Ok(Self::default());
         };
         toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
+    }
+
+    /// 設定ファイルの中身をそのまま読む。無ければ空文字。
+    ///
+    /// `ailo config` は `Config` に読み込んで書き戻すのではなく、本文を直接扱う。
+    /// 読み込んで書き戻すと、人が書いたコメントと並びが消える。
+    pub fn read_text() -> Result<String> {
+        Ok(fs::read_to_string(Self::path()?).unwrap_or_default())
+    }
+
+    /// 設定ファイルを丸ごと置き換える。一時ファイル + rename、0600。
+    pub fn write_text(text: &str) -> Result<()> {
+        write_private(&Self::path()?, text)
     }
 
     pub fn save(&self) -> Result<()> {

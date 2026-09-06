@@ -40,8 +40,11 @@ pub enum Command {
     Save(SaveArgs),
     /// 保存済みのリクエストを一覧する
     Ls,
-    /// 環境を一覧する
-    Env,
+    /// 環境を一覧する / 切り替える
+    Env(EnvArgs),
+    /// 設定ファイルを読み書きする
+    #[command(subcommand)]
+    Config(ConfigCommand),
     /// 秘匿値を出し入れする
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -173,6 +176,63 @@ pub struct SaveArgs {
     /// capture のうちキーチェーンへ入れるもの (繰り返し可)
     #[arg(long = "secret", value_name = "名前")]
     pub secrets: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct EnvArgs {
+    #[command(subcommand)]
+    pub action: Option<EnvCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EnvCommand {
+    /// 既定の環境を切り替える
+    ///
+    /// 実体は `config set default_env <名前>`。一番よく使う操作なので専用の動詞を置く。
+    /// 変更が起きることを名前で示すために `use` を残している。
+    Use {
+        /// 環境名
+        name: String,
+    },
+}
+
+/// 設定の読み書き。`git config` と同じく、ファイルの構造をそのままパスで指す。
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// $EDITOR で設定ファイルを開く
+    Edit,
+    /// 値を書く
+    Set {
+        /// 環境 (指定すると env.<名前>.vars. を補う)
+        #[arg(long, short)]
+        env: Option<String>,
+        /// キー (例: base_url / env.stg.headers.Accept)
+        key: String,
+        /// 値
+        value: String,
+    },
+    /// 値を 1 つ読む
+    Get {
+        /// 環境 (指定すると env.<名前>.vars. を補う)
+        #[arg(long, short)]
+        env: Option<String>,
+        /// キー
+        key: String,
+    },
+    /// 値を消す
+    Unset {
+        /// 環境 (指定すると env.<名前>.vars. を補う)
+        #[arg(long, short)]
+        env: Option<String>,
+        /// キー
+        key: String,
+    },
+    /// 設定を一覧する
+    List {
+        /// この環境の分だけ出す
+        #[arg(long, short)]
+        env: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

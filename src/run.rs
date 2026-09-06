@@ -10,9 +10,11 @@ use time::OffsetDateTime;
 use crate::args::{self, Item};
 use crate::capture;
 use crate::cli::{
-    Command, CommonArgs, LogArgs, RequestArgs, RunArgs, SaveArgs, SecretCommand, ShowArgs,
+    Command, CommonArgs, ConfigCommand, EnvCommand, LogArgs, RequestArgs, RunArgs, SaveArgs,
+    SecretCommand, ShowArgs,
 };
 use crate::config::{Config, LastInvocation, Requests, SavedRequest, State};
+use crate::config_edit;
 use crate::dump::{self, Dump, Retention};
 use crate::output::{self, Format, Palette};
 use crate::paths;
@@ -37,7 +39,11 @@ pub async fn run(command: Command) -> Result<Outcome> {
         Command::Run(a) => saved(&a).await,
         Command::Save(a) => save(&a),
         Command::Ls => list_requests(),
-        Command::Env => list_envs(),
+        Command::Env(a) => match a.action {
+            None => list_envs(),
+            Some(EnvCommand::Use { name }) => use_env(&name),
+        },
+        Command::Config(c) => config_command(&c),
         Command::Secret(c) => secret(&c),
         Command::Log(a) => log(&a),
         Command::Show(a) => show(&a),
@@ -732,6 +738,178 @@ fn list_envs() -> Result<Outcome> {
             .unwrap_or_default();
         println!("{mark} {:<12} {}", name, p.dim(&base));
     }
+    Ok(OK)
+}
+
+/// 既定の環境を切り替える。
+///
+/// **存在しない名前は弾く。** `prd` を `prod` と打ち間違えて通ると、以降の
+/// リクエストが全部 `base_url` 未解決で落ちる。原因が切り替えにあるとは気づきにくい。
+fn use_env(name: &str) -> Result<Outcome> {
+    crate::config::validate_env_name(name)?;
+    let cfg = Config::load()?;
+    let known: Vec<String> = cfg
+        .environments()
+        .iter()
+        .map(|s| s.to_string())
+        .chain(
+            secrets::Index::load()?
+                .environments()
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .collect();
+    if !known.iter().any(|k| k == name) {
+        if known.is_empty() {
+            bail!(
+                "環境 `{name}` はありません。まず `ailo config set -e {name} base_url <URL>` で作ってください"
+            );
+        }
+        let mut sorted = known;
+        sorted.sort();
+        sorted.dedup();
+        bail!(
+            "環境 `{name}` はありません。あるのは: {}",
+            sorted.join(", ")
+        );
+    }
+
+    edit_config(|doc| config_edit::set(doc, &["default_env".to_string()], name))?;
+    // 切り替え後の既定を必ず表示する。書き換えたことが目で見えないと確認のために
+    // もう 1 コマンド叩くことになる。
+    println!("既定の環境: {name}");
+    Ok(OK)
+}
+
+/// 設定ファイルを読み、渡された変更を適用し、`Config` として読めることを確かめてから書く。
+///
+/// 検証を通さずに書くと、`config set` の 1 回で以降すべてのリクエストが
+/// 「設定を読めません」で落ちる状態になりうる。
+fn edit_config(change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Result<()> {
+    let path = Config::path()?;
+    let text = Config::read_text()?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("{} が TOML として読めません", paths::tildify(&path)))?;
+    change(&mut doc)?;
+    let updated = doc.to_string();
+    config_edit::check(&updated)?;
+    Config::write_text(&updated)
+}
+
+fn config_command(c: &ConfigCommand) -> Result<Outcome> {
+    match c {
+        ConfigCommand::Edit => edit_in_editor(),
+        ConfigCommand::Set { env, key, value } => {
+            let path = config_edit::resolve_path(env.as_deref(), key)?;
+            edit_config(|doc| config_edit::set(doc, &path, value))?;
+            println!("{} = {}", path.join("."), value);
+            Ok(OK)
+        }
+        ConfigCommand::Get { env, key } => {
+            let path = config_edit::resolve_path(env.as_deref(), key)?;
+            let doc = load_document()?;
+            let found = config_edit::flatten(&doc, &path);
+            match found.as_slice() {
+                [] => {
+                    // 空を黙って返すと「値が空文字だった」と区別がつかない。
+                    eprintln!(
+                        "{}",
+                        Palette::detect().dim(&format!("`{}` はありません", path.join(".")))
+                    );
+                }
+                values => {
+                    for (_, v) in values {
+                        println!("{v}");
+                    }
+                }
+            }
+            Ok(OK)
+        }
+        ConfigCommand::Unset { env, key } => {
+            let path = config_edit::resolve_path(env.as_deref(), key)?;
+            let mut removed = false;
+            edit_config(|doc| {
+                removed = config_edit::unset(doc, &path)?;
+                Ok(())
+            })?;
+            if removed {
+                println!("消しました: {}", path.join("."));
+            } else {
+                eprintln!(
+                    "{}",
+                    Palette::detect().dim(&format!("`{}` はありません", path.join(".")))
+                );
+            }
+            Ok(OK)
+        }
+        ConfigCommand::List { env } => {
+            let prefix: Vec<String> = match env {
+                Some(e) => {
+                    crate::config::validate_env_name(e)?;
+                    vec!["env".to_string(), e.to_string()]
+                }
+                None => Vec::new(),
+            };
+            let doc = load_document()?;
+            for (key, value) in config_edit::flatten(&doc, &prefix) {
+                println!("{key}={value}");
+            }
+            Ok(OK)
+        }
+    }
+}
+
+fn load_document() -> Result<toml_edit::DocumentMut> {
+    let path = Config::path()?;
+    Config::read_text()?
+        .parse()
+        .with_context(|| format!("{} が TOML として読めません", paths::tildify(&path)))
+}
+
+/// `$EDITOR` で設定を開く。
+///
+/// **編集は一時ファイルで行い、読めることを確かめてから本体に書く。** 直接開かせると、
+/// 保存した瞬間に壊れた設定が正本になる。壊れていたら一時ファイルの場所を伝えて、
+/// 書いたものを捨てさせない。
+fn edit_in_editor() -> Result<Outcome> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let dir = paths::config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("config.edit.{}.toml", std::process::id()));
+    std::fs::write(&tmp, Config::read_text()?)?;
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\"", editor = editor))
+        .arg("sh")
+        .arg(&tmp)
+        .status()
+        .with_context(|| format!("エディタを起動できません: {editor}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("エディタが異常終了しました。設定は変更していません");
+    }
+
+    let edited = std::fs::read_to_string(&tmp)?;
+    if let Err(e) = edited
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(anyhow::Error::from)
+        .and_then(|_| config_edit::check(&edited))
+    {
+        // 書いたものは消さない。直して `ailo config edit` をやり直せる。
+        bail!(
+            "{e}\n編集したものは {} に残してあります",
+            paths::tildify(&tmp)
+        );
+    }
+
+    Config::write_text(&edited)?;
+    let _ = std::fs::remove_file(&tmp);
+    println!("保存しました: {}", paths::tildify(&Config::path()?));
     Ok(OK)
 }
 

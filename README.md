@@ -143,6 +143,29 @@ ailo get '{{base_url}}/users' --env prd
 未解決の `{{名前}}` が残ったら、リクエストを送らずにその名前を挙げて落ちる。
 空文字で送ってしまうと、返ってきた 401 の原因が分からなくなるため。
 
+#### 設定をコマンドで書く
+
+ファイルを手で開かなくてよい。`git config` と同じく、**ファイルの構造をそのままパスで指す**。
+
+```bash
+ailo config set -e stg base_url https://stg.example.com   # env.stg.vars.base_url
+ailo config set api_version v1                            # vars.api_version
+ailo config set env.stg.headers.Accept application/json    # フルパス
+ailo config get env.stg.vars.base_url
+ailo config list -e stg
+ailo config unset -e stg tenant
+ailo config edit                                          # $EDITOR で全体
+ailo env use stg                                          # 既定の環境を切り替える
+```
+
+- 短いキーは、`-e` があれば `env.<名前>.vars.`、無ければ `vars.` を補う。
+  人には短い形、エージェントには曖昧さの無いフルパス、という住み分け。
+- 手で書いたコメントと並びは消えない。
+- 書き込む前に設定として読めることを確かめる。読めない形になるなら書かない。
+- 秘匿らしいキー名は弾く。平文ファイルに残るため、`ailo secret set` を使う。
+- 存在しない環境には切り替えない。打ち間違いをそのまま通すと、以降のリクエストが
+  すべて未解決の変数で落ちる。
+
 ### 秘匿値
 
 値は OS のセキュアストアに入る。平文ファイルには書かない。

@@ -7,6 +7,7 @@ pub mod args;
 pub mod capture;
 pub mod cli;
 pub mod config;
+pub mod config_edit;
 pub mod dump;
 pub mod http;
 pub mod keychain;

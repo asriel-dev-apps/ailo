@@ -25,6 +25,9 @@ serde_json_path = "0.7"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "0.8"
+# toml_edit は「読んで書き戻す」ため。`config.toml` は人が手で書くファイルなので、
+# 値を 1 つ変えるたびにコメントと並びが消えるのは実質的な破壊になる。
+toml_edit = "0.22"
 
 # rustls-tls: OS の OpenSSL に依存せず、単一バイナリのまま配布するため。
 # blocking を使わないのは、後で入れる SSE で非同期が要るため。今から async で組んでおく。

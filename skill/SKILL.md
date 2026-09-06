@@ -104,6 +104,21 @@ base_url = "https://api.example.com"
 capture した値 → `[env.<名前>.vars]` → `[vars]`。
 未解決の `{{名前}}` が残ったら、送信せずにその名前を挙げて落ちる。
 
+**ファイルを開かずに `ailo config` で書ける。** `git config` と同じく、
+ファイルの構造をそのままパスで指す。エージェントは曖昧さの無いフルパスを使うとよい。
+
+```bash
+ailo config set env.stg.vars.base_url https://stg.example.com
+ailo config set -e stg base_url https://stg.example.com   # 同じ場所。-e があれば env.<名前>.vars. を補う
+ailo config get env.stg.vars.base_url
+ailo config list -e stg                                    # 名前=値 の平らな並び
+ailo config unset -e stg tenant
+ailo env use stg                                           # 既定の環境を切り替える
+```
+
+秘匿らしいキー名(`token`、`api_key` など)は `config set` では弾かれる。
+平文ファイルに残るため。`ailo secret set` に預けて `{{名前}}` で参照する。
+
 ## コマンド一覧
 
 | | |
@@ -112,6 +127,8 @@ capture した値 → `[env.<名前>.vars]` → `[vars]`。
 | `ailo run <名前> [item...]` | 保存済みを実行 |
 | `ailo save <名前> [--capture 名前=式] [--secret 名前]` | 直前のリクエストを保存 |
 | `ailo ls` / `ailo env` | 保存済み / 環境の一覧 |
+| `ailo config set\|get\|unset\|list\|edit` | 設定の読み書き(`git config` 相当) |
+| `ailo env use <名前>` | 既定の環境を切り替える |
 | `ailo secret set\|ls\|rm <env> [キー]` | 秘匿値の出し入れ |
 | `ailo log` / `ailo show <番号\|ファイル名>` | ダンプの索引 / 本体 |
 
