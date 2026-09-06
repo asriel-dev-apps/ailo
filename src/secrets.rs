@@ -137,12 +137,21 @@ pub fn load_env(env: &str) -> Result<BTreeMap<String, String>> {
         }
     }
     // 索引に無くても環境変数で渡されたものは拾う。
-    let prefix = env_prefix_for(env);
+    let workspace = crate::workspace::current().name();
+    let prefix = env_prefix_in(workspace, env);
     for (k, v) in std::env::vars() {
-        if let Some(name) = k.strip_prefix(&prefix) {
-            if !v.is_empty() {
-                out.insert(name.to_ascii_lowercase(), v);
-            }
+        let Some(name) = k.strip_prefix(&prefix) else {
+            continue;
+        };
+        // **既定 workspace は、名前付きの文法に見えるものを拾わない。**
+        // 既定の接頭辞は短いので、環境名を workspace 名と同じにするだけで
+        // `AILO_SECRET_<WS>__<ENV>_<KEY>` を丸ごと飲み込める。実測で
+        // 既定 workspace が名前付きの秘匿値を読めていた。
+        if workspace.is_none() && name.starts_with('_') {
+            continue;
+        }
+        if !v.is_empty() {
+            out.insert(name.to_ascii_lowercase(), v);
         }
     }
     Ok(out)
@@ -300,6 +309,21 @@ mod workspace_tests {
     fn a_named_workspace_gets_its_own_namespace() {
         assert_eq!(account_in(Some("proj"), "stg", "token"), "proj/stg/token");
         assert_eq!(env_prefix_in(Some("proj"), "stg"), "AILO_SECRET_PROJ__STG_");
+    }
+
+    #[test]
+    fn the_default_workspace_does_not_read_a_named_workspaces_variable() {
+        // 既定の接頭辞は名前付きのものより短い。環境名を workspace 名と同じに
+        // するだけで飲み込めてしまうので、名前付きの文法に見えるものは拾わない。
+        let named = format!("{}TOKEN", env_prefix_in(Some("alpha"), "stg"));
+        let default_prefix = env_prefix_in(None, "alpha");
+        let rest = named
+            .strip_prefix(&default_prefix)
+            .expect("接頭辞が重なる前提");
+        assert!(
+            rest.starts_with('_'),
+            "名前付きだと見分けるための `_` が無い: {rest}"
+        );
     }
 
     #[test]

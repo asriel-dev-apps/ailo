@@ -351,16 +351,28 @@ pub struct State {
 /// (実際に書けることを確認した)。名前は英数と `-` `_` `.` に限る。
 /// `.` は許すが、`.` だけ・`..` だけの名前は弾く。
 pub fn validate_env_name(env: &str) -> Result<()> {
+    let sep = |c: char| matches!(c, '-' | '_' | '.');
+    // **区切りを続けさせない。** 環境変数名では `-` も `.` も `_` に潰れるので、
+    // `a_` や `a__b` のような名前があると `AILO_SECRET_<WS>__<ENV>_<KEY>` の
+    // 区切りと見分けが付かなくなり、**別の workspace の秘匿値を拾える**。
     let ok = !env.is_empty()
         && env != "."
         && env != ".."
+        && !env.starts_with(sep)
+        && !env.ends_with(sep)
+        && !env
+            .chars()
+            .zip(env.chars().skip(1))
+            .any(|(a, b)| sep(a) && sep(b))
         && env
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if ok {
         Ok(())
     } else {
-        anyhow::bail!("環境名 `{env}` は使えません。英数字と `-` `_` `.` だけで指定してください")
+        anyhow::bail!(
+            "環境名 `{env}` は使えません。英数字と `-` `_` `.` で、区切りを続けたり端に置いたりしないでください"
+        )
     }
 }
 

@@ -203,10 +203,18 @@ async fn saved(a: &RunArgs) -> Result<Outcome> {
     let reqs = Requests::load()?;
     let saved = reqs.get(&a.name).ok_or_else(|| {
         let known = reqs.names().join(", ");
+        // どの workspace で探して見つからなかったのかを必ず添える。
         if known.is_empty() {
-            anyhow!("保存済みリクエストがありません。`ailo save <名前>` で保存してください")
+            anyhow!(
+                "保存済みリクエストがありません（{}）。`ailo new <名前>` で定義できます",
+                where_we_are()
+            )
         } else {
-            anyhow!("`{}` は保存されていません。あるのは: {known}", a.name)
+            anyhow!(
+                "`{}` は保存されていません（{}）。あるのは: {known}",
+                a.name,
+                where_we_are()
+            )
         }
     })?;
 
@@ -676,6 +684,9 @@ fn save(a: &SaveArgs) -> Result<Outcome> {
         }
     }
 
+    // `ailo new` と同じ排他に入れる。片方だけロックしても、もう片方との
+    // 同時実行で書き込みが消える。
+    let _lock = crate::config::lock_config()?;
     let mut reqs = Requests::load()?;
     reqs.put(
         &a.name,
@@ -697,7 +708,9 @@ fn save(a: &SaveArgs) -> Result<Outcome> {
 fn list_requests() -> Result<Outcome> {
     let reqs = Requests::load()?;
     if reqs.requests.is_empty() {
-        println!("保存済みリクエストはありません");
+        // どの workspace を見て空なのかが出ていないと、`.ailo` を置いた瞬間に
+        // 一覧が空になった理由が分からない。
+        println!("保存済みリクエストはありません（{}）", where_we_are());
         return Ok(OK);
     }
     let p = Palette::detect();
@@ -929,6 +942,24 @@ fn write_scratch(path: &std::path::Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// 保存済みリクエストの名前として使える文字。
+///
+/// 一時ファイル名の一部になるので、素通しにすると置き場所の外を指せる。
+/// いまは接頭辞のおかげで実害が出ていないが、**たまたま守られている**状態を残さない。
+fn validate_request_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        bail!("名前 `{name}` は使えません。英数字と `-` `_` `.` だけで指定してください")
+    }
+}
+
 /// 定義として成り立っているか。**`ailo save` と同じ秘匿値のガードを通す。**
 ///
 /// `save` は直書きされた `Authorization:` や `password=` を見つけると保存を拒む。
@@ -989,9 +1020,7 @@ secret = []
 /// (Postman がやっていること)ので、雛形を `$EDITOR` で開いて登録できるようにする。
 /// 既にある名前なら、その定義を開いて直す。
 fn new_request(name: &str) -> Result<Outcome> {
-    if name.is_empty() || name.chars().any(char::is_whitespace) {
-        bail!("名前 `{name}` は使えません。空白を含まない名前にしてください");
-    }
+    validate_request_name(name)?;
 
     let existing = Requests::load()?.get(name).cloned();
     let initial = match &existing {
@@ -1054,6 +1083,14 @@ fn new_request(name: &str) -> Result<Outcome> {
     };
     println!("{what}: {name} ({})", crate::workspace::current().label());
     Ok(OK)
+}
+
+/// いまの workspace を添える 1 行。
+///
+/// **自動で切り替わる以上、いまどこを見ているかが出ていないと動機と逆になる。**
+/// `.ailo` を置いた瞬間に `ailo ls` が空になっても、理由がどこにも出ない。
+fn where_we_are() -> String {
+    format!("workspace: {}", crate::workspace::current().label())
 }
 
 /// `$EDITOR` で設定を開く。

@@ -278,3 +278,132 @@ fn new_refuses_a_definition_with_a_literal_secret() {
     assert!(run.stderr.contains("ailo secret set"), "{}", run.stderr);
     assert!(sb.run(&["ls"]).ok().contains("ありません"));
 }
+
+/// **既定の workspace が、名前付きの秘匿値を読まないこと。**
+///
+/// 既定の環境変数の接頭辞は短いので、環境名を workspace 名と同じにするだけで
+/// `AILO_SECRET_<WS>__<ENV>_<KEY>` を丸ごと飲み込めてしまう（実際に読めていた）。
+#[test]
+fn the_default_workspace_cannot_read_a_named_workspaces_secret() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    let plain = sb.dir("no-marker");
+
+    let run = Run::of_command(
+        sb.command()
+            .current_dir(&plain)
+            .args([
+                "get",
+                &format!("{}?k={{{{_stg_token}}}}", server.url("/reflect")),
+                "-e",
+                "alpha",
+                "--pick",
+                ".query",
+            ])
+            .env("AILO_SECRET_ALPHA__STG_TOKEN", "leaked-secret"),
+    );
+    assert_ne!(run.code, 0, "既定 workspace が名前付きの秘匿値を読んでいる");
+    assert!(
+        !run.stdout.contains("leaked-secret") && !run.stderr.contains("leaked-secret"),
+        "秘匿値が出力に出ている"
+    );
+}
+
+/// 接頭辞が重なる名前どうしでも混ざらないこと。
+///
+/// 区切りが 1 文字だと、workspace `a` + 環境 `b-c` と workspace `a-b` + 環境 `c` が
+/// 同じ環境変数名になる。
+#[test]
+fn workspaces_with_overlapping_prefixes_do_not_share_secrets() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    let short = sb.dir("short");
+    let long = sb.dir("long");
+    sb.mark(&short, "a");
+    sb.mark(&long, "a-b");
+
+    let url = format!("{}?k={{{{token}}}}", server.url("/reflect"));
+
+    // workspace `a` / 環境 `b-c` に置いた値。
+    let owner = Run::of_command(
+        sb.command()
+            .current_dir(&short)
+            .args(["get", &url, "-e", "b-c", "--pick", ".query"])
+            .env("AILO_SECRET_A__B_C_TOKEN", "owned-by-a"),
+    );
+    assert_eq!(owner.ok(), "k=owned-by-a");
+
+    // workspace `a-b` / 環境 `c` からは見えないこと。
+    let other = Run::of_command(
+        sb.command()
+            .current_dir(&long)
+            .args(["get", &url, "-e", "c", "--pick", ".query"])
+            .env("AILO_SECRET_A__B_C_TOKEN", "owned-by-a"),
+    );
+    assert_ne!(other.code, 0, "別 workspace が同じ環境変数を読んでいる");
+    assert!(!other.stdout.contains("owned-by-a"));
+}
+
+/// `AILO_WORKSPACE` が `.ailo` より強く、`--workspace` より弱いこと。
+#[test]
+fn the_environment_variable_sits_between_the_flag_and_the_marker() {
+    let sb = Sandbox::new();
+    let dir = sb.dir("project");
+    sb.mark(&dir, "from-marker");
+
+    sb.run_in(&dir, &["config", "set", "who", "marker"]).ok();
+    Run::of_command(
+        sb.command()
+            .current_dir(&dir)
+            .args(["config", "set", "who", "envvar"])
+            .env("AILO_WORKSPACE", "from-env"),
+    )
+    .ok();
+
+    // 環境変数が `.ailo` に勝つ。
+    let from_env = Run::of_command(
+        sb.command()
+            .current_dir(&dir)
+            .args(["config", "get", "who"])
+            .env("AILO_WORKSPACE", "from-env"),
+    );
+    assert_eq!(from_env.ok(), "envvar");
+
+    // フラグが環境変数に勝つ。
+    let from_flag = Run::of_command(
+        sb.command()
+            .current_dir(&dir)
+            .args(["-w", "from-marker", "config", "get", "who"])
+            .env("AILO_WORKSPACE", "from-env"),
+    );
+    assert_eq!(from_flag.ok(), "marker");
+}
+
+/// 読めない `.ailo` を「無い」として既定へ落とさないこと。
+///
+/// 黙って落ちると、マーカーがあるのに既定へ書き、以後の秘匿値も別の名前空間になる。
+#[test]
+fn a_marker_that_cannot_be_read_stops_rather_than_falling_back() {
+    let sb = Sandbox::new();
+    let dir = sb.dir("bad-perm");
+    // ディレクトリにして「あるが読めない」を作る。
+    std::fs::create_dir(dir.join(".ailo")).unwrap();
+
+    let run = sb.run_in(&dir, &["config", "set", "who", "silent-default"]);
+    assert_ne!(run.code, 0, "黙って既定 workspace に書いている");
+    assert!(run.stderr.contains(".ailo"), "{}", run.stderr);
+}
+
+/// いまどの workspace を見ているかが、空の一覧に出ること。
+#[test]
+fn an_empty_listing_says_which_workspace_it_looked_in() {
+    let sb = Sandbox::new();
+    let dir = sb.dir("project");
+    sb.mark(&dir, "alpha");
+
+    assert!(sb.run_in(&dir, &["ls"]).ok().contains("alpha"));
+    // 既定は括弧を二重にしない。
+    let default = sb.run(&["ls"]).ok().to_string();
+    assert!(default.contains("既定"), "{default}");
+    assert!(!default.contains("((既定))"), "{default}");
+}
