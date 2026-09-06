@@ -118,6 +118,7 @@ ailo env use stg                                           # 既定の環境を�
 
 秘匿らしいキー名(`token`、`api_key` など)は `config set` では弾かれる。
 平文ファイルに残るため。`ailo secret set` に預けて `{{名前}}` で参照する。
+`config get` / `config unset` は対象が無ければ終了コード 1(値が空文字なら 0)。
 
 ## コマンド一覧
 

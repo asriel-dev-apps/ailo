@@ -59,6 +59,12 @@ pub fn resolve_path(env: Option<&str>, key: &str) -> Result<Vec<String>> {
     match env {
         Some(e) => {
             validate_env_name(e)?;
+            // **`.` を含む環境名は `-e` から作らせない。** 作れてしまうと、
+            // `config list` の出力(`.` で連結するだけ)がパスとして読み戻せなくなり、
+            // 「エージェントには曖昧さの無いフルパス」という前提が崩れる。
+            if e.contains('.') {
+                bail!("環境名に `.` は使えません(`{e}`)。パスの区切りと見分けが付かなくなります");
+            }
             let mut path = vec!["env".to_string(), e.to_string(), "vars".to_string()];
             path.extend(segments);
             Ok(path)
@@ -79,7 +85,7 @@ pub fn resolve_path(env: Option<&str>, key: &str) -> Result<Vec<String>> {
 /// **テンプレート(`{{...}}`)は通す。** `Authorization = "Bearer {{access_token}}"` は
 /// 設定に書くのが正しい形で、値そのものはキーチェーンにある。
 fn refuse_secret(path: &[String], value: &str) -> Result<()> {
-    if value.contains("{{") {
+    if is_only_templates(value) {
         return Ok(());
     }
     let Some(last) = path.last() else {
@@ -103,8 +109,61 @@ fn refuse_secret(path: &[String], value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 値が `{{...}}` の参照(と、その周りの飾り)だけでできているか。
+///
+/// **「`{{` を含むか」で判定してはいけない。** それだと `sk-live-xxxx{{}}` のような値が
+/// そのまま通り、平文で残る。参照を全部取り除いた残りに中身があるなら、
+/// それは直書きされた値として扱う。`Bearer {{access_token}}` の `Bearer ` のように
+/// 語句が残る形は普通にあるので、残りは**英数字を含まないこと**を条件にする。
+fn is_only_templates(value: &str) -> bool {
+    let mut rest = String::new();
+    let mut cursor = value;
+    let mut saw_template = false;
+    while let Some(start) = cursor.find("{{") {
+        rest.push_str(&cursor[..start]);
+        let after = &cursor[start + 2..];
+        let Some(end) = after.find("}}") else {
+            rest.push_str(after);
+            cursor = "";
+            break;
+        };
+        saw_template = true;
+        cursor = &after[end + 2..];
+    }
+    rest.push_str(cursor);
+    if !saw_template {
+        return false;
+    }
+    // 残ってよいのは `Bearer ` のような**単語 1 つ**まで。`sk-live-abcdef{{}}` の
+    // ように値そのものが残る形、`{{a}}` を挟んで前後に断片がある形は通さない。
+    let words: Vec<&str> = rest
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    match words.as_slice() {
+        [] => true,
+        [only] => only.len() <= 10 && only.chars().all(|c| c.is_ascii_alphabetic()),
+        _ => false,
+    }
+}
+
+/// 制御文字を含む値を拒む。
+///
+/// `config list` は「名前=値」の 1 行 1 件でエージェントに読ませる出力なので、
+/// 改行が 1 つ混ざるだけで以降の行が別のキーに見える。
+fn refuse_control_characters(value: &str) -> Result<()> {
+    if let Some(c) = value.chars().find(|c| c.is_control()) {
+        bail!(
+            "値に制御文字(U+{:04X})は使えません。`ailo config list` の 1 行 1 件が壊れます。\n             改行を含む値が要るなら `ailo config edit` で直接書いてください",
+            c as u32
+        );
+    }
+    Ok(())
+}
+
 /// パスの位置に値を書く。途中のテーブルは作る。
 pub fn set(doc: &mut DocumentMut, path: &[String], value: &str) -> Result<()> {
+    refuse_control_characters(value)?;
     refuse_secret(path, value)?;
 
     let (last, parents) = path.split_last().expect("パスは空でない");
@@ -324,6 +383,45 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("ailo secret set"), "{err}");
+    }
+
+    #[test]
+    fn a_secret_with_a_template_glued_on_is_still_refused() {
+        // `{{` を含むかどうかで判定すると、これが素通りする。
+        let mut d = doc("");
+        for value in [
+            "sk-live-abcdef{{}}",
+            "{{}}sk-live-abcdef",
+            "abcdef{{x}}ghijkl",
+        ] {
+            assert!(
+                set(
+                    &mut d,
+                    &["env".into(), "prd".into(), "vars".into(), "token".into()],
+                    value,
+                )
+                .is_err(),
+                "`{value}` が通ってしまった"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_with_a_newline_is_refused() {
+        // `config list` の 1 行 1 件が壊れる。
+        let mut d = doc("");
+        let err = set(&mut d, &["vars".into(), "note".into()], "1 行目\n2 行目=x")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("制御文字"), "{err}");
+    }
+
+    #[test]
+    fn an_environment_name_with_a_dot_is_refused_for_the_short_form() {
+        let err = resolve_path(Some("prd.vars.token"), "foo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains('.'), "{err}");
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub struct Outcome {
 }
 
 const OK: Outcome = Outcome { code: 0 };
+/// 「探したが無かった」。エラー(2)ではない。`git config` と同じ流儀。
+const NOT_FOUND: Outcome = Outcome { code: 1 };
 
 pub async fn run(command: Command) -> Result<Outcome> {
     if let Some((method, a)) = command.as_request() {
@@ -721,10 +723,8 @@ fn list_envs() -> Result<Outcome> {
         }
     }
     if names.is_empty() {
-        println!(
-            "環境はまだありません。{} に書いてください",
-            paths::tildify(&Config::path()?)
-        );
+        // 手でファイルを開かせない。それを無くすために `config` を足した。
+        println!("環境はまだありません。`ailo config set -e <名前> base_url <URL>` で作れます");
         return Ok(OK);
     }
     names.sort();
@@ -746,9 +746,23 @@ fn list_envs() -> Result<Outcome> {
 /// **存在しない名前は弾く。** `prd` を `prod` と打ち間違えて通ると、以降の
 /// リクエストが全部 `base_url` 未解決で落ちる。原因が切り替えにあるとは気づきにくい。
 fn use_env(name: &str) -> Result<Outcome> {
+    ensure_env_exists(name)?;
+    edit_config(|doc| config_edit::set(doc, &["default_env".to_string()], name))?;
+    // 切り替え後の既定を必ず表示する。書き換えたことが目で見えないと確認のために
+    // もう 1 コマンド叩くことになる。
+    println!("既定の環境: {name}");
+    Ok(OK)
+}
+
+/// 既定にしてよい環境かどうか。
+///
+/// **`env use` と `config set default_env` の両方から通す。** 片方だけに置くと、
+/// フルパスを勧めているエージェントのほうが検証の無い経路を通ることになる。
+/// 打ち間違いをそのまま通すと、以降のリクエストが全部未解決の変数で落ちる。
+fn ensure_env_exists(name: &str) -> Result<()> {
     crate::config::validate_env_name(name)?;
     let cfg = Config::load()?;
-    let known: Vec<String> = cfg
+    let mut known: Vec<String> = cfg
         .environments()
         .iter()
         .map(|s| s.to_string())
@@ -759,26 +773,17 @@ fn use_env(name: &str) -> Result<Outcome> {
                 .map(|s| s.to_string()),
         )
         .collect();
-    if !known.iter().any(|k| k == name) {
-        if known.is_empty() {
-            bail!(
-                "環境 `{name}` はありません。まず `ailo config set -e {name} base_url <URL>` で作ってください"
-            );
-        }
-        let mut sorted = known;
-        sorted.sort();
-        sorted.dedup();
+    if known.iter().any(|k| k == name) {
+        return Ok(());
+    }
+    if known.is_empty() {
         bail!(
-            "環境 `{name}` はありません。あるのは: {}",
-            sorted.join(", ")
+            "環境 `{name}` はありません。まず `ailo config set -e {name} base_url <URL>` で作ってください"
         );
     }
-
-    edit_config(|doc| config_edit::set(doc, &["default_env".to_string()], name))?;
-    // 切り替え後の既定を必ず表示する。書き換えたことが目で見えないと確認のために
-    // もう 1 コマンド叩くことになる。
-    println!("既定の環境: {name}");
-    Ok(OK)
+    known.sort();
+    known.dedup();
+    bail!("環境 `{name}` はありません。あるのは: {}", known.join(", "))
 }
 
 /// 設定ファイルを読み、渡された変更を適用し、`Config` として読めることを確かめてから書く。
@@ -786,6 +791,9 @@ fn use_env(name: &str) -> Result<Outcome> {
 /// 検証を通さずに書くと、`config set` の 1 回で以降すべてのリクエストが
 /// 「設定を読めません」で落ちる状態になりうる。
 fn edit_config(change: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>) -> Result<()> {
+    // 「読む → 変える → 書き戻す」全体を排他する。取らないと、同時に走った
+    // `config set` が互いの結果を捨て合い、しかも全部が成功として終わる。
+    let _lock = crate::config::lock_config()?;
     let path = Config::path()?;
     let text = Config::read_text()?;
     let mut doc: toml_edit::DocumentMut = text
@@ -802,6 +810,9 @@ fn config_command(c: &ConfigCommand) -> Result<Outcome> {
         ConfigCommand::Edit => edit_in_editor(),
         ConfigCommand::Set { env, key, value } => {
             let path = config_edit::resolve_path(env.as_deref(), key)?;
+            if path == ["default_env"] {
+                ensure_env_exists(value)?;
+            }
             edit_config(|doc| config_edit::set(doc, &path, value))?;
             println!("{} = {}", path.join("."), value);
             Ok(OK)
@@ -812,11 +823,14 @@ fn config_command(c: &ConfigCommand) -> Result<Outcome> {
             let found = config_edit::flatten(&doc, &path);
             match found.as_slice() {
                 [] => {
-                    // 空を黙って返すと「値が空文字だった」と区別がつかない。
+                    // **空文字が入っていた場合と区別できる形で終える。** stderr だけに
+                    // 書いても、`$(ailo config get k)` と終了コードしか見ない
+                    // エージェントには届かない。`git config` と同じく 1 で終える。
                     eprintln!(
                         "{}",
                         Palette::detect().dim(&format!("`{}` はありません", path.join(".")))
                     );
+                    return Ok(NOT_FOUND);
                 }
                 values => {
                     for (_, v) in values {
@@ -833,14 +847,14 @@ fn config_command(c: &ConfigCommand) -> Result<Outcome> {
                 removed = config_edit::unset(doc, &path)?;
                 Ok(())
             })?;
-            if removed {
-                println!("消しました: {}", path.join("."));
-            } else {
+            if !removed {
                 eprintln!(
                     "{}",
                     Palette::detect().dim(&format!("`{}` はありません", path.join(".")))
                 );
+                return Ok(NOT_FOUND);
             }
+            println!("消しました: {}", path.join("."));
             Ok(OK)
         }
         ConfigCommand::List { env } => {
@@ -873,15 +887,33 @@ fn load_document() -> Result<toml_edit::DocumentMut> {
 /// 保存した瞬間に壊れた設定が正本になる。壊れていたら一時ファイルの場所を伝えて、
 /// 書いたものを捨てさせない。
 fn edit_in_editor() -> Result<Outcome> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
+    // 空文字は「設定されていない」と同じに扱う。素通しにすると一時ファイル自体を
+    // 実行しようとして "Permission denied" になり、原因が分からない。
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
 
     let dir = paths::config_dir()?;
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("config.edit.{}.toml", std::process::id()));
-    std::fs::write(&tmp, Config::read_text()?)?;
+    // **一時ファイルも 0600 で作る。** 中身は設定ファイルの複製なので、本体を
+    // 0600 で書いておきながらここが 0644 では、編集している間だけ同じ内容が
+    // 誰にでも読める状態になる。
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("{} を作れません", paths::tildify(&tmp)))?;
+        f.write_all(Config::read_text()?.as_bytes())?;
+    }
 
+    let before = Config::read_text()?;
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$1\"", editor = editor))
@@ -889,12 +921,22 @@ fn edit_in_editor() -> Result<Outcome> {
         .arg(&tmp)
         .status()
         .with_context(|| format!("エディタを起動できません: {editor}"))?;
+    let edited = std::fs::read_to_string(&tmp)?;
+
     if !status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        bail!("エディタが異常終了しました。設定は変更していません");
+        // **書いたものは、書き換えられていれば残す。** `vim` の `:cq`、エディタの
+        // クラッシュ、接続断はどれも「保存済み・非ゼロ終了」になる。ここで消すと、
+        // 唯一「人の手作業が消える」経路になる。
+        if edited == before {
+            let _ = std::fs::remove_file(&tmp);
+            bail!("エディタが異常終了しました。設定は変更していません");
+        }
+        bail!(
+            "エディタが異常終了しました。設定は変更していません。\n編集内容は {} に残してあります",
+            paths::tildify(&tmp)
+        );
     }
 
-    let edited = std::fs::read_to_string(&tmp)?;
     if let Err(e) = edited
         .parse::<toml_edit::DocumentMut>()
         .map_err(anyhow::Error::from)
@@ -903,6 +945,17 @@ fn edit_in_editor() -> Result<Outcome> {
         // 書いたものは消さない。直して `ailo config edit` をやり直せる。
         bail!(
             "{e}\n編集したものは {} に残してあります",
+            paths::tildify(&tmp)
+        );
+    }
+
+    // 書く直前に排他を取り、読んだときから変わっていないことを確かめる。
+    // エディタは何分も開きっぱなしになるので、その間の `config set` を
+    // 黙って巻き戻さない。
+    let _lock = crate::config::lock_config()?;
+    if Config::read_text()? != before {
+        bail!(
+            "編集している間に設定が書き換えられました。上書きしていません。\n編集内容は {} に残してあります",
             paths::tildify(&tmp)
         );
     }

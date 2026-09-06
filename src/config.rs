@@ -4,7 +4,7 @@
 //!
 //! | ファイル | 場所 | 書き換える主体 |
 //! | --- | --- | --- |
-//! | `config.toml` | 設定ディレクトリ | 人間が手で書く |
+//! | `config.toml` | 設定ディレクトリ | 人間と `ailo config` |
 //! | `requests.toml` | 設定ディレクトリ | `ailo save` |
 //! | `state/<env>.toml` | データディレクトリ | キャプチャ |
 //!
@@ -108,6 +108,72 @@ impl Default for RetentionConfig {
     }
 }
 
+/// 置き去りのロックを奪ってよいまでの秒数。
+const LOCK_STALE_SECS: u64 = 60;
+/// ロックを待つ上限。人が待てる範囲で、かつ 1 回の書き換えには十分長い。
+const LOCK_WAIT_MS: u64 = 3000;
+
+/// 設定ファイルの読み書きを直列化する。
+///
+/// **`write_private` が保証するのは 1 回の書き込みの原子性だけで、
+/// 「読む → 変える → 書き戻す」の原子性ではない。** 排他が無いと、同時に走った
+/// `ailo config set` は互いの結果を捨て合い、しかも全部が成功として終わる。
+/// 主利用者はエージェントで、セットアップを並列に流すのは普通の使い方なので、
+/// ここは「たまたま起きない」に頼れない。
+pub struct ConfigLock {
+    path: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// 設定ファイルのロックを取る。取れるまで少し待ち、駄目なら失敗させる。
+///
+/// 掃除のロック(`dump.rs`)と違い、**取れなければ見送るのではなく落とす**。
+/// 掃除は後回しにできるが、設定の書き換えを黙って見送ると値が消えたのと同じになる。
+pub fn lock_config() -> Result<ConfigLock> {
+    let dir = paths::config_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("config.lock");
+
+    let started = std::time::Instant::now();
+    loop {
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => return Ok(ConfigLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // 書き換えの途中で落ちるとロックが残る。古すぎるものは奪って進む。
+                let stale = fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                    .is_some_and(|age| age.as_secs() > LOCK_STALE_SECS);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                if started.elapsed().as_millis() as u64 >= LOCK_WAIT_MS {
+                    anyhow::bail!(
+                        "他の ailo が設定を書き換えています。少し待ってやり直してください({} が残り続ける場合は消してください)",
+                        paths::tildify(&path)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("{} を作れません", paths::tildify(&path)))
+            }
+        }
+    }
+}
+
 impl Config {
     pub fn path() -> Result<PathBuf> {
         Ok(paths::config_dir()?.join("config.toml"))
@@ -194,19 +260,6 @@ impl Requests {
             return Ok(Self::default());
         };
         toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
-    }
-
-    /// 設定ファイルの中身をそのまま読む。無ければ空文字。
-    ///
-    /// `ailo config` は `Config` に読み込んで書き戻すのではなく、本文を直接扱う。
-    /// 読み込んで書き戻すと、人が書いたコメントと並びが消える。
-    pub fn read_text() -> Result<String> {
-        Ok(fs::read_to_string(Self::path()?).unwrap_or_default())
-    }
-
-    /// 設定ファイルを丸ごと置き換える。一時ファイル + rename、0600。
-    pub fn write_text(text: &str) -> Result<()> {
-        write_private(&Self::path()?, text)
     }
 
     pub fn save(&self) -> Result<()> {

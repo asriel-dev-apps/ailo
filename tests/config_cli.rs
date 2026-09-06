@@ -78,7 +78,7 @@ fn a_value_can_be_removed_and_absence_is_reported() {
     assert_eq!(sb.run(&["config", "list"]).ok(), "");
 
     let run = sb.run(&["config", "unset", "who"]);
-    run.ok();
+    assert_eq!(run.code, 1, "無いものを消したことが終了コードに出ていない");
     assert!(run.stderr.contains("ありません"), "{}", run.stderr);
 }
 
@@ -185,4 +185,137 @@ fn config_edit_refuses_a_document_that_would_not_load() {
     let run = Run::of_command(sb.command().args(["config", "edit"]).env("EDITOR", &editor));
     assert_ne!(run.code, 0);
     assert!(run.stderr.contains("設定として読めない"), "{}", run.stderr);
+}
+
+/// 編集用の一時ファイルも 0600 で作られること。
+///
+/// 中身は設定ファイルの複製。本体を 0600 で書きながらここが 0644 では、
+/// 編集している間だけ同じ内容が誰にでも読める状態になる。
+#[test]
+fn the_file_handed_to_the_editor_is_not_world_readable() {
+    let sb = Sandbox::new();
+    // エディタ自身に権限を測らせ、その結果を設定として書き戻させる。
+    let editor = sb.editor(
+        "m=$(stat -f %Lp \"$1\" 2>/dev/null || stat -c %a \"$1\")\n\
+         printf '[vars]\\nmode = \"%s\"\\n' \"$m\" > \"$1\"\n",
+    );
+
+    Run::of_command(sb.command().args(["config", "edit"]).env("EDITOR", &editor)).ok();
+    assert_eq!(sb.run(&["config", "get", "mode"]).ok(), "600");
+}
+
+/// 同時に走った `config set` が互いの結果を捨て合わないこと。
+///
+/// **主利用者はエージェントで、セットアップを並列に流すのは普通の使い方。**
+/// `write_private` が保証するのは 1 回の書き込みの原子性だけで、
+/// 「読む → 変える → 書き戻す」の原子性ではない。
+#[test]
+fn concurrent_writes_do_not_lose_each_other() {
+    let sb = Sandbox::new();
+    let children: Vec<_> = (0..8)
+        .map(|i| {
+            sb.command()
+                .args(["config", "set", &format!("k{i}"), &format!("v{i}")])
+                .spawn()
+                .expect("ailo を起動できない")
+        })
+        .collect();
+    for mut child in children {
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}");
+    }
+
+    let listed = sb.run(&["config", "list"]).ok().to_string();
+    for i in 0..8 {
+        assert!(
+            listed.contains(&format!("vars.k{i}=v{i}")),
+            "k{i} が消えている:\n{listed}"
+        );
+    }
+}
+
+/// `config set default_env` も、`env use` と同じく存在しない環境名を弾くこと。
+///
+/// エージェントにはフルパスを勧めているので、検証がこちらに無いと
+/// **勧めたほうの経路にだけガードが無い**ことになる。
+#[test]
+fn setting_default_env_directly_is_validated_too() {
+    let sb = Sandbox::new();
+    sb.run(&["config", "set", "-e", "stg", "base_url", "http://x"])
+        .ok();
+
+    let run = sb.run(&["config", "set", "default_env", "prod"]);
+    assert_ne!(run.code, 0);
+    assert!(run.stderr.contains("stg"), "{}", run.stderr);
+    assert!(!sb.run(&["config", "list"]).ok().contains("default_env"));
+
+    sb.run(&["config", "set", "default_env", "stg"]).ok();
+}
+
+/// 「無い」と「空文字が入っている」を終了コードで区別できること。
+#[test]
+fn a_missing_value_and_an_empty_value_are_told_apart_by_the_exit_code() {
+    let sb = Sandbox::new();
+    assert_eq!(sb.run(&["config", "get", "nope"]).code, 1);
+
+    sb.run(&["config", "set", "empty", ""]).ok();
+    let found = sb.run(&["config", "get", "empty"]);
+    assert_eq!(found.code, 0);
+    assert_eq!(found.stdout, "\n");
+
+    // 消すときも同じ。
+    assert_eq!(sb.run(&["config", "unset", "nope"]).code, 1);
+    assert_eq!(sb.run(&["config", "unset", "empty"]).code, 0);
+}
+
+/// テンプレートを混ぜただけの秘匿値は通さないこと。
+#[test]
+fn a_secret_with_a_template_glued_on_does_not_slip_through() {
+    let sb = Sandbox::new();
+    let run = sb.run(&["config", "set", "-e", "prd", "token", "sk-live-abcdef{{}}"]);
+    assert_ne!(run.code, 0, "平文の秘匿値が通ってしまった");
+    assert!(run.stderr.contains("ailo secret set"), "{}", run.stderr);
+    assert_eq!(sb.run(&["config", "list"]).ok(), "");
+}
+
+/// 改行を含む値は拒むこと。`config list` の 1 行 1 件が壊れる。
+#[test]
+fn a_value_with_a_newline_is_refused() {
+    let sb = Sandbox::new();
+    let run = sb.run(&["config", "set", "note", "1 行目\n2 行目=x"]);
+    assert_ne!(run.code, 0);
+    assert!(run.stderr.contains("制御文字"), "{}", run.stderr);
+}
+
+/// エディタが保存後に異常終了しても、書いたものを捨てないこと。
+///
+/// `vim` の `:cq`、クラッシュ、接続断はどれも「保存済み・非ゼロ終了」になる。
+#[test]
+fn config_edit_keeps_the_work_when_the_editor_exits_with_a_failure() {
+    let sb = Sandbox::new();
+    sb.run(&["config", "set", "who", "taro"]).ok();
+
+    let editor = sb.editor("printf '[vars]\\nwho = \"hanako\"\\n' > \"$1\"\nexit 1\n");
+    let run = Run::of_command(sb.command().args(["config", "edit"]).env("EDITOR", &editor));
+    assert_ne!(run.code, 0);
+    // 本体は変わっていない。
+    assert_eq!(sb.run(&["config", "get", "who"]).ok(), "taro");
+    // 書いたものの居場所が伝わる。
+    assert!(run.stderr.contains("config.edit"), "{}", run.stderr);
+}
+
+/// 何も書き換えずにエディタが失敗したときは、残骸を置いていかないこと。
+#[test]
+fn config_edit_leaves_nothing_behind_when_the_editor_changed_nothing() {
+    let sb = Sandbox::new();
+    let editor = sb.editor("exit 1\n");
+    let run = Run::of_command(sb.command().args(["config", "edit"]).env("EDITOR", &editor));
+    assert_ne!(run.code, 0);
+
+    let leftovers: Vec<_> = std::fs::read_dir(sb.config_dir())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains("config.edit"))
+        .collect();
+    assert!(leftovers.is_empty(), "残骸がある: {leftovers:?}");
 }
