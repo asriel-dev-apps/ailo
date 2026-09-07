@@ -89,6 +89,9 @@ fn merge(a: Shape, b: Shape) -> Shape {
         return a;
     }
     match (a, b) {
+        // 空の配列は要素の型を何も語らない。片方が空なら、もう片方をそのまま採る。
+        // union に混ぜると `…|empty` のような、読んでも意味の取れない型が出る。
+        (Shape::Elided("empty"), other) | (other, Shape::Elided("empty")) => other,
         (Shape::Object(mut xs), Shape::Object(ys)) => {
             // キーの出現順を保ちつつ、片方にしかないキーも残す。
             for (k, v) in ys {
@@ -277,6 +280,16 @@ mod tests {
         assert!(out.contains("object"), "{out}");
         // 打ち切っているので出力は短いままであること。
         assert!(out.chars().count() < 120, "打ち切れていない: {out}");
+    }
+
+    #[test]
+    fn an_empty_array_does_not_pollute_the_element_type_of_its_siblings() {
+        // 実 API で出た。`labels` が 0 件の要素と 4 件の要素に分かれていて、
+        // 畳んだ結果が `…|empty` になった。読んでも何の型か分からない。
+        let v = json!([{"labels": []}, {"labels": [{"name": "x"}]}]);
+        let out = of_with_depth(&v, 2).render();
+        assert!(!out.contains("empty"), "{out}");
+        assert!(out.contains("labels: [1 item] …"), "{out}");
     }
 
     #[test]
