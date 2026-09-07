@@ -105,7 +105,9 @@ pub struct CommonArgs {
     pub shape: bool,
 
     /// --shape の展開する深さ (既定 6)
-    #[arg(long, requires = "shape", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    ///
+    /// 上限 128 は serde_json の再帰上限。それ以上を許しても、読める JSON は無い。
+    #[arg(long, requires = "shape", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=128))]
     pub depth: Option<usize>,
 
     /// 本文の表示行数

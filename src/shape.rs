@@ -44,7 +44,19 @@ fn shape_at(value: &Value, depth: usize) -> Shape {
         Value::String(_) => Shape::String,
         Value::Array(items) => {
             if depth == 0 {
-                return Shape::Elided("array");
+                // **要素数は捨てない。** 深さの上限は「中を展開しない」という指定であって、
+                // 「この配列について何も言わない」ではない。ここで長さまで落とすと
+                // 0 件の配列と 30 件の配列が同じ `array` になり、
+                // 「いま何件あるか」という一番よく要る情報が深さを上げないと取れなくなる。
+                let elem = if items.is_empty() {
+                    Shape::Elided("empty")
+                } else {
+                    Shape::Elided("…")
+                };
+                return Shape::Array {
+                    len: items.len(),
+                    elem: Box::new(elem),
+                };
             }
             // 全要素を畳んで 1 つの要素型にする。要素ごとにキーが違う配列でも
             // 「どのキーが現れうるか」が 1 行で分かる。
@@ -265,6 +277,18 @@ mod tests {
         assert!(out.contains("object"), "{out}");
         // 打ち切っているので出力は短いままであること。
         assert!(out.chars().count() < 120, "打ち切れていない: {out}");
+    }
+
+    #[test]
+    fn a_cut_off_array_still_reports_how_many_elements_it_has() {
+        // 打ち切りは「中を見せない」であって「件数も言わない」ではない。
+        // 0 件と 30 件が同じ表示になると、深さを上げるまで件数が分からない。
+        let v = json!({"empty": [], "some": [{"a": 1}, {"a": 2}]});
+        let out = of_with_depth(&v, 1).render();
+        assert!(out.contains("empty: [0 items]"), "{out}");
+        assert!(out.contains("some: [2 items]"), "{out}");
+        // 中身は出さない。
+        assert!(!out.contains('a'), "中身が出ている: {out}");
     }
 
     #[test]

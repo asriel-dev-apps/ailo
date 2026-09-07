@@ -221,7 +221,13 @@ fn issues_body() -> String {
                     "avatar_url": "http://example.invalid/a",
                     "type": "User",
                     "site_admin": false,
-                    "plan": { "name": "free", "seats": 1, "private_repos": 0 }
+                    // 5 段目。既定の深さ 6 が本当に 6 段開いていることを、
+                    // 「4 段では出ない・6 段では出る」という形で確かめるために要る。
+                    "plan": {
+                        "name": "free",
+                        "seats": 1,
+                        "quota": { "limit": 1, "used": 0 }
+                    }
                 },
                 "labels": [
                     {

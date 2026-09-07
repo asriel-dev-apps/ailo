@@ -357,14 +357,45 @@ fn shape_depth_cuts_the_output_and_the_default_is_pinned() {
     };
 
     // 1 行目は必ずステータス行。形そのものは行数から 1 を引いた分。
-    assert_eq!(lines(&[]), 48, "既定の出力が変わった");
+    assert_eq!(lines(&[]), 52, "既定の出力が変わった");
     assert_eq!(lines(&["--depth", "1"]), 2, "深さ 1 は配列 1 行だけのはず");
     assert_eq!(lines(&["--depth", "2"]), 26);
     assert_eq!(lines(&["--depth", "3"]), 40);
-    // 入れ子の実際の深さを超えたら既定と同じになる。ここが違うと
-    // 「既定 = 深さ 6」という約束が崩れている。
     assert_eq!(lines(&["--depth", "4"]), 48);
-    assert_eq!(lines(&["--depth", "9"]), 48);
+}
+
+/// 既定が 6 段であること。
+///
+/// **行数では固定できない。** この fixture は 4 段目で打ち切っても 6 段まで開いても
+/// 48 行に収まるので、既定を 4 に変えても行数のアサーションは通ってしまう。
+/// 出力そのものを突き合わせる。
+#[test]
+fn the_default_depth_is_six() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    let url = server.url("/issues");
+    // 1 行目のステータス行には所要時間が入る。実行のたびに変わるので、形だけを比べる。
+    let out = |args: &[&str]| {
+        let mut all = vec!["get", url.as_str(), "--shape", "--no-dump"];
+        all.extend_from_slice(args);
+        sb.run(&all)
+            .ok()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    assert_eq!(out(&[]), out(&["--depth", "6"]), "既定が 6 段でなくなった");
+    // 入れ子の実際の深さを超えたら、それ以上は何も増えない。
+    assert_eq!(out(&["--depth", "9"]), out(&["--depth", "6"]));
+    // fixture が本当に 5 段目以降を持っていること。持っていなければ
+    // 上の 2 つは「何を比べても同じ」で通ってしまう。
+    assert_ne!(
+        out(&["--depth", "4"]),
+        out(&["--depth", "6"]),
+        "fixture が浅すぎて、既定の深さを検出できていない"
+    );
 }
 
 /// 打ち切った位置は `object` / `array` と書いて残す。消してしまうと
@@ -384,7 +415,10 @@ fn shape_depth_marks_what_it_elided_instead_of_dropping_it() {
     ]);
     let out = run.ok();
     assert!(out.contains("user: object"), "{out}");
-    assert!(out.contains("labels: array"), "{out}");
+    // 配列は**要素数を残す**。0 件と 1 件が同じ `array` になると、
+    // 「いま何件あるか」を知るのに深さを上げ直すことになる。
+    assert!(out.contains("labels: [1 item] …"), "{out}");
+    assert!(out.contains("assignees: [0 items]"), "{out}");
     // 深さ 2 で止めているのだから、3 段目のキーは出ていないこと。
     assert!(!out.contains("site_admin"), "打ち切れていない: {out}");
 }
@@ -416,6 +450,8 @@ fn depth_zero_is_rejected() {
         "--no-dump",
     ]);
     assert_ne!(run.code, 0, "受け付けてしまっている: {}", run.stdout);
+    // 「未知のフラグ」ではなく、範囲で落ちていること。
+    assert!(run.stderr.contains("1..=128"), "{}", run.stderr);
 }
 
 /// 回帰: `--head` と `--full` は `--shape` に効かない。**黙って無視していた**ので、
