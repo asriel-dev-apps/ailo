@@ -136,6 +136,9 @@ fn route(req: &Request, path: &str, query: &str) -> Response {
     match path {
         // 一覧系の API。**トップレベルが配列**。`--pick '.[].title'` が要る形。
         "/list" => Response::json(list_body()),
+        // 幅も深さもある一覧。GitHub の issues と同じ形(30 件・キー多数・入れ子 3 段)を
+        // 実データを置かずに再現する。`--shape` の深さがどれだけ効くかはここで測る。
+        "/issues" => Response::json(issues_body()),
         // **gzip で返す。** ailo は gzip/brotli を有効にしてビルドされており、実 API の
         // 大半も圧縮して返す。ここを通らない fixture は、リクエスト側で直したのと
         // 同じ「都合のよい形」をレスポンス側に残すことになる。
@@ -182,6 +185,68 @@ fn list_body() -> String {
         {"id": 2, "title": "2 つめ", "author-name": "hanako"}
     ])
     .to_string()
+}
+
+/// GitHub の issues 一覧と同じ「幅も深さもある」形。値はすべてダミー。
+///
+/// 実レスポンスをそのまま置かないのは、公開リポジトリに他人のログイン名や
+/// アバターの URL を残さないため。`--shape` が見るのはキー名と型だけなので、
+/// 形さえ合っていれば測定としては同じことになる。
+fn issues_body() -> String {
+    let items: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({
+                "url": "http://example.invalid/i",
+                "repository_url": "http://example.invalid/r",
+                "labels_url": "http://example.invalid/l",
+                "comments_url": "http://example.invalid/c",
+                "events_url": "http://example.invalid/e",
+                "html_url": "http://example.invalid/h",
+                "id": i,
+                "node_id": "n",
+                "number": i,
+                "title": "t",
+                "state": "open",
+                "locked": false,
+                "comments": 0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "closed_at": Value::Null,
+                "author_association": "NONE",
+                "body": "b",
+                "user": {
+                    "login": "u",
+                    "id": 1,
+                    "node_id": "n",
+                    "avatar_url": "http://example.invalid/a",
+                    "type": "User",
+                    "site_admin": false,
+                    "plan": { "name": "free", "seats": 1, "private_repos": 0 }
+                },
+                "labels": [
+                    {
+                        "id": 1,
+                        "node_id": "n",
+                        "name": "bug",
+                        "color": "ffffff",
+                        "default": true,
+                        "description": Value::Null,
+                        "meta": { "scope": "s", "weight": 1 }
+                    }
+                ],
+                "assignees": [],
+                "milestone": Value::Null,
+                "reactions": {
+                    "url": "http://example.invalid/x",
+                    "total_count": 0,
+                    "laugh": 0,
+                    "hooray": 0,
+                    "confused": 0
+                }
+            })
+        })
+        .collect();
+    Value::Array(items).to_string()
 }
 
 fn gzip(body: &[u8]) -> Vec<u8> {

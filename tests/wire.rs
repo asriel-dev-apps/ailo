@@ -337,3 +337,112 @@ fn two_spellings_of_one_header_in_the_same_table_are_reported() {
         run.stderr
     );
 }
+
+// ---------------------------------------------------------------- `--shape --depth`
+
+/// `--shape` の出力は、幅も深さもある一覧だと 48 行になる。**最小コストで形を掴む**
+/// という `--shape` の目的からは長い。`--depth` で切れることを、実際に送って測る。
+///
+/// 数字を直に書いているのは、「短くなった」ではなく「**どれだけになるか**」を
+/// 固定するため。既定を変える変更が入れば、ここが落ちて気づける。
+#[test]
+fn shape_depth_cuts_the_output_and_the_default_is_pinned() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+    let url = server.url("/issues");
+    let lines = |args: &[&str]| {
+        let mut all = vec!["get", url.as_str(), "--shape", "--no-dump"];
+        all.extend_from_slice(args);
+        sb.run(&all).ok().lines().count()
+    };
+
+    // 1 行目は必ずステータス行。形そのものは行数から 1 を引いた分。
+    assert_eq!(lines(&[]), 48, "既定の出力が変わった");
+    assert_eq!(lines(&["--depth", "1"]), 2, "深さ 1 は配列 1 行だけのはず");
+    assert_eq!(lines(&["--depth", "2"]), 26);
+    assert_eq!(lines(&["--depth", "3"]), 40);
+    // 入れ子の実際の深さを超えたら既定と同じになる。ここが違うと
+    // 「既定 = 深さ 6」という約束が崩れている。
+    assert_eq!(lines(&["--depth", "4"]), 48);
+    assert_eq!(lines(&["--depth", "9"]), 48);
+}
+
+/// 打ち切った位置は `object` / `array` と書いて残す。消してしまうと
+/// 「そのキーは無い」と読まれる。
+#[test]
+fn shape_depth_marks_what_it_elided_instead_of_dropping_it() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&[
+        "get",
+        &server.url("/issues"),
+        "--shape",
+        "--depth",
+        "2",
+        "--no-dump",
+    ]);
+    let out = run.ok();
+    assert!(out.contains("user: object"), "{out}");
+    assert!(out.contains("labels: array"), "{out}");
+    // 深さ 2 で止めているのだから、3 段目のキーは出ていないこと。
+    assert!(!out.contains("site_admin"), "打ち切れていない: {out}");
+}
+
+/// `--depth` は `--shape` 専用。単独で受け付けると「指定したのに何も変わらない」
+/// という一番たちの悪い黙り方をする。
+#[test]
+fn depth_without_shape_is_rejected() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&["get", &server.url("/issues"), "--depth", "2", "--no-dump"]);
+    assert_ne!(run.code, 0, "受け付けてしまっている: {}", run.stdout);
+    assert!(run.stderr.contains("--shape"), "{}", run.stderr);
+}
+
+/// 深さ 0 は「配列」「オブジェクト」の一言しか出ず、形を掴む役に立たない。
+#[test]
+fn depth_zero_is_rejected() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&[
+        "get",
+        &server.url("/issues"),
+        "--shape",
+        "--depth",
+        "0",
+        "--no-dump",
+    ]);
+    assert_ne!(run.code, 0, "受け付けてしまっている: {}", run.stdout);
+}
+
+/// 回帰: `--head` と `--full` は `--shape` に効かない。**黙って無視していた**ので、
+/// 「短くしたつもりで長いまま」に気づけなかった。行数を切る指定は `--depth` に一本化し、
+/// 効かない組み合わせは落とす。
+#[test]
+fn head_and_full_are_rejected_with_shape_instead_of_being_ignored() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let url = server.url("/issues");
+    for extra in [vec!["--head", "5"], vec!["--full"]] {
+        let mut args = vec!["get", url.as_str(), "--shape", "--no-dump"];
+        args.extend_from_slice(&extra);
+        let run = sb.run(&args);
+        assert_ne!(run.code, 0, "{extra:?} が黙って通った: {}", run.stdout);
+        assert!(run.stderr.contains("--shape"), "{}", run.stderr);
+        assert!(run.stderr.contains(extra[0]), "{}", run.stderr);
+    }
+}
+
+/// 上の 2 つを落とした結果、`--shape` 単独が壊れていないこと。
+#[test]
+fn shape_alone_still_works() {
+    let server = TestServer::start();
+    let sb = Sandbox::new();
+
+    let run = sb.run(&["get", &server.url("/list"), "--shape", "--no-dump"]);
+    assert!(run.ok().contains("[2 items]"), "{}", run.ok());
+}

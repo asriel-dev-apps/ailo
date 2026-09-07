@@ -631,7 +631,8 @@ fn render(
         if let Some(path) = dump_path {
             println!("{} {}", palette.key("dump:"), paths::tildify(path));
         }
-        println!("{}", shape::of(&body).render());
+        let depth = common.depth.unwrap_or(shape::DEFAULT_MAX_DEPTH);
+        println!("{}", shape::of_with_depth(&body, depth).render());
         return Ok(());
     }
 

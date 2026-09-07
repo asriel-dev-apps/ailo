@@ -104,12 +104,16 @@ pub struct CommonArgs {
     #[arg(long)]
     pub shape: bool,
 
+    /// --shape の展開する深さ (既定 6)
+    #[arg(long, requires = "shape", value_name = "N", value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    pub depth: Option<usize>,
+
     /// 本文の表示行数
-    #[arg(long, default_value_t = DEFAULT_HEAD_LINES)]
+    #[arg(long, default_value_t = DEFAULT_HEAD_LINES, conflicts_with = "shape")]
     pub head: usize,
 
     /// 本文を全文表示する
-    #[arg(long, conflicts_with = "head")]
+    #[arg(long, conflicts_with = "head", conflicts_with = "shape")]
     pub full: bool,
 
     /// 認証情報をマスクせずにダンプする

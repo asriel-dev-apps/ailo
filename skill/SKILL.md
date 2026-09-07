@@ -16,6 +16,7 @@ description: HTTP API を叩くときに使う。curl の代わり。レスポ�
 | --- | --- |
 | 特定のフィールドの値だけ | `--pick '<式>'` |
 | レスポンスの構造(キー名と型) | `--shape` |
+| 構造が長すぎるとき | `--shape --depth 2`(既定は 6 段。`--head` / `--full` は `--shape` には使えない) |
 | 成否と大きさだけ | `--format json` |
 | 本文をざっと見る | 既定(先頭 20 行 + ダンプの場所) |
 | 本文を全部 | `--full`(**最後の手段**。まず `--pick` で足りないか考える) |
@@ -23,6 +24,7 @@ description: HTTP API を叩くときに使う。curl の代わり。レスポ�
 ```bash
 ailo get https://api.example.com/users --pick '.data.items[].id'
 ailo get https://api.example.com/users --shape
+ailo get https://api.example.com/users --shape --depth 2
 ailo post https://api.example.com/users name=taro age:=30
 ```
 
