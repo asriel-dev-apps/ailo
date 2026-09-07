@@ -5,7 +5,8 @@
 
 use serde_json::Value;
 
-/// 既定の再帰上限。これを超えた階層は `object` / `array` とだけ表示する。
+/// 既定の再帰上限。これを超えた階層は、オブジェクトなら `object`、
+/// 配列なら件数を残して `[N items] …` と表示する(`…` は「中を展開していない」)。
 pub const DEFAULT_MAX_DEPTH: usize = 6;
 
 /// この長さに収まるなら 1 行で描く。
@@ -296,12 +297,13 @@ mod tests {
     fn a_cut_off_array_still_reports_how_many_elements_it_has() {
         // 打ち切りは「中を見せない」であって「件数も言わない」ではない。
         // 0 件と 30 件が同じ表示になると、深さを上げるまで件数が分からない。
-        let v = json!({"empty": [], "some": [{"a": 1}, {"a": 2}]});
+        let v = json!({"empty": [], "some": [{"zebra": 1}, {"zebra": 2}]});
         let out = of_with_depth(&v, 1).render();
         assert!(out.contains("empty: [0 items]"), "{out}");
         assert!(out.contains("some: [2 items]"), "{out}");
-        // 中身は出さない。
-        assert!(!out.contains('a'), "中身が出ている: {out}");
+        // 中身は出さない。キー名は出力の他の語と重ならないものを選ぶ
+        // (`a` のような 1 文字だと、どこにも含まれないので偶然通る)。
+        assert!(!out.contains("zebra"), "中身が出ている: {out}");
     }
 
     #[test]
