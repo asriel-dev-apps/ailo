@@ -175,9 +175,89 @@ impl App {
 
 /// タブごとに見せる中身を、保存済みの定義から組む。
 ///
-/// **値は保存されたテンプレートのまま出す。**`{{token}}` を展開して見せると、
-/// 画面に秘匿値が出る。展開後の姿はレスポンス欄ではなくダンプで確かめる。
+/// **展開しない。**`{{token}}` を展開して見せると画面に秘匿値が出る。
+/// 展開後の姿はダンプで確かめる。
+///
+/// **展開しないだけでは足りない。** 定義そのものに `Authorization: Bearer <生の値>` が
+/// 直書きされていることがある。`ailo new` は既知の秘匿名を拒むが、手で書いた
+/// `requests.toml`・古い版で作った定義・`parse_item` が読めない綴りは通り抜ける。
+/// 表示の側でも落とす。
 pub fn tab_lines(req: &SavedRequest, tab: Tab) -> Vec<String> {
+    let lines = tab_lines_raw(req, tab);
+    match tab {
+        // Capture は item 記法ではなく「名前 = 式」。値を持たないので落とすものが無く、
+        // item として読ませると式のほうが値だと解釈されて潰れる。
+        Tab::Capture => lines,
+        _ => lines.iter().map(|l| mask_literal_secret(l)).collect(),
+    }
+}
+
+/// 名前が秘匿らしく、値がテンプレートでないなら値を落とす。
+///
+/// `{{token}}` はそのまま残す。名前しか出ていないので、それ自体は漏れない。
+/// 区切りは正規の綴りで書き直す（escape を含む名前を復元しようとして
+/// 間違えるより、`名前 = ***` と分かる形のほうがよい）。
+fn mask_literal_secret(line: &str) -> String {
+    use crate::args::Item;
+
+    let Ok(item) = crate::args::parse_item(line) else {
+        // **読めなかった行も素通しにしない。** `password:=hunter2` のように
+        // JSON として壊れた item は `parse_item` が落ちる。「読めたものだけ検査する」に
+        // すると、一番危ない行だけが素通りする。
+        return mask_unparsed(line);
+    };
+
+    let literal = |value: &str| !value.contains("{{");
+    match &item {
+        Item::Header { name, value } if is_sensitive_header_name(name) && literal(value) => {
+            format!("{name}: {MASK}")
+        }
+        Item::Field { name, value } if is_secret_name(name) && literal(value) => {
+            format!("{name}={MASK}")
+        }
+        Item::Query { name, value } if is_secret_name(name) && literal(value) => {
+            format!("{name}=={MASK}")
+        }
+        Item::RawField { name, value } if is_secret_name(name) && literal(&value.to_string()) => {
+            format!("{name}:={MASK}")
+        }
+        _ => line.to_string(),
+    }
+}
+
+/// 画面に出すマスク。ダンプ側と同じ綴りにする。
+const MASK: &str = "***";
+
+fn is_secret_name(name: &str) -> bool {
+    crate::redact::is_sensitive_field(name)
+}
+
+/// `parse_item` が読めなかった行。名前らしき先頭だけ残して、後ろを落とす。
+fn mask_unparsed(line: &str) -> String {
+    let head: String = line
+        .chars()
+        .take_while(|c| !matches!(c, ':' | '=' | '@'))
+        .collect();
+    if is_secret_name(&head) && !line.contains("{{") {
+        format!("{head} {MASK}")
+    } else {
+        line.to_string()
+    }
+}
+
+/// 既定の秘匿ヘッダ名。`Redactor` と同じ判定を使う。
+fn is_sensitive_header_name(name: &str) -> bool {
+    crate::redact::Redactor::new(true).is_sensitive_header(name)
+}
+
+/// URL も同じ理由で落とす。`?api_key=<生の値>` は画面にも残したくない。
+///
+/// 展開していないので、生の秘匿値が入るのは `{{...}}` でない部分だけ。
+pub fn display_url(url: &str) -> String {
+    crate::redact::Redactor::new(true).url(url)
+}
+
+fn tab_lines_raw(req: &SavedRequest, tab: Tab) -> Vec<String> {
     match tab {
         Tab::Body => {
             let mut out: Vec<String> = req

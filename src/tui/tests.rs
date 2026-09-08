@@ -226,6 +226,10 @@ fn the_list_is_exactly_what_requests_holds() {
 
 // ------------------------------------------------------------------ マスク
 
+fn fold_of(done: Performed) -> Pane {
+    fold(done, Vec::new())
+}
+
 fn performed(body: serde_json::Value, redactor: Redactor) -> Performed {
     Performed {
         response: ResponseRecord {
@@ -241,7 +245,6 @@ fn performed(body: serde_json::Value, redactor: Redactor) -> Performed {
         },
         dump_path: None,
         redactor,
-        notes: Vec::new(),
     }
 }
 
@@ -251,7 +254,7 @@ fn performed(body: serde_json::Value, redactor: Redactor) -> Performed {
 fn the_response_shown_on_screen_is_masked() {
     let mut r = Redactor::new(true);
     r.add_literal("s3cr3t-token-value");
-    let pane = fold(performed(
+    let pane = fold_of(performed(
         serde_json::json!({"access_token": "s3cr3t-token-value", "id": 7}),
         r,
     ));
@@ -270,7 +273,7 @@ fn the_response_shown_on_screen_is_masked() {
 /// マスクを外せば**必ず**素の値が出ること。出なければ検査自体が死んでいる。
 #[test]
 fn control_without_masking_the_secret_would_have_been_visible() {
-    let pane = fold(performed(
+    let pane = fold_of(performed(
         serde_json::json!({"access_token": "s3cr3t-token-value"}),
         Redactor::disabled(),
     ));
@@ -287,7 +290,7 @@ fn control_without_masking_the_secret_would_have_been_visible() {
 #[test]
 fn a_long_body_is_cut_so_the_pane_does_not_hold_the_whole_response() {
     let items: Vec<_> = (0..5000).map(|i| serde_json::json!({"id": i})).collect();
-    let pane = fold(performed(
+    let pane = fold_of(performed(
         serde_json::json!({ "items": items }),
         Redactor::new(true),
     ));
@@ -350,33 +353,15 @@ fn screen(app: &App, width: u16, height: u16) -> String {
             while x < buf.area.width {
                 let sym = buf[(x, y)].symbol();
                 row.push_str(sym);
-                x += if sym.chars().next().is_some_and(is_wide) {
-                    2
-                } else {
-                    1
-                };
+                // 幅の判定は自前の表を持たない。範囲を書き写すと、絵文字や
+                // 一部の書記素で外し、「画面に出ているのに一致しない」で
+                // 検査が空振りする。
+                x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
             }
             row.trim_end().to_string()
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// 端末で 2 セル分の幅を取る文字か。罫線(U+2500 台)は 1 セルなので入れない。
-fn is_wide(c: char) -> bool {
-    matches!(c as u32,
-        0x1100..=0x115F
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x20000..=0x3FFFD)
 }
 
 fn demo() -> App {
@@ -462,4 +447,93 @@ fn scratch_screen() {
     a.tab = Tab::Capture;
     eprintln!("=== Capture タブ ===\n{}", screen(&a, 100, 20));
     eprintln!("=== 50x24（狭い）===\n{}", screen(&demo(), 50, 24));
+}
+
+// -------------------------------------------------- 定義そのものに直書きされた秘匿値
+
+/// 展開しないだけでは足りない。定義に生の値が書かれていることがある。
+/// `ailo new` は拒むが、手で書いた `requests.toml` や古い定義は通り抜ける。
+#[test]
+fn a_literal_secret_written_into_the_definition_is_masked_on_screen() {
+    let r = req(
+        "POST",
+        "http://x/",
+        &[
+            "Authorization: Bearer live-token-abc",
+            "password=hunter2",
+            "api_key==live-key-xyz",
+        ],
+    );
+    let all = [
+        tab_lines(&r, Tab::Headers),
+        tab_lines(&r, Tab::Body),
+        tab_lines(&r, Tab::Query),
+    ]
+    .concat()
+    .join("\n");
+
+    assert!(!all.contains("live-token-abc"), "{all}");
+    assert!(!all.contains("hunter2"), "{all}");
+    assert!(!all.contains("live-key-xyz"), "{all}");
+    // 名前は残す。何が設定されているかは分かる必要がある。
+    assert!(all.contains("Authorization"), "{all}");
+    assert!(all.contains("password"), "{all}");
+    assert!(all.contains("api_key"), "{all}");
+}
+
+/// 上のテストが本当に検査になっているかのコントロール。
+/// 秘匿でない名前の値は**必ずそのまま出る**こと。出なければ全部を潰しているだけ。
+#[test]
+fn control_a_non_secret_value_is_shown_as_written() {
+    let r = req("POST", "http://x/", &["user=taro", "X-Trace: abc123"]);
+    let all = [tab_lines(&r, Tab::Body), tab_lines(&r, Tab::Headers)]
+        .concat()
+        .join("\n");
+    assert!(all.contains("taro"), "{all}");
+    assert!(all.contains("abc123"), "{all}");
+}
+
+/// 変数参照は落とさない。名前しか出ていないので漏れない。
+#[test]
+fn a_templated_secret_is_left_readable() {
+    let r = req("POST", "http://x/", &["Authorization: Bearer {{token}}"]);
+    assert_eq!(
+        tab_lines(&r, Tab::Headers),
+        vec!["Authorization: Bearer {{token}}"]
+    );
+}
+
+/// 回帰: `parse_item` が読めない行を「検査対象外」にすると、
+/// **一番危ない行だけが素通りする**。`password:=hunter2` は JSON として壊れている。
+#[test]
+fn an_item_that_cannot_be_parsed_is_still_masked() {
+    let r = req("POST", "http://x/", &["password:=hunter2"]);
+    let out = tab_lines(&r, Tab::Body).join("\n");
+    assert!(!out.contains("hunter2"), "{out}");
+}
+
+/// URL のクエリに直書きされた秘匿値も落とす。
+#[test]
+fn a_secret_in_the_url_query_is_masked_on_screen() {
+    let masked = super::model::display_url("https://api.example.com/x?api_key=live-key-xyz&page=2");
+    assert!(!masked.contains("live-key-xyz"), "{masked}");
+    assert!(masked.contains("page=2"), "落としすぎ: {masked}");
+}
+
+// ------------------------------------------------------------------ Ctrl-C
+
+/// 回帰: 絞り込み中の Ctrl-C が文字 `c` として検索語に入り、抜ける手段が無かった。
+#[test]
+fn ctrl_c_quits_even_while_filtering() {
+    let mut a = app(&["x"]);
+    on_key(&mut a, key(KeyCode::Char('/')));
+    let ctrl_c = KeyEvent {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: ratatui::crossterm::event::KeyEventState::NONE,
+    };
+    assert_eq!(on_key(&mut a, ctrl_c), Action::Quit);
+    assert!(a.quit);
+    assert_eq!(a.filter, "", "検索語に入ってしまっている");
 }

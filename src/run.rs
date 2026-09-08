@@ -205,8 +205,12 @@ fn record_last(recipe: &Recipe) -> Result<()> {
 /// TUI 用の入口。`Recipe` を外へ出さずに済むよう、名前で受ける。CLI の
 /// `ailo run <名前>` と**同じ recipe 組み立て**を通るので、変数展開・マスク・
 /// ダンプ・capture の扱いが片方だけ古くなることがない。
-pub async fn send_saved(name: &str, common: &CommonArgs) -> Result<Performed> {
-    perform(saved_recipe(name, &[])?, common).await
+pub async fn send_saved(
+    name: &str,
+    common: &CommonArgs,
+    notes: &mut Vec<String>,
+) -> Result<Performed> {
+    perform(saved_recipe(name, &[])?, common, notes).await
 }
 
 fn saved_recipe(name: &str, extra_items: &[String]) -> Result<Recipe> {
@@ -380,16 +384,20 @@ pub struct Performed {
     pub response: crate::dump::ResponseRecord,
     pub dump_path: Option<std::path::PathBuf>,
     pub redactor: Redactor,
-    /// 標準エラーへ出していた注意書き。呼び出し側が出し方を決める。
-    pub notes: Vec<String>,
 }
 
 async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
     let palette = Palette::detect();
-    let done = perform(recipe, common).await?;
-    for note in &done.notes {
+    // **notes は呼び出し側が持つ。** `perform` の戻り値に載せていたときは、
+    // 送信やダンプ書き込みが失敗した瞬間に、そこまでに出ていた警告
+    // （未知の環境、重複ヘッダ、URL への秘匿値展開）が全部消えていた。
+    // 警告が一番効くのは失敗したときなので、消える向きの設計にしない。
+    let mut notes = Vec::new();
+    let done = perform(recipe, common, &mut notes).await;
+    for note in &notes {
         eprintln!("{}", palette.dim(note));
     }
+    let done = done?;
     render(
         &done.response,
         done.dump_path.as_deref(),
@@ -401,8 +409,11 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
 }
 
 /// 送るところまで。表示も終了コードの決定もしない。
-async fn perform(recipe: Recipe, common: &CommonArgs) -> Result<Performed> {
-    let mut notes: Vec<String> = Vec::new();
+async fn perform(
+    recipe: Recipe,
+    common: &CommonArgs,
+    notes: &mut Vec<String>,
+) -> Result<Performed> {
     let cfg = Config::load()?;
     let env = cfg.resolve_env(common.env.as_deref());
 
@@ -535,14 +546,19 @@ async fn perform(recipe: Recipe, common: &CommonArgs) -> Result<Performed> {
     let captured = if recipe.capture_spec.is_empty() {
         None
     } else {
+        // **ここから先のエラー文にはレスポンス由来の値が載る。**
+        // `expires_in` が数値でなければ、その値がそのままエラーに入る。
+        // 標準エラーにも TUI の画面にも出るので、必ずマスクを通す。
         let body = body_as_json(&sent.response)
-            .context("capture はレスポンスが JSON のときだけ使えます")?;
+            .context("capture はレスポンスが JSON のときだけ使えます")
+            .map_err(|e| redact_error(&redactor, e))?;
         let got = capture::capture(
             &body,
             &recipe.capture_spec,
             &recipe.secret_names,
             OffsetDateTime::now_utc(),
-        )?;
+        )
+        .map_err(|e| redact_error(&redactor, e))?;
         for value in got.secret_values() {
             redactor.add_literal(value);
         }
@@ -570,7 +586,8 @@ async fn perform(recipe: Recipe, common: &CommonArgs) -> Result<Performed> {
                     keep_count: cfg.retention.keep_count,
                     keep_days: cfg.retention.keep_days,
                 },
-            )?
+            )
+            .map_err(|e| redact_error(&redactor, e))?
             .path,
         )
     };
@@ -579,14 +596,13 @@ async fn perform(recipe: Recipe, common: &CommonArgs) -> Result<Performed> {
         let env_name = env.as_deref().ok_or_else(|| {
             anyhow!("capture には環境が要ります。`--env <名前>` を指定するか config に default_env を書いてください")
         })?;
-        persist_capture(env_name, &got, &mut notes)?;
+        persist_capture(env_name, &got, notes).map_err(|e| redact_error(&redactor, e))?;
     }
 
     Ok(Performed {
         response: sent.response,
         dump_path,
         redactor,
-        notes,
     })
 }
 

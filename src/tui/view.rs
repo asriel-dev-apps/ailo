@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 
-use super::model::{tab_lines, App, Mode, Pane, Tab};
+use super::model::{display_url, tab_lines, App, Mode, Pane, Tab};
 
 /// 左ペインの幅。これより狭い端末では一覧を畳む。
 const SIDEBAR: u16 = 26;
@@ -142,7 +142,7 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
                     .fg(method_colour(&entry.req.method))
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(entry.req.url.clone()),
+            Span::raw(display_url(&entry.req.url)),
         ]))
         .wrap(Wrap { trim: true })
         .block(

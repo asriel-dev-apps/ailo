@@ -52,6 +52,7 @@ ratatui = "0.29"
 # テストのレスポンスが常に非圧縮では復号経路を一度も通らない。
 flate2 = "1"
 tempfile = "3"
+unicode-width = "0.2"
 
 [profile.release]
 lto = true

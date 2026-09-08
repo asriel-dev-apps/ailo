@@ -50,9 +50,10 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
     let entries = load_entries()?;
     let mut app = App::new(entries, workspace::current().label(), env.clone());
 
-    let mut terminal = enter()?;
-    let result = event_loop(&mut terminal, &mut app, env.as_deref()).await;
-    leave(&mut terminal)?;
+    let mut screen = Screen::enter()?;
+    let result = event_loop(&mut screen.terminal, &mut app, env.as_deref()).await;
+    // `screen` の Drop がここで端末を戻す。エラーで抜けても同じ。
+    drop(screen);
     result?;
     Ok(Outcome { code: 0 })
 }
@@ -107,19 +108,51 @@ fn install_panic_restore() {
     }));
 }
 
-fn enter() -> Result<Term> {
-    enable_raw_mode().context("端末を raw モードにできません")?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(out)).context("端末を初期化できません")
+/// 端末を握っている間だけ生きる。**`Drop` で必ず戻す。**
+///
+/// 手で `leave()` を呼ぶ形にしていたときは、`enable_raw_mode()` が成功したあとに
+/// `EnterAlternateScreen` や `Terminal::new` が失敗すると raw モードのまま抜けていた。
+/// 早期 return が 1 本増えるたびに同じ穴が開くので、戻す責任を型に持たせる。
+struct Screen {
+    terminal: Term,
 }
 
-/// **必ず戻す。** 戻し損ねると、抜けたあとのシェルがエコーなしのまま残る。
-fn leave(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+impl Screen {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("端末を raw モードにできません")?;
+        // ここから先で失敗しても raw モードを戻す。
+        let guard = RawGuard;
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen).context("画面を切り替えられません")?;
+        let terminal = Terminal::new(CrosstermBackend::new(out)).context("端末を初期化できません");
+        match terminal {
+            Ok(terminal) => {
+                std::mem::forget(guard);
+                Ok(Self { terminal })
+            }
+            Err(e) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                Err(e)
+            }
+        }
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+/// `enable_raw_mode()` だけが成功した状態を戻すための番人。
+struct RawGuard;
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
 }
 
 async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Result<()> {
@@ -153,9 +186,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
                 // エディタは端末を占有する。**必ず画面を明け渡してから起動する。**
                 // 明け渡さずに起動すると、vim が alternate screen の上に描いて
                 // 何も見えないまま入力だけが通る。
-                leave(terminal)?;
-                let outcome = crate::run::edit_saved(&name);
-                *terminal = enter()?;
+                let outcome = with_terminal_released(terminal, || crate::run::edit_saved(&name))?;
                 terminal.clear()?;
                 match outcome {
                     Ok(()) => {
@@ -174,6 +205,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
 
 /// キー 1 つに対する判断。端末にも通信にも触らない。
 pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
+    // **Ctrl-C はどの状態からでも抜ける。** 絞り込みの分岐より後ろに置いていたときは、
+    // 絞り込み中の Ctrl-C が文字 `c` として検索語に入り、抜ける手段が無くなっていた。
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        app.quit = true;
+        return Action::Quit;
+    }
+
     if app.mode == Mode::Filter {
         match key.code {
             KeyCode::Esc => {
@@ -186,12 +224,6 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             _ => {}
         }
         return Action::None;
-    }
-
-    // Ctrl-C はどの状態からでも抜ける。
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        app.quit = true;
-        return Action::Quit;
     }
 
     match key.code {
@@ -226,6 +258,24 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         },
         _ => Action::None,
     }
+}
+
+/// 端末を明け渡してから `f` を動かし、戻ってきたら握り直す。
+///
+/// **明け渡さずにエディタを起動すると、vim が alternate screen の上に描いて
+/// 何も見えないまま入力だけが通る。** 握り直しに失敗したときは、そのまま
+/// 上へ返す（画面を持たないまま描き続けるより、落ちるほうがよい）。
+fn with_terminal_released<T>(terminal: &mut Term, f: impl FnOnce() -> T) -> Result<T> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    let out = f();
+
+    enable_raw_mode().context("端末を raw モードに戻せません")?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen).context("画面を戻せません")?;
+    terminal.hide_cursor()?;
+    Ok(out)
 }
 
 /// 送りながら、中断のキーだけを拾い続ける。
@@ -281,21 +331,27 @@ async fn send(name: &str, env: Option<&str>) -> Pane {
         env: env.map(str::to_string),
         ..CommonArgs::for_tui()
     };
-    match crate::run::send_saved(name, &common).await {
+    let mut notes = Vec::new();
+    match crate::run::send_saved(name, &common, &mut notes).await {
         Err(e) => {
             let mut msg = format!("{e}");
             for cause in e.chain().skip(1) {
                 msg.push_str(&format!("\n  原因: {cause}"));
             }
+            // **送信前に出ていた警告も一緒に見せる。** 失敗したときこそ、
+            // 「未知の環境を指していた」「URL に秘匿値を展開した」が要る。
+            for note in notes {
+                msg.push_str(&format!("\n{note}"));
+            }
             Pane::Failed(msg)
         }
-        Ok(done) => fold(done),
+        Ok(done) => fold(done, notes),
     }
 }
 
 /// 送信結果を画面に載る形に畳む。**ここが唯一の変換点**なので、
 /// マスクが効いているかはこの関数だけを見れば確かめられる。
-pub fn fold(done: crate::run::Performed) -> Pane {
+pub fn fold(done: crate::run::Performed, notes: Vec<String>) -> Pane {
     // **表示するものは必ずマスクを通す。** 生の `response` は
     // capture のために残っているだけで、画面には出さない。
     let res = dump::redact_response(&done.response, &done.redactor);
@@ -321,6 +377,6 @@ pub fn fold(done: crate::run::Performed) -> Pane {
         shape,
         body,
         dump: done.dump_path.as_deref().map(crate::paths::tildify),
-        notes: done.notes,
+        notes,
     }
 }
