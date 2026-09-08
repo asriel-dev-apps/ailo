@@ -50,6 +50,17 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
     let entries = load_entries()?;
     let mut app = App::new(entries, workspace::current().label(), env.clone());
 
+    // **未知の環境は起動時に言う。** 送るまで黙っていると、ヘッダに
+    // `env: typo` と平然と出たまま、変数が 1 つも解決しない画面を見ることになる。
+    if let (Some(name), false) = (env.as_deref(), cfg.environments().is_empty()) {
+        if !cfg.knows_env(name) {
+            app.pane = Pane::Failed(format!(
+                "環境 `{name}` は設定にありません。あるのは: {}",
+                cfg.environments().join(", ")
+            ));
+        }
+    }
+
     let mut screen = Screen::enter()?;
     let result = event_loop(&mut screen.terminal, &mut app, env.as_deref()).await;
     // `screen` の Drop がここで端末を戻す。エラーで抜けても同じ。
@@ -284,17 +295,25 @@ fn with_terminal_released<T>(terminal: &mut Term, f: impl FnOnce() -> T) -> Resu
 /// 画面が固まる。raw モードでは Ctrl-C が SIGINT にならないので、固まっている間は
 /// 端末を叩いても何も起きない。**止められない画面は、失敗するより悪い。**
 ///
-/// 中断は送信の future を捨てることで行う。応答を受け取る前なので、ダンプも
-/// capture も書かれない（どちらも応答を受けたあとの処理）。
+/// 中断は送信の future を捨てることで行う。**「送っていない」ことは保証できない。**
+/// TCP に出したあとに捨てても、相手ではもう実行されているかもしれない。
+/// 文言でそう言う。
+///
+/// `biased;` を付けて送信のほうを先に見る。既定のランダム順だと、応答を受け取って
+/// ダンプも capture も書き終えた結果を捨てて「中断しました」と出すことがある
+/// （応答受信後の処理に await が無いので、完了＝全部書き終えている）。
 async fn send_watching_for_cancel(name: &str, env: Option<&str>) -> Result<Pane> {
     let sending = send(name, env);
     tokio::pin!(sending);
     loop {
         tokio::select! {
+            biased;
             pane = &mut sending => return Ok(pane),
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 if wants_cancel()? {
-                    return Ok(Pane::Failed("送信を中断しました".into()));
+                    return Ok(Pane::Failed(
+                        "送信を打ち切りました（サーバには届いている可能性があります）".into(),
+                    ));
                 }
             }
         }

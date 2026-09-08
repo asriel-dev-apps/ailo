@@ -46,13 +46,15 @@ tokio = { version = "1", features = ["rt", "macros", "fs", "io-util", "time"] }
 # crossterm は直接依存にしない。ratatui が `ratatui::crossterm` として再輸出しており、
 # 別々に固定すると版がずれた瞬間に「型は合うのにイベントが来ない」壊れ方をする。
 ratatui = "0.29"
+# 端末での表示幅。案内の文字列が収まるかを実幅で決めるのに要る。
+# 自前で範囲表を書くと絵文字や一部の書記素で外す。
+unicode-width = "0.2"
 
 [dev-dependencies]
 # 実 API の大半は gzip を返す。ailo は自分で gzip/brotli を有効にしているのに、
 # テストのレスポンスが常に非圧縮では復号経路を一度も通らない。
 flate2 = "1"
 tempfile = "3"
-unicode-width = "0.2"
 
 [profile.release]
 lto = true

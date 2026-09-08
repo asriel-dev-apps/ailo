@@ -8,6 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::model::{display_url, tab_lines, App, Mode, Pane, Tab};
 
@@ -55,15 +56,43 @@ fn header(app: &App) -> Paragraph<'_> {
     ]))
 }
 
+/// 案内の候補。長いものから順に、**実際に収まるもの**を選ぶ。
+///
+/// 幅の閾値を定数で決めていたときは、60〜63 セルで最後の `q 終了` だけが
+/// 切れていた。消えるのが**抜け方**なので、初見の利用者は raw モードの画面に
+/// 取り残される。**途中で切れた案内は、無いより悪い。**
+const NORMAL_HINTS: [&str; 3] = [
+    " ↑↓ 選択   Tab タブ   Enter 送信   / 絞り込み   e 編集   q 終了",
+    " Enter 送信   e 編集   q 終了",
+    " q 終了",
+];
+
+fn fits(text: &str, width: u16) -> bool {
+    UnicodeWidthStr::width(text) <= width as usize
+}
+
+/// 収まる候補のうち一番長いもの。どれも収まらなければ一番短いもの。
+fn best_hint(candidates: &[&'static str], width: u16) -> &'static str {
+    candidates
+        .iter()
+        .copied()
+        .find(|t| fits(t, width))
+        .unwrap_or_else(|| candidates.last().copied().unwrap_or(""))
+}
+
 fn footer(app: &App, width: u16) -> Paragraph<'_> {
     let text = match app.mode {
-        Mode::Filter => format!(" 絞り込み: {}   Enter 確定   Esc 取消", app.filter),
-        // 狭い端末では削る。**途中で切れた案内は、無いより悪い**
-        // (最後の項目だけが消えて、残りは読めるので気づけない)。
-        Mode::Normal if width < NARROW => " Enter 送信   e 編集   q 終了".to_string(),
-        Mode::Normal => {
-            " ↑↓ 選択   Tab タブ   Enter 送信   / 絞り込み   e 編集   q 終了".to_string()
+        Mode::Filter => {
+            // 絞り込み中に一番要るのは「戻り方」。検索語が長いと押し出されるので、
+            // 収まらなければ検索語のほうを削る。
+            let full = format!(" 絞り込み: {}   Enter 確定   Esc 取消", app.filter);
+            if fits(&full, width) {
+                full
+            } else {
+                " Enter 確定   Esc 取消".to_string()
+            }
         }
+        Mode::Normal => best_hint(&NORMAL_HINTS, width).to_string(),
     };
     Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }

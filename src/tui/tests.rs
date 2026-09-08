@@ -537,3 +537,110 @@ fn ctrl_c_quits_even_while_filtering() {
     assert!(a.quit);
     assert_eq!(a.filter, "", "検索語に入ってしまっている");
 }
+
+// ------------------------------------------------ `--raw` 本文とテンプレート URL
+
+/// 回帰: `--raw` の本文を item 記法の判定に通すと**素通りする**。
+/// `{"password":"hunter2"}` は `parse_item` に成功してしまう
+/// (`{"password"` という名前のヘッダと読まれる)。ログインの本文は
+/// 一番秘匿値が入る場所なので、ここが抜けると表示側の防御が意味を失う。
+#[test]
+fn a_secret_in_a_raw_body_is_masked() {
+    for raw in [
+        r#"{"user":"a","password":"hunter2-secret"}"#,
+        r#"{"grant_type":"password","client_secret":"abc123XYZ"}"#,
+        r#"{"nested":{"api_key":"AKIAsecretvalue"}}"#,
+    ] {
+        let mut r = req("POST", "http://x/", &[]);
+        r.raw = Some(raw.into());
+        let out = tab_lines(&r, Tab::Body).join("\n");
+        for leak in ["hunter2-secret", "abc123XYZ", "AKIAsecretvalue"] {
+            assert!(!out.contains(leak), "{raw} → {out}");
+        }
+    }
+}
+
+/// JSON として読めない本文も素通しにしない。
+#[test]
+fn a_raw_body_that_is_not_json_is_not_passed_through_when_it_smells_of_secrets() {
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some("grant_type=password&client_secret=abc123XYZ".into());
+    let out = tab_lines(&r, Tab::Body).join("\n");
+    assert!(!out.contains("abc123XYZ"), "{out}");
+}
+
+/// コントロール: 秘匿でない本文は**そのまま出る**。出なければ全部を潰しているだけ。
+#[test]
+fn control_a_raw_body_without_secrets_is_shown_as_written() {
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some(r#"{"user":"taro","limit":50}"#.into());
+    let out = tab_lines(&r, Tab::Body).join("\n");
+    assert!(out.contains("taro"), "{out}");
+    assert!(out.contains("50"), "{out}");
+}
+
+/// 変数参照は落とさない。
+#[test]
+fn a_raw_body_that_references_a_variable_is_left_readable() {
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some(r#"{"password":"{{password}}"}"#.into());
+    let out = tab_lines(&r, Tab::Body).join("\n");
+    assert!(out.contains("{{password}}"), "{out}");
+}
+
+/// 回帰: `Redactor::url` は `Url::parse` に失敗した入力をそのまま返す。
+/// **この repo で一番普通の形**（`{{base_url}}/...`）だけが落ちなかった。
+#[test]
+fn a_secret_in_a_templated_url_is_masked() {
+    for url in [
+        "{{base_url}}/v1?api_key=AKIAsecretvalue123",
+        "{{base_url}}/v1?token=abcdef123456&page=2",
+    ] {
+        let out = super::model::display_url(url);
+        assert!(!out.contains("AKIAsecretvalue123"), "{url} → {out}");
+        assert!(!out.contains("abcdef123456"), "{url} → {out}");
+        assert!(out.contains("{{base_url}}"), "{out}");
+    }
+    // 絶対 URL も従来どおり落ちる。
+    let out = super::model::display_url("https://api.example.com/x?api_key=live-key-xyz&page=2");
+    assert!(!out.contains("live-key-xyz"), "{out}");
+    assert!(out.contains("page=2"), "落としすぎ: {out}");
+}
+
+/// コントロール: 秘匿でないクエリはそのまま残る。
+#[test]
+fn control_a_templated_url_without_secrets_is_untouched() {
+    let url = "{{base_url}}/v1/users?page=2&sort=name";
+    assert_eq!(super::model::display_url(url), url);
+}
+
+// ------------------------------------------------------------------ 案内の幅
+
+/// 回帰: 閾値を定数で決めていたとき、幅 60〜63 で最後の `q 終了` だけが切れていた。
+/// 消えるのが**抜け方**なので、初見の利用者は raw モードの画面に取り残される。
+#[test]
+fn the_hint_line_is_never_cut_off_at_any_width() {
+    for width in [30u16, 40, 50, 58, 59, 60, 62, 63, 64, 80, 100] {
+        let out = screen(&demo(), width, 20);
+        let last = out.lines().last().unwrap_or_default().to_string();
+        assert!(
+            last.contains("q 終了"),
+            "幅 {width} で抜け方が消えている: {last:?}"
+        );
+    }
+}
+
+/// 絞り込み中も戻り方が消えないこと。検索語が長ければ検索語のほうを削る。
+#[test]
+fn the_filter_hint_keeps_the_way_back_even_with_a_long_search_term() {
+    let mut a = demo();
+    on_key(&mut a, key(KeyCode::Char('/')));
+    for c in "とてもながいけんさくごをいれてみる".chars() {
+        on_key(&mut a, key(KeyCode::Char(c)));
+    }
+    for width in [40u16, 50, 60, 80] {
+        let out = screen(&a, width, 20);
+        let last = out.lines().last().unwrap_or_default().to_string();
+        assert!(last.contains("Esc 取消"), "幅 {width}: {last:?}");
+    }
+}

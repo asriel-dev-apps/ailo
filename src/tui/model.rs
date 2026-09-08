@@ -228,6 +228,50 @@ fn mask_literal_secret(line: &str) -> String {
 /// 画面に出すマスク。ダンプ側と同じ綴りにする。
 const MASK: &str = "***";
 
+/// `--raw` の本文を画面に出せる形にする。
+///
+/// **item 記法の判定に通してはいけない。** `{"password":"hunter2"}` は
+/// `parse_item` に**成功する**（`{"password"` という名前のヘッダと読まれる）ので、
+/// item として検査すると素通りする。ログインの本文は一番秘匿値が入る場所なので、
+/// ここが素通りすると「表示側でも落とす」という主張が成り立たない。
+fn mask_raw_body(raw: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+        mask_json_in_place(&mut value);
+        return serde_json::to_string(&value).unwrap_or_else(|_| MASK.to_string());
+    }
+    // JSON として読めない本文は構造で判断できない。秘匿らしい綴りがあれば
+    // 行ごと落とす。**「読めなかったから素通し」にはしない。**
+    let lower = raw.to_ascii_lowercase();
+    let suspicious = ["password", "passwd", "token", "secret", "api_key", "apikey"]
+        .iter()
+        .any(|w| lower.contains(*w));
+    if suspicious && !raw.contains("{{") {
+        format!("(本文は画面に出しません。`ailo show` で確かめてください) {MASK}")
+    } else {
+        raw.to_string()
+    }
+}
+
+fn mask_json_in_place(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                let literal = match v {
+                    serde_json::Value::String(s) => !s.contains("{{"),
+                    _ => true,
+                };
+                if is_secret_name(key) && literal {
+                    *v = serde_json::Value::String(MASK.to_string());
+                } else {
+                    mask_json_in_place(v);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_json_in_place),
+        _ => {}
+    }
+}
+
 fn is_secret_name(name: &str) -> bool {
     crate::redact::is_sensitive_field(name)
 }
@@ -252,9 +296,44 @@ fn is_sensitive_header_name(name: &str) -> bool {
 
 /// URL も同じ理由で落とす。`?api_key=<生の値>` は画面にも残したくない。
 ///
-/// 展開していないので、生の秘匿値が入るのは `{{...}}` でない部分だけ。
+/// **`Redactor::url` に投げるだけでは足りない。** あれは `Url::parse` に失敗した入力を
+/// そのまま返すので、`{{base_url}}/x?api_key=...` という**この repo で一番普通の形**だけが
+/// 落ちない。クエリは自分で分解して落とし、そのうえで parse できるものは
+/// `Redactor::url` にも通す（userinfo のパスワードなど、クエリ以外の経路のため）。
 pub fn display_url(url: &str) -> String {
-    crate::redact::Redactor::new(true).url(url)
+    let masked = mask_query(url);
+    if reqwest::Url::parse(&masked).is_ok() {
+        crate::redact::Redactor::new(true).url(&masked)
+    } else {
+        masked
+    }
+}
+
+fn mask_query(url: &str) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    // fragment は落とさない。秘匿値の置き場所ではないうえ、`#` の後ろまで
+    // クエリとして扱うと、素の断片まで書き換えてしまう。
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if is_secret_name(name) && !value.contains("{{") => {
+                format!("{name}={MASK}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect();
+    let mut out = format!("{head}?{}", masked.join("&"));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
 }
 
 fn tab_lines_raw(req: &SavedRequest, tab: Tab) -> Vec<String> {
@@ -267,7 +346,7 @@ fn tab_lines_raw(req: &SavedRequest, tab: Tab) -> Vec<String> {
                 .cloned()
                 .collect();
             if let Some(raw) = &req.raw {
-                out.push(raw.clone());
+                out.push(mask_raw_body(raw));
             }
             if req.form {
                 out.push("(form-urlencoded で送る)".into());

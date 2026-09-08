@@ -6,6 +6,11 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::output::{Format, DEFAULT_HEAD_LINES};
 
+/// 送信のタイムアウト秒数。**1 か所で決める。**
+/// CLI の既定値と TUI の既定値を別々に書いていたときは、片方を変えても
+/// もう片方に届かなかった。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "ailo",
@@ -125,7 +130,7 @@ pub struct CommonArgs {
     pub no_redact: bool,
 
     /// タイムアウト秒数
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_TIMEOUT_SECS)]
     pub timeout: u64,
 
     /// ダンプを書かない
@@ -154,7 +159,7 @@ impl CommonArgs {
             head: DEFAULT_HEAD_LINES,
             full: false,
             no_redact: false,
-            timeout: 30,
+            timeout: DEFAULT_TIMEOUT_SECS,
             no_dump: false,
             fail: false,
         }
