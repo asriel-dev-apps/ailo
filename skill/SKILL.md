@@ -81,6 +81,8 @@ ailo run me --env stg
 - **ダンプと画面出力では認証情報がマスクされる。** 実際の値が要るときだけ `--pick` を使う。
   `--no-redact` はダンプに生の認証情報を残すので、理由があるときだけ。
 - **`--full` を反射的に使わない。** それはコンテキストにレスポンス全文を入れるということ。
+- **`ailo tui` を呼ばない。** 端末が要る画面で、エージェントには端末が無い。一覧は `ailo ls`、
+  実行は `ailo run <名前>`。
 
 ## 設定
 
@@ -137,6 +139,7 @@ ailo env use stg                                           # 既定の環境を�
 | `ailo run <名前> [item...]` | 保存済みを実行 |
 | `ailo save <名前> [--capture 名前=式] [--secret 名前]` | 直前のリクエストを保存 |
 | `ailo new <名前>` | 送らずにリクエストを定義する（$EDITOR） |
+| `ailo tui` | 一覧・実行の画面（**人が端末で使うもの。エージェントは使わない**） |
 | `ailo ls` / `ailo env` | 保存済み / 環境の一覧 |
 | `ailo -w <名前> ...` | workspace を明示する（既定は `.ailo` を上へ辿って探す） |
 | `ailo config set\|get\|unset\|list\|edit` | 設定の読み書き(`git config` 相当) |
