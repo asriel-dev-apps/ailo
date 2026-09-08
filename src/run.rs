@@ -41,6 +41,7 @@ pub async fn run(command: Command) -> Result<Outcome> {
         Command::Run(a) => saved(&a).await,
         Command::Save(a) => save(&a),
         Command::New { name } => new_request(&name),
+        Command::Tui(a) => crate::tui::run(a.env).await,
         Command::Ls => list_requests(),
         Command::Env(a) => match a.action {
             None => list_envs(),
@@ -199,9 +200,18 @@ fn record_last(recipe: &Recipe) -> Result<()> {
     .record()
 }
 
-async fn saved(a: &RunArgs) -> Result<Outcome> {
+/// 保存済みリクエストを 1 件送り、結果を返す。表示はしない。
+///
+/// TUI 用の入口。`Recipe` を外へ出さずに済むよう、名前で受ける。CLI の
+/// `ailo run <名前>` と**同じ recipe 組み立て**を通るので、変数展開・マスク・
+/// ダンプ・capture の扱いが片方だけ古くなることがない。
+pub async fn send_saved(name: &str, common: &CommonArgs) -> Result<Performed> {
+    perform(saved_recipe(name, &[])?, common).await
+}
+
+fn saved_recipe(name: &str, extra_items: &[String]) -> Result<Recipe> {
     let reqs = Requests::load()?;
-    let saved = reqs.get(&a.name).ok_or_else(|| {
+    let saved = reqs.get(name).ok_or_else(|| {
         let known = reqs.names().join(", ");
         // どの workspace で探して見つからなかったのかを必ず添える。
         if known.is_empty() {
@@ -211,30 +221,29 @@ async fn saved(a: &RunArgs) -> Result<Outcome> {
             )
         } else {
             anyhow!(
-                "`{}` は保存されていません（{}）。あるのは: {known}",
-                a.name,
+                "`{name}` は保存されていません（{}）。あるのは: {known}",
                 where_we_are()
             )
         }
     })?;
 
     let mut items = saved.items.clone();
-    items.extend(a.items.clone());
+    items.extend_from_slice(extra_items);
 
-    execute(
-        Recipe {
-            method: saved.method.clone(),
-            url: saved.url.clone(),
-            items,
-            raw: saved.raw.clone(),
-            form: saved.form,
-            name: Some(a.name.clone()),
-            capture_spec: saved.capture.clone(),
-            secret_names: saved.secret.clone(),
-        },
-        &a.common,
-    )
-    .await
+    Ok(Recipe {
+        method: saved.method.clone(),
+        url: saved.url.clone(),
+        items,
+        raw: saved.raw.clone(),
+        form: saved.form,
+        name: Some(name.to_string()),
+        capture_spec: saved.capture.clone(),
+        secret_names: saved.secret.clone(),
+    })
+}
+
+async fn saved(a: &RunArgs) -> Result<Outcome> {
+    execute(saved_recipe(&a.name, &a.items)?, &a.common).await
 }
 
 /// 変数の層を優先順に組む。先頭が最優先。
@@ -361,20 +370,48 @@ fn check_expiry(state: &State, referenced: &[String], now: OffsetDateTime) -> Re
     );
 }
 
+/// 送信の結果。表示はしない。
+///
+/// TUI からも同じ経路で送るために、**送ること**と**見せること**を分けてある。
+/// 片方だけを別実装にすると、マスク・ダンプ・capture のどれかが TUI 経由では
+/// 効かない、という壊れ方をする。
+pub struct Performed {
+    /// マスク前のレスポンス。表示の直前に必ず `redactor` を通すこと。
+    pub response: crate::dump::ResponseRecord,
+    pub dump_path: Option<std::path::PathBuf>,
+    pub redactor: Redactor,
+    /// 標準エラーへ出していた注意書き。呼び出し側が出し方を決める。
+    pub notes: Vec<String>,
+}
+
 async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
+    let palette = Palette::detect();
+    let done = perform(recipe, common).await?;
+    for note in &done.notes {
+        eprintln!("{}", palette.dim(note));
+    }
+    render(
+        &done.response,
+        done.dump_path.as_deref(),
+        common,
+        &done.redactor,
+        &palette,
+    )?;
+    Ok(exit_for(done.response.status, common.fail))
+}
+
+/// 送るところまで。表示も終了コードの決定もしない。
+async fn perform(recipe: Recipe, common: &CommonArgs) -> Result<Performed> {
+    let mut notes: Vec<String> = Vec::new();
     let cfg = Config::load()?;
     let env = cfg.resolve_env(common.env.as_deref());
-    let palette = Palette::detect();
 
     if let (Some(name), false) = (env.as_deref(), cfg.environments().is_empty()) {
         if !cfg.knows_env(name) {
-            eprintln!(
-                "{}",
-                palette.dim(&format!(
-                    "環境 `{name}` は設定にありません。あるのは: {}",
-                    cfg.environments().join(", ")
-                ))
-            );
+            notes.push(format!(
+                "環境 `{name}` は設定にありません。あるのは: {}",
+                cfg.environments().join(", ")
+            ));
         }
     }
 
@@ -425,12 +462,9 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
                 &cfg.env_config(env.as_deref()).headers,
             ))
     {
-        eprintln!(
-            "{}",
-            palette.dim(&format!(
-                "警告: 同じ設定に大文字小文字だけが違うヘッダがあります({dupe})。送られるのは片方だけです"
-            ))
-        );
+        notes.push(format!(
+            "警告: 同じ設定に大文字小文字だけが違うヘッダがあります({dupe})。送られるのは片方だけです"
+        ));
     }
 
     // 設定のヘッダを先に、item のヘッダを後に。後勝ちで item が上書きする。
@@ -448,7 +482,7 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         .map(|i| expand_item(i, &v, &mut warnings))
         .collect::<Result<_>>()?;
     for w in &warnings {
-        eprintln!("{}", palette.dim(&format!("警告: {w}")));
+        notes.push(format!("警告: {w}"));
     }
 
     let expanded_url = v.expand(&recipe.url)?;
@@ -456,8 +490,7 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         // `{{base_url}}/x?key={{api_key}}` のように URL に直接書く形が一番自然なので、
         // item のクエリだけ警告していても意味がない。URL はサーバのアクセスログ、
         // プロキシ、Referer に残る。
-        warnings.push("URL に秘匿値を展開しました".to_string());
-        eprintln!("{}", palette.dim("警告: URL に秘匿値を展開しました"));
+        notes.push("警告: URL に秘匿値を展開しました".to_string());
     }
     let url = expanded_url.text;
     let raw = recipe
@@ -546,20 +579,18 @@ async fn execute(recipe: Recipe, common: &CommonArgs) -> Result<Outcome> {
         let env_name = env.as_deref().ok_or_else(|| {
             anyhow!("capture には環境が要ります。`--env <名前>` を指定するか config に default_env を書いてください")
         })?;
-        persist_capture(env_name, &got, &palette)?;
+        persist_capture(env_name, &got, &mut notes)?;
     }
 
-    render(
-        &sent.response,
-        dump_path.as_deref(),
-        common,
-        &redactor,
-        &palette,
-    )?;
-    Ok(exit_for(sent.response.status, common.fail))
+    Ok(Performed {
+        response: sent.response,
+        dump_path,
+        redactor,
+        notes,
+    })
 }
 
-fn persist_capture(env: &str, got: &capture::Captured, p: &Palette) -> Result<()> {
+fn persist_capture(env: &str, got: &capture::Captured, notes: &mut Vec<String>) -> Result<()> {
     for (key, value) in &got.secrets {
         secrets::set(env, key, value)?;
     }
@@ -578,10 +609,7 @@ fn persist_capture(env: &str, got: &capture::Captured, p: &Palette) -> Result<()
     names.extend(got.vars.keys().map(String::as_str));
     if !names.is_empty() {
         // 値は出さない。名前だけで「入った」ことは分かる。
-        eprintln!(
-            "{}",
-            p.dim(&format!("captured({env}): {}", names.join(", ")))
-        );
+        notes.push(format!("captured({env}): {}", names.join(", ")));
     }
     Ok(())
 }
@@ -1021,6 +1049,15 @@ secret = []
 /// (Postman がやっていること)ので、雛形を `$EDITOR` で開いて登録できるようにする。
 /// 既にある名前なら、その定義を開いて直す。
 fn new_request(name: &str) -> Result<Outcome> {
+    edit_saved(name)?;
+    Ok(OK)
+}
+
+/// `$EDITOR` で保存済みリクエストの定義を開き、読めたら書き戻す。
+///
+/// `ailo new` と TUI の `e` が**同じ実装を通る**。TUI 側に編集器を作らないのは、
+/// 二重実装になった瞬間、秘匿値のガードや編集中の衝突検出が片方だけ古くなるため。
+pub fn edit_saved(name: &str) -> Result<()> {
     validate_request_name(name)?;
 
     let existing = Requests::load()?.get(name).cloned();
@@ -1083,7 +1120,7 @@ fn new_request(name: &str) -> Result<Outcome> {
         "登録しました"
     };
     println!("{what}: {name} ({})", crate::workspace::current().label());
-    Ok(OK)
+    Ok(())
 }
 
 /// いまの workspace を添える 1 行。

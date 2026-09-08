@@ -482,3 +482,23 @@ fn shape_alone_still_works() {
     let run = sb.run(&["get", &server.url("/list"), "--shape", "--no-dump"]);
     assert!(run.ok().contains("[2 items]"), "{}", run.ok());
 }
+
+/// 回帰: `ailo tui` を端末でないところで起動しない。
+///
+/// **主利用者はエージェントで、エージェントには端末が無い。** 環境によっては
+/// 入力待ちのまま止まる。止まるのは失敗より遥かにたちが悪いので、必ず落とし、
+/// 代わりに何を使えばよいかを書く。
+#[test]
+fn tui_refuses_to_start_without_a_terminal() {
+    let sb = Sandbox::new();
+    let run = sb.run(&["tui"]);
+
+    assert_ne!(run.code, 0, "端末でないのに起動した: {}", run.stdout);
+    assert!(run.stderr.contains("端末"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("ailo ls"),
+        "次にやることが無い: {}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("ailo run"), "{}", run.stderr);
+}

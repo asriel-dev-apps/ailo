@@ -18,5 +18,6 @@ pub mod redact;
 pub mod run;
 pub mod secrets;
 pub mod shape;
+pub mod tui;
 pub mod vars;
 pub mod workspace;

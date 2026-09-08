@@ -63,6 +63,8 @@ pub enum Command {
     Log(LogArgs),
     /// ダンプ本体を表示する
     Show(ShowArgs),
+    /// 保存済みリクエストを一覧・実行する画面を開く
+    Tui(TuiArgs),
 }
 
 impl Command {
@@ -136,6 +138,28 @@ pub struct CommonArgs {
 }
 
 impl CommonArgs {
+    /// TUI から送るときの既定。
+    ///
+    /// **画面の描き方はここでは決めない。** TUI は `Performed` を自分で畳むので、
+    /// 出力形式に関わるものは触らずに既定のままにしてある。ダンプは書く
+    /// (TUI から送った分だけ `ailo log` に出ない、という食い違いを作らないため)。
+    pub fn for_tui() -> Self {
+        Self {
+            env: None,
+            vars: Vec::new(),
+            format: Format::Digest,
+            pick: None,
+            shape: false,
+            depth: None,
+            head: DEFAULT_HEAD_LINES,
+            full: false,
+            no_redact: false,
+            timeout: 30,
+            no_dump: false,
+            fail: false,
+        }
+    }
+
     pub fn head_lines(&self) -> usize {
         if self.full {
             usize::MAX
@@ -280,6 +304,13 @@ pub struct LogArgs {
     /// 表示する件数
     #[arg(long, short, default_value_t = 20)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct TuiArgs {
+    /// 使う環境 (省略時は config の default_env)
+    #[arg(long, short)]
+    pub env: Option<String>,
 }
 
 #[derive(Debug, Args)]
