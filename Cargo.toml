@@ -40,7 +40,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "brotli",
   "charset",
 ] }
-tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
+# time は TUI のため。送信中もイベントを拾い続けるのに、短い sleep と select が要る。
+tokio = { version = "1", features = ["rt", "macros", "fs", "io-util", "time"] }
 # TUI。bitbucket-tui / specto / launchtop と同じ ratatui に揃える。
 # crossterm は直接依存にしない。ratatui が `ratatui::crossterm` として再輸出しており、
 # 別々に固定すると版がずれた瞬間に「型は合うのにイベントが来ない」壊れ方をする。

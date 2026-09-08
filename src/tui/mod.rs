@@ -46,6 +46,7 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
     let cfg = Config::load()?;
     let env = cfg.resolve_env(env.as_deref());
     require_terminal()?;
+    install_panic_restore();
     let entries = load_entries()?;
     let mut app = App::new(entries, workspace::current().label(), env.clone());
 
@@ -92,6 +93,20 @@ fn require_terminal() -> Result<()> {
     )
 }
 
+/// パニックしても端末を戻す。
+///
+/// **戻さないと、抜けたあとのシェルがエコーなしの raw モードで残る。**
+/// 利用者から見ると「ターミナルが壊れた」で、`reset` を知らないと直せない。
+/// パニックの本文は素の端末に出したいので、戻してから既定のハンドラへ渡す。
+fn install_panic_restore() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        previous(info);
+    }));
+}
+
 fn enter() -> Result<Term> {
     enable_raw_mode().context("端末を raw モードにできません")?;
     let mut out = io::stdout();
@@ -132,7 +147,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
                 };
                 app.pane = Pane::Sending;
                 terminal.draw(|f| view::draw(f, app))?;
-                app.pane = send(&name, env).await;
+                app.pane = send_watching_for_cancel(&name, env).await?;
             }
             Action::Edit(name) => {
                 // エディタは端末を占有する。**必ず画面を明け渡してから起動する。**
@@ -211,6 +226,50 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         },
         _ => Action::None,
     }
+}
+
+/// 送りながら、中断のキーだけを拾い続ける。
+///
+/// **`await` の間もイベントを読む。** 読まないと、タイムアウト（既定 30 秒）まで
+/// 画面が固まる。raw モードでは Ctrl-C が SIGINT にならないので、固まっている間は
+/// 端末を叩いても何も起きない。**止められない画面は、失敗するより悪い。**
+///
+/// 中断は送信の future を捨てることで行う。応答を受け取る前なので、ダンプも
+/// capture も書かれない（どちらも応答を受けたあとの処理）。
+async fn send_watching_for_cancel(name: &str, env: Option<&str>) -> Result<Pane> {
+    let sending = send(name, env);
+    tokio::pin!(sending);
+    loop {
+        tokio::select! {
+            pane = &mut sending => return Ok(pane),
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {
+                if wants_cancel()? {
+                    return Ok(Pane::Failed("送信を中断しました".into()));
+                }
+            }
+        }
+    }
+}
+
+/// 溜まっているキーのうち、中断を意味するものがあるか。
+///
+/// **溜まっている分は全部読み切る。** 途中で抜けると、送信中に押したキーが
+/// 送信後の操作として遅れて効く。
+fn wants_cancel() -> Result<bool> {
+    let mut cancel = false;
+    while event::poll(Duration::from_millis(0))? {
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl_c =
+                key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
+            if ctrl_c || key.code == KeyCode::Esc {
+                cancel = true;
+            }
+        }
+    }
+    Ok(cancel)
 }
 
 /// 送って、画面に載る形に畳む。
