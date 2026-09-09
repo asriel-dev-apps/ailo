@@ -266,6 +266,9 @@ pub enum Mode {
 
 #[derive(Clone)]
 pub struct App {
+    /// 秘匿の判定に使う。**設定の `redact_headers` を含む**ので、起動時に 1 つ作って
+    /// 持ち回る。各所で `Redactor::new(true)` を作り直すと判定が分裂する。
+    pub redactor: crate::redact::Redactor,
     all: Vec<Entry>,
     pub filter: String,
     pub mode: Mode,
@@ -371,6 +374,7 @@ impl Areas {
 impl App {
     pub fn new(entries: Vec<Entry>, workspace: impl Into<String>, env: Option<String>) -> Self {
         Self {
+            redactor: crate::run::configured_redactor(),
             all: entries,
             filter: String::new(),
             mode: Mode::Normal,
@@ -546,19 +550,16 @@ pub fn tab_count(req: &SavedRequest, tab: Tab) -> usize {
 /// 直書きされていることがある。`ailo new` は既知の秘匿名を拒むが、手で書いた
 /// `requests.toml`・古い版で作った定義・`parse_item` が読めない綴りは通り抜ける。
 /// 表示の側でも落とす。
-pub fn tab_lines(req: &SavedRequest, tab: Tab) -> Vec<String> {
+pub fn tab_lines(req: &SavedRequest, tab: Tab, r: &crate::redact::Redactor) -> Vec<String> {
     let lines = tab_lines_raw(req, tab);
     match tab {
         // Capture は item 記法ではなく「名前 = 式」。値を持たないので落とすものが無く、
         // item として読ませると式のほうが値だと解釈されて潰れる。
         Tab::Capture => lines,
-        _ => {
-            let r = crate::redact::Redactor::new(true);
-            lines
-                .iter()
-                .map(|l| crate::redact::mask_item(l, &r).text)
-                .collect()
-        }
+        _ => lines
+            .iter()
+            .map(|l| crate::redact::mask_item(l, r).text)
+            .collect(),
     }
 }
 

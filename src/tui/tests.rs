@@ -23,6 +23,11 @@ fn key(code: KeyCode) -> KeyEvent {
     }
 }
 
+/// 既定の秘匿判定。設定を読まない（テストは設定を持たない）。
+fn plain() -> Redactor {
+    Redactor::new(true)
+}
+
 fn req(method: &str, url: &str, items: &[&str]) -> SavedRequest {
     SavedRequest {
         method: method.into(),
@@ -258,21 +263,21 @@ fn items_are_sorted_into_the_tab_they_belong_to() {
         "http://x/",
         &["name=taro", "age:=30", "X-Trace: abc", "limit==50"],
     );
-    let body = tab_lines(&r, Tab::Body);
+    let body = tab_lines(&r, Tab::Body, &plain());
     assert!(body.contains(&"name=taro".to_string()), "{body:?}");
     assert!(body.contains(&"age:=30".to_string()), "{body:?}");
     assert!(!body.contains(&"X-Trace: abc".to_string()), "{body:?}");
     assert!(!body.contains(&"limit==50".to_string()), "{body:?}");
 
-    assert_eq!(tab_lines(&r, Tab::Headers), vec!["X-Trace: abc"]);
-    assert_eq!(tab_lines(&r, Tab::Query), vec!["limit==50"]);
+    assert_eq!(tab_lines(&r, Tab::Headers, &plain()), vec!["X-Trace: abc"]);
+    assert_eq!(tab_lines(&r, Tab::Query, &plain()), vec!["limit==50"]);
 }
 
 #[test]
 fn a_raw_body_shows_up_under_body() {
     let mut r = req("POST", "http://x/", &[]);
     r.raw = Some("{\"a\":1}".into());
-    assert_eq!(tab_lines(&r, Tab::Body), vec!["{\"a\":1}"]);
+    assert_eq!(tab_lines(&r, Tab::Body, &plain()), vec!["{\"a\":1}"]);
 }
 
 /// **テンプレートのまま出す。** 展開して見せると画面に秘匿値が出る。
@@ -284,7 +289,7 @@ fn variables_are_shown_unexpanded() {
         &["Authorization: Bearer {{token}}"],
     );
     assert_eq!(
-        tab_lines(&r, Tab::Headers),
+        tab_lines(&r, Tab::Headers, &plain()),
         vec!["Authorization: Bearer {{token}}"]
     );
     assert_eq!(r.url, "{{base_url}}/me");
@@ -300,7 +305,7 @@ fn capture_shows_names_and_marks_the_ones_that_go_to_the_keychain() {
     ]);
     r.secret = vec!["access_token".into()];
 
-    let lines = tab_lines(&r, Tab::Capture);
+    let lines = tab_lines(&r, Tab::Capture, &plain());
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("access_token = .data.token"), "{lines:?}");
     assert!(lines[0].contains("キーチェーン"), "{lines:?}");
@@ -565,9 +570,9 @@ fn a_literal_secret_written_into_the_definition_is_masked_on_screen() {
         ],
     );
     let all = [
-        tab_lines(&r, Tab::Headers),
-        tab_lines(&r, Tab::Body),
-        tab_lines(&r, Tab::Query),
+        tab_lines(&r, Tab::Headers, &plain()),
+        tab_lines(&r, Tab::Body, &plain()),
+        tab_lines(&r, Tab::Query, &plain()),
     ]
     .concat()
     .join("\n");
@@ -586,9 +591,12 @@ fn a_literal_secret_written_into_the_definition_is_masked_on_screen() {
 #[test]
 fn control_a_non_secret_value_is_shown_as_written() {
     let r = req("POST", "http://x/", &["user=taro", "X-Trace: abc123"]);
-    let all = [tab_lines(&r, Tab::Body), tab_lines(&r, Tab::Headers)]
-        .concat()
-        .join("\n");
+    let all = [
+        tab_lines(&r, Tab::Body, &plain()),
+        tab_lines(&r, Tab::Headers, &plain()),
+    ]
+    .concat()
+    .join("\n");
     assert!(all.contains("taro"), "{all}");
     assert!(all.contains("abc123"), "{all}");
 }
@@ -598,7 +606,7 @@ fn control_a_non_secret_value_is_shown_as_written() {
 fn a_templated_secret_is_left_readable() {
     let r = req("POST", "http://x/", &["Authorization: Bearer {{token}}"]);
     assert_eq!(
-        tab_lines(&r, Tab::Headers),
+        tab_lines(&r, Tab::Headers, &plain()),
         vec!["Authorization: Bearer {{token}}"]
     );
 }
@@ -608,7 +616,7 @@ fn a_templated_secret_is_left_readable() {
 #[test]
 fn an_item_that_cannot_be_parsed_is_still_masked() {
     let r = req("POST", "http://x/", &["password:=hunter2"]);
-    let out = tab_lines(&r, Tab::Body).join("\n");
+    let out = tab_lines(&r, Tab::Body, &plain()).join("\n");
     // **その行が画面に出ていることを先に確かめる。** 出ていなければ
     // 「含まない」は空文字に対して真になるだけで、マスクは何も証明していない。
     // 実際、読めない行がどのタブにも出ていなかったせいで、この防御は
@@ -658,7 +666,7 @@ fn a_secret_in_a_raw_body_is_masked() {
     ] {
         let mut r = req("POST", "http://x/", &[]);
         r.raw = Some(raw.into());
-        let out = tab_lines(&r, Tab::Body).join("\n");
+        let out = tab_lines(&r, Tab::Body, &plain()).join("\n");
         for leak in ["hunter2-secret", "abc123XYZ", "AKIAsecretvalue"] {
             assert!(!out.contains(leak), "{raw} → {out}");
         }
@@ -670,7 +678,7 @@ fn a_secret_in_a_raw_body_is_masked() {
 fn a_raw_body_that_is_not_json_is_not_passed_through_when_it_smells_of_secrets() {
     let mut r = req("POST", "http://x/", &[]);
     r.raw = Some("grant_type=password&client_secret=abc123XYZ".into());
-    let out = tab_lines(&r, Tab::Body).join("\n");
+    let out = tab_lines(&r, Tab::Body, &plain()).join("\n");
     assert!(!out.contains("abc123XYZ"), "{out}");
 }
 
@@ -679,7 +687,7 @@ fn a_raw_body_that_is_not_json_is_not_passed_through_when_it_smells_of_secrets()
 fn control_a_raw_body_without_secrets_is_shown_as_written() {
     let mut r = req("POST", "http://x/", &[]);
     r.raw = Some(r#"{"user":"taro","limit":50}"#.into());
-    let out = tab_lines(&r, Tab::Body).join("\n");
+    let out = tab_lines(&r, Tab::Body, &plain()).join("\n");
     assert!(out.contains("taro"), "{out}");
     assert!(out.contains("50"), "{out}");
 }
@@ -689,7 +697,7 @@ fn control_a_raw_body_without_secrets_is_shown_as_written() {
 fn a_raw_body_that_references_a_variable_is_left_readable() {
     let mut r = req("POST", "http://x/", &[]);
     r.raw = Some(r#"{"password":"{{password}}"}"#.into());
-    let out = tab_lines(&r, Tab::Body).join("\n");
+    let out = tab_lines(&r, Tab::Body, &plain()).join("\n");
     assert!(out.contains("{{password}}"), "{out}");
 }
 
@@ -1354,7 +1362,7 @@ fn the_editor_is_given_the_real_definition_not_the_masked_one() {
     // 伏せ字を渡す実装でもこのテストは通ってしまっていた。
     let r = req("POST", "http://x/", &["Authorization: Bearer {{token}}"]);
     assert_eq!(
-        tab_lines(&r, Tab::Headers),
+        tab_lines(&r, Tab::Headers, &plain()),
         vec!["Authorization: Bearer {{token}}"],
         "前提: テンプレート参照は表示でも伏せない"
     );
@@ -1370,11 +1378,11 @@ fn the_editor_is_given_the_real_definition_not_the_masked_one() {
         &["Authorization: Bearer sk-live-0123456789"],
     );
     assert!(
-        tab_lines(&leaky, Tab::Headers)[0].contains("***"),
+        tab_lines(&leaky, Tab::Headers, &plain())[0].contains("***"),
         "前提: 表示は伏せている"
     );
     assert!(
-        !crate::run::literal_secrets(&leaky).is_empty(),
+        !crate::run::literal_secrets(&leaky, &plain()).is_empty(),
         "表示が伏せるのに保存の門は素通り（判定が 2 系統に分かれている）"
     );
 }
@@ -1699,6 +1707,65 @@ fn restarting_for_a_new_workspace_keeps_the_chosen_environment() {
     assert_eq!(super::restart_args("既定", None), ["-w", "", "tui"]);
 }
 
+/// 設定の `redact_headers` は、画面・編集器のガード・保存の門にも効く。
+///
+/// `record_last` だけが設定を読んでいたときは、`X-Tenant` を秘匿指定しても
+/// `last.toml` では落ちるのに画面には出て、編集器も開き、保存も通った。
+#[test]
+fn a_user_configured_secret_header_is_hidden_everywhere_not_just_in_last_toml() {
+    let mut configured = Redactor::new(true);
+    configured.add_header_name("X-Tenant");
+    let r = req("GET", "http://x/", &["X-Tenant: acme-prod-0123456789"]);
+
+    // コントロール: 既定の Redactor では、これはただのヘッダ。
+    assert!(tab_lines(&r, Tab::Headers, &plain())[0].contains("acme-prod"));
+    assert!(crate::run::literal_secrets(&r, &plain()).is_empty());
+
+    // 設定済みなら、表示も保存の門も同じように落とす。
+    assert!(
+        !tab_lines(&r, Tab::Headers, &configured)[0].contains("acme-prod"),
+        "画面に出ている"
+    );
+    assert!(
+        !crate::run::literal_secrets(&r, &configured).is_empty(),
+        "保存の門が素通り"
+    );
+    assert!(
+        !crate::run::hidden_on_screen(&r, &configured).is_empty(),
+        "編集器のガードが素通り"
+    );
+}
+
+/// **画面が伏せたものは、編集器も開かない。**
+///
+/// 保存を拒む閾値（`Assigned`）で編集器を止めていたときは、`Suspected`
+/// ——「秘匿らしい綴りがあるだけ」の本文——が編集器から素で見えた。
+/// 「通常画面で隠したものが編集器では出る」という元の漏れ口そのもの。
+#[test]
+fn the_editor_will_not_open_anything_the_panes_hide() {
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some("token hunter2".into());
+    // 前提: 保存は拒まない（ただの散文まで保存できなくなると門が通れない側で壊れる）。
+    assert!(
+        crate::run::literal_secrets(&r, &plain()).is_empty(),
+        "保存まで拒んでいる"
+    );
+    // 前提: 画面では伏せている。
+    assert!(!tab_lines(&r, Tab::Body, &plain())[0].contains("hunter2"));
+
+    let mut a = App::new(
+        vec![Entry {
+            name: "prose".into(),
+            req: r,
+        }],
+        "既定",
+        None,
+    );
+    on_key(&mut a, key(KeyCode::Char('e')));
+    assert!(a.editing.is_none(), "画面が伏せたものを編集器が開いた");
+    assert!(!screen(&a, 100, 26).contains("hunter2"));
+}
+
 /// スクロールした一覧でも、押した行が選ばれる。
 ///
 /// `ListState` の offset を足していなかったとき、下まで送った一覧の最上行を押すと
@@ -1815,7 +1882,7 @@ fn the_editor_and_the_panes_agree_on_where_a_line_lives() {
         assert_eq!(tab_of(line), want, "{line}");
         let r = req("POST", "http://x/", &[line]);
         for tab in [Tab::Headers, Tab::Query, Tab::Body] {
-            let in_pane = tab_lines(&r, tab).len() == 1;
+            let in_pane = tab_lines(&r, tab, &plain()).len() == 1;
             assert_eq!(in_pane, tab == want, "{line} が {tab:?} の表示と食い違う");
         }
     }

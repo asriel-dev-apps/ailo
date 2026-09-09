@@ -552,10 +552,12 @@ fn open_editor(app: &mut App, target: Target) {
     // 編集器には生の定義を渡す（伏せ字を渡すと保存した瞬間に `***` が本物の値として
     // 書き込まれる）。つまり直書きがあると、開いただけで通常表示が伏せている値が
     // 画面に出る。保存時のガード（`check_definition`）では表示漏洩に間に合わない。
-    let literal = crate::run::literal_secrets(&entry.req);
+    // **保存の門より広い閾値で止める。** 編集器には生の定義が入るので、
+    // 「画面では伏せているのに編集器では出る」をここで塞ぐ。
+    let literal = crate::run::hidden_on_screen(&entry.req, &app.redactor);
     if !literal.is_empty() {
         app.pane = Pane::Failed(format!(
-            "`{}` には秘匿値が直接書かれています({})。画面に出すので編集器を開きません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照する形に、CLI で直してください",
+            "`{}` には画面に出せない値が直接書かれています({})。編集器には生の定義が入るので開きません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照する形に、CLI で直してください",
             entry.name,
             literal.join(", ")
         ));

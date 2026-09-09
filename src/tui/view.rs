@@ -63,7 +63,8 @@ fn with_vars(text: &str, known: &[String]) -> Vec<Span<'static>> {
 /// 渡す `p` は**枠を付ける前**のもの。`line_count` は渡した幅をそのまま折り返しに
 /// 使い、枠の左右を引かないので、こちらで内側の幅を渡す。
 fn max_top(p: &Paragraph, area: Rect) -> u16 {
-    let lines = p.line_count(area.width.saturating_sub(2)) as u16;
+    // `as u16` は切り詰めでなく桁落ち。65,536 行で 0 に戻り、末尾へ下げられなくなる。
+    let lines = u16::try_from(p.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
     lines.saturating_sub(area.height.saturating_sub(2))
 }
 
@@ -415,7 +416,7 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     app.areas.tab_items = tab_rects(rows[1], &labels);
 
     // 3. タブの中身
-    let lines = tab_lines(&entry.req, app.tab);
+    let lines = tab_lines(&entry.req, app.tab, &app.redactor);
     let body: Vec<Line> = if lines.is_empty() {
         vec![Line::from(Span::styled(
             "（なし）",

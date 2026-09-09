@@ -90,8 +90,46 @@ async fn adhoc(method: &str, a: &RequestArgs) -> Result<Outcome> {
 /// **判定は `redact` 側に 1 つしかない。** 表示のマスクと保存の門が別の関数だった
 /// ときは、片方だけ塞がった穴が入口を足すたびに開いた（TUI の編集器で 3 経路）。
 /// ここは同じ判定の「保存を拒む側の閾値」を選ぶだけにする。
-pub(crate) fn literal_secrets(req: &SavedRequest) -> Vec<String> {
-    literal_secrets_with(req, &Redactor::new(true))
+pub(crate) fn literal_secrets(req: &SavedRequest, r: &Redactor) -> Vec<String> {
+    literal_secrets_with(req, r)
+}
+
+/// 設定の `redact_headers` を足した Redactor。
+///
+/// **これを使わずに `Redactor::new(true)` を各所で作ると、判定がまた分裂する。**
+/// `X-Tenant` を秘匿指定した利用者に対し、`last.toml` では落ちるのに画面には出て、
+/// 編集器も開き、保存も通る、という状態になっていた。
+pub fn configured_redactor() -> Redactor {
+    let mut r = Redactor::new(true);
+    // 設定が読めないときは既定の名前だけで判定する。ここで落とすと、
+    // 設定が壊れている間は画面が一切開かなくなる。
+    if let Ok(cfg) = Config::load() {
+        for name in &cfg.redact_headers {
+            r.add_header_name(name);
+        }
+    }
+    r
+}
+
+/// 画面に出す時点で伏せるもの。**保存を拒む閾値より広い。**
+///
+/// 編集器には生の定義が入るので、**表示が伏せるものは編集器も開かない**。
+/// 保存の門（`literal_secrets`）と閾値が違うのは意図したもので、ここを
+/// `blocks_saving()` に合わせると `Suspected` が編集器から素で見える。
+pub(crate) fn hidden_on_screen(req: &SavedRequest, r: &Redactor) -> Vec<String> {
+    let mut found: Vec<String> = req
+        .items
+        .iter()
+        .filter_map(|raw| redact::mask_item(raw, r).found)
+        .map(|f| f.name().to_string())
+        .collect();
+    if let Some(f) = req.raw.as_deref().and_then(|b| redact::mask_body(b).found) {
+        found.push(format!("--raw の {}", f.name()));
+    }
+    if let Some(f) = redact::mask_url(&req.url).found {
+        found.push(f.name().to_string());
+    }
+    found
 }
 
 fn literal_secrets_with(req: &SavedRequest, r: &Redactor) -> Vec<String> {
@@ -131,10 +169,7 @@ fn blocking_name(found: Option<redact::Found>) -> Option<String> {
 /// ときは、`X-Tenant` のように利用者が秘匿指定したヘッダが、ダンプでは `***` なのに
 /// `last.toml` には平文で残った。マスクの定義は 1 か所から両方へ配る。
 fn record_last(recipe: &Recipe) -> Result<()> {
-    let mut r = Redactor::new(true);
-    for name in &Config::load()?.redact_headers {
-        r.add_header_name(name);
-    }
+    let r = configured_redactor();
     let mut items = Vec::with_capacity(recipe.items.len());
     let mut redacted = Vec::new();
     for raw in &recipe.items {
@@ -1027,7 +1062,7 @@ fn check_definition(req: &SavedRequest) -> Result<()> {
         }
     }
 
-    let found = literal_secrets(req);
+    let found = literal_secrets(req, &configured_redactor());
     if !found.is_empty() {
         bail!(
             "秘匿値が直接書かれています({})。平文のファイルには残せません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照してください",
