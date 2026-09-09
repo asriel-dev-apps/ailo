@@ -187,6 +187,43 @@ pub struct VarRow {
     pub secret: bool,
 }
 
+/// テンプレートの断片。`{{名前}}` を色分けして描くために切り出す。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Piece {
+    Text(String),
+    /// `{{名前}}`。`resolved` は、いまの環境で値が付くか。
+    Var {
+        name: String,
+        resolved: bool,
+    },
+}
+
+/// `{{名前}}` で切り分ける。
+///
+/// **解決できるかどうかを見せるのが目的。** Postman が未解決を赤で出すのと同じ。
+/// 送ってから「変数が無い」と言われるより、書いている時点で分かるほうが早い。
+pub fn split_vars(text: &str, known: &[String]) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let Some(len) = rest[start..].find("}}") else {
+            break;
+        };
+        let end = start + len;
+        if start > 0 {
+            out.push(Piece::Text(rest[..start].to_string()));
+        }
+        let name = rest[start + 2..end].trim().to_string();
+        let resolved = known.contains(&name);
+        out.push(Piece::Var { name, resolved });
+        rest = &rest[end + 2..];
+    }
+    if !rest.is_empty() {
+        out.push(Piece::Text(rest.to_string()));
+    }
+    out
+}
+
 /// レスポンス欄の状態。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pane {
@@ -260,6 +297,9 @@ pub struct App {
     pub editing: Option<crate::tui::editor::Editing>,
     /// ダンプを書くか。**画面から切れるようにする**（ユーザー要望 2026-09-09）。
     pub dump: bool,
+    /// いまの環境で値の付く変数の名前。**値は持たない**（画面に出すのは名前だけ）。
+    /// 未解決の `{{名前}}` を別色にするのに使う。
+    pub known_vars: Vec<String>,
     /// マウスの捕捉が有効か。
     ///
     /// **切れるようにしておく。** 捕捉したままだと端末側のテキスト選択・コピーが
@@ -343,6 +383,7 @@ impl App {
             overlay: None,
             editing: None,
             dump: true,
+            known_vars: Vec::new(),
             mouse: true,
         }
     }
@@ -474,6 +515,12 @@ impl App {
         self.filter.clear();
         self.clamp();
     }
+}
+
+/// そのタブに何件入っているか。**空のタブと中身のあるタブを見分ける**ために出す。
+/// Postman が `Headers 11` や `Body ●` を出しているのと同じ役目。
+pub fn tab_count(req: &SavedRequest, tab: Tab) -> usize {
+    tab_lines_raw(req, tab).len()
 }
 
 /// タブごとに見せる中身を、保存済みの定義から組む。

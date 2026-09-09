@@ -10,7 +10,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::model::{display_url, tab_lines, App, Focus, Mode, Overlay, Pane, Tab};
+use super::model::{
+    display_url, split_vars, tab_count, tab_lines, App, Focus, Mode, Overlay, Pane, Piece, Tab,
+};
 
 /// フォーカス中のペインの枠。
 ///
@@ -29,6 +31,27 @@ fn framed(title: &str, focused: bool) -> Block<'_> {
     } else {
         block
     }
+}
+
+/// `{{名前}}` を色分けした Span 列にする。
+///
+/// **解決できない変数を別色にする。** 送ってから「変数が無い」と言われるより、
+/// 書いている時点で分かるほうが早い。Postman が未解決を赤で出すのと同じ。
+fn with_vars(text: &str, known: &[String]) -> Vec<Span<'static>> {
+    split_vars(text, known)
+        .into_iter()
+        .map(|p| match p {
+            Piece::Text(t) => Span::raw(t),
+            Piece::Var { name, resolved } => Span::styled(
+                format!("{{{{{name}}}}}"),
+                if resolved {
+                    Style::default().fg(Color::Magenta)
+                } else {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                },
+            ),
+        })
+        .collect()
 }
 
 /// 中身の行数と見えている高さから、これ以上下げられない位置を出す。
@@ -308,9 +331,10 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     app.areas.tabs = rows[1];
     app.areas.definition = rows[2];
     app.areas.response = rows[3];
-    app.areas.tab_items = tab_rects(rows[1]);
 
-    let Some(entry) = app.selected() else {
+    // **借りたまま `app` に書き戻せない**ので、必要な分だけ複製する。
+    // 定義 1 件は小さく、1 フレームに 1 回しか作らない。
+    let Some(entry) = app.selected().cloned() else {
         f.render_widget(
             Paragraph::new("リクエストを選んでください")
                 .block(Block::default().borders(Borders::ALL)),
@@ -321,15 +345,17 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 1. エンドポイント
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
+        Paragraph::new(Line::from(
+            vec![Span::styled(
                 format!("{} ", entry.req.method),
                 Style::default()
                     .fg(method_colour(&entry.req.method))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(display_url(&entry.req.url)),
-        ]))
+            )]
+            .into_iter()
+            .chain(with_vars(&display_url(&entry.req.url), &app.known_vars))
+            .collect::<Vec<_>>(),
+        ))
         .wrap(Wrap { trim: true })
         .block(framed(" エンドポイント ", app.focus == Focus::Endpoint)),
         rows[0],
@@ -338,8 +364,17 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     // 2. タブ
     let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
     let tabs_focused = app.focus == Focus::Tabs;
+    // **件数を出す。** 空のタブと中身のあるタブが同じ見た目だと、
+    // 開いてみるまで何が入っているか分からない。
+    let labels: Vec<String> = Tab::ALL
+        .iter()
+        .map(|t| match tab_count(&entry.req, *t) {
+            0 => t.label().to_string(),
+            n => format!("{} {n}", t.label()),
+        })
+        .collect();
     f.render_widget(
-        Tabs::new(Tab::ALL.iter().map(|t| t.label()).collect::<Vec<_>>())
+        Tabs::new(labels.clone())
             .select(selected)
             .divider(" ")
             // フォーカスが当たっているときだけ、選択中のタブを反転させる。
@@ -355,6 +390,7 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
             }),
         rows[1],
     );
+    app.areas.tab_items = tab_rects(rows[1], &labels);
 
     // 3. タブの中身
     let lines = tab_lines(&entry.req, app.tab);
@@ -364,7 +400,10 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        lines.into_iter().map(Line::from).collect()
+        lines
+            .into_iter()
+            .map(|l| Line::from(with_vars(&l, &app.known_vars)))
+            .collect()
     };
     app.definition_max_top = max_top(body.len(), rows[2].height);
     app.definition_scroll.clamp(app.definition_max_top);
@@ -401,12 +440,12 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
 ///
 /// ratatui は各タブの位置を教えてくれないので、同じ規則で数え直す。
 /// **`Tabs` の組み立てを変えたらここも変える。** ずれると、隣のタブが選ばれる。
-fn tab_rects(area: Rect) -> [Rect; Tab::ALL.len()] {
+fn tab_rects(area: Rect, labels: &[String]) -> [Rect; Tab::ALL.len()] {
     let mut out = [Rect::default(); Tab::ALL.len()];
     // `Tabs` は先頭に 1 桁の余白を置く。
     let mut x = area.x + 1;
-    for (i, tab) in Tab::ALL.iter().enumerate() {
-        let w = UnicodeWidthStr::width(tab.label()) as u16;
+    for (i, label) in labels.iter().enumerate() {
+        let w = UnicodeWidthStr::width(label.as_str()) as u16;
         out[i] = Rect {
             x,
             y: area.y,

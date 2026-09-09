@@ -1313,3 +1313,131 @@ fn the_editor_is_given_the_real_definition_not_the_masked_one() {
     assert_eq!(e.lines(), vec!["Authorization: Bearer {{token}}"]);
     assert!(!e.lines().join("").contains("***"));
 }
+
+// -------------------------------------------------- 変数の色分けとタブのバッジ
+
+use super::model::{split_vars, tab_count, Piece};
+
+/// `{{名前}}` を切り分け、解決できるかどうかを付ける。
+#[test]
+fn variables_are_split_out_and_marked_as_resolved_or_not() {
+    let known = vec!["base_url".to_string()];
+    let out = split_vars("{{base_url}}/x?k={{missing}}", &known);
+    assert_eq!(
+        out,
+        vec![
+            Piece::Var {
+                name: "base_url".into(),
+                resolved: true
+            },
+            Piece::Text("/x?k=".into()),
+            Piece::Var {
+                name: "missing".into(),
+                resolved: false
+            },
+        ]
+    );
+}
+
+/// 閉じていない `{{` は変数として扱わない。切り出すと、後ろが全部消える。
+#[test]
+fn an_unclosed_brace_is_left_as_text() {
+    let out = split_vars("a{{b", &[]);
+    assert_eq!(out, vec![Piece::Text("a{{b".into())]);
+}
+
+#[test]
+fn text_without_variables_stays_one_piece() {
+    assert_eq!(
+        split_vars("https://example.com/x", &[]),
+        vec![Piece::Text("https://example.com/x".into())]
+    );
+}
+
+/// 解決できない変数は**赤で太字**にする。送る前に気づけるように。
+#[test]
+fn an_unresolved_variable_is_shown_in_a_different_colour() {
+    use ratatui::style::Color;
+    let mut a = demo();
+    a.known_vars = vec!["base_url".into()];
+
+    let colour_of = |a: &App, needle: &str| -> Option<Color> {
+        let mut a = a.clone();
+        let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
+        t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+        let buf = t.backend().buffer().clone();
+        let first = needle.chars().next().unwrap();
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|(x, y)| buf[(*x, *y)].symbol() == first.to_string())
+            .map(|(x, y)| buf[(x, y)].style().fg.unwrap_or(Color::Reset))
+    };
+
+    // demo の URL は `{{base_url}}/tokens`。解決できるので赤ではない。
+    assert_ne!(colour_of(&a, "{"), Some(Color::Red));
+
+    a.known_vars.clear();
+    assert_eq!(
+        colour_of(&a, "{"),
+        Some(Color::Red),
+        "解決できない変数が目立たない"
+    );
+}
+
+/// タブには件数を出す。空と中身ありが同じ見た目だと、開くまで分からない。
+#[test]
+fn tabs_show_how_many_items_they_hold() {
+    let r = req(
+        "POST",
+        "http://x/",
+        &["name=taro", "age:=30", "X-Trace: abc", "limit==50"],
+    );
+    assert_eq!(tab_count(&r, Tab::Body), 2);
+    assert_eq!(tab_count(&r, Tab::Headers), 1);
+    assert_eq!(tab_count(&r, Tab::Query), 1);
+    assert_eq!(tab_count(&r, Tab::Capture), 0);
+
+    let a = App::new(
+        vec![Entry {
+            name: "x".into(),
+            req: r,
+        }],
+        "既定",
+        None,
+    );
+    let out = screen(&a, 100, 26);
+    assert!(out.contains("Body 2"), "{out}");
+    assert!(out.contains("Headers 1"), "{out}");
+    // 空のタブには数字を付けない。0 を並べても読む足しにならない。
+    assert!(
+        out.contains("Capture") && !out.contains("Capture 0"),
+        "{out}"
+    );
+}
+
+/// 件数が付いてもクリックの当たり判定がずれないこと。
+/// タブの矩形は `Tabs` と同じ規則で数え直しているので、ラベルが変われば動く。
+#[test]
+fn clicking_a_tab_still_works_when_the_labels_carry_counts() {
+    use super::on_mouse;
+    let r = req(
+        "POST",
+        "http://x/",
+        &["name=taro", "age:=30", "X-Trace: abc", "limit==50"],
+    );
+    let mut a = drawn(
+        &App::new(
+            vec![Entry {
+                name: "x".into(),
+                req: r,
+            }],
+            "既定",
+            None,
+        ),
+        100,
+        26,
+    );
+    let query = a.areas.tab_items[2];
+    on_mouse(&mut a, click(query.x, query.y));
+    assert_eq!(a.tab, Tab::Query, "tab_items: {:?}", a.areas.tab_items);
+}

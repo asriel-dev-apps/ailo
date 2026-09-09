@@ -55,6 +55,7 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
     install_panic_restore();
     let entries = load_entries()?;
     let mut app = App::new(entries, workspace::current().label(), env.clone());
+    app.known_vars = known_var_names(env.as_deref());
 
     // **未知の環境は起動時に言う。** 送るまで黙っていると、ヘッダに
     // `env: typo` と平然と出たまま、変数が 1 つも解決しない画面を見ることになる。
@@ -249,6 +250,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App) -> Result<Exit> {
                 app.pane = Pane::Sending;
                 terminal.draw(|f| view::draw(f, app))?;
                 app.pane = send_watching_for_cancel(&name, app.env.as_deref(), app.dump).await?;
+                // capture で変数が増えることがある。取り直さないと、
+                // いま取ったばかりの値が未解決の色で出る。
+                app.known_vars = known_var_names(app.env.as_deref());
             }
             Action::Save => save_editing(app)?,
             Action::SwitchWorkspace(name) => return Ok(Exit::Switch(name)),
@@ -472,6 +476,16 @@ fn workspace_names() -> Result<Vec<String>> {
         .collect())
 }
 
+/// いまの環境で値の付く変数の名前。**値は持ち出さない。**
+///
+/// 読めなければ空で返す。ここで落として画面が開かないほうが困る
+/// (色が付かないだけで、送るのに支障は無い)。
+fn known_var_names(env: Option<&str>) -> Vec<String> {
+    crate::run::variables(env)
+        .map(|rows| rows.into_iter().map(|(d, _)| d.name).collect())
+        .unwrap_or_default()
+}
+
 /// 変数一覧の行。**値は `run::variables` の時点で伏せてある。**
 fn var_rows(env: Option<&str>) -> Result<Vec<VarRow>> {
     Ok(crate::run::variables(env)?
@@ -571,6 +585,9 @@ fn on_overlay_key(app: &mut App, key: KeyEvent) -> Action {
                 }
                 (Some(Overlay::Env { .. }), Some(name)) => {
                     app.set_env(name);
+                    // 環境が変われば解決できる変数も変わる。取り直さないと
+                    // 色分けが前の環境のまま残る。
+                    app.known_vars = known_var_names(app.env.as_deref());
                 }
                 _ => {}
             }
