@@ -819,3 +819,148 @@ fn a_scrollable_pane_shows_how_far_down_it_is() {
     let out = screen(&a, 100, 26);
     assert!(out.contains("レスポンス [0/"), "{out}");
 }
+
+// ------------------------------------------------------------------ マウス
+
+use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+
+fn click(x: u16, y: u16) -> MouseEvent {
+    MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn wheel(down: bool, x: u16, y: u16) -> MouseEvent {
+    MouseEvent {
+        kind: if down {
+            MouseEventKind::ScrollDown
+        } else {
+            MouseEventKind::ScrollUp
+        },
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// 矩形は描いたときに書き戻される。クリックの当たり判定はそれを使う。
+fn drawn(app: &App, width: u16, height: u16) -> App {
+    let mut a = app.clone();
+    let mut t = Terminal::new(TestBackend::new(width, height)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+    a
+}
+
+/// クリックしたペインにフォーカスが移る。
+#[test]
+fn clicking_a_pane_moves_the_focus_there() {
+    use super::{on_mouse, Focus};
+    let mut a = drawn(&demo(), 100, 26);
+
+    let response = a.areas.response;
+    on_mouse(&mut a, click(response.x + 2, response.y + 1));
+    assert_eq!(a.focus, Focus::Response);
+
+    let list = a.areas.list;
+    on_mouse(&mut a, click(list.x + 2, list.y + 1));
+    assert_eq!(a.focus, Focus::List);
+}
+
+/// 一覧はクリックした行が選ばれる。
+#[test]
+fn clicking_a_row_in_the_list_selects_it() {
+    use super::on_mouse;
+    let mut a = drawn(&demo(), 100, 26);
+    assert_eq!(a.selected().unwrap().name, "login");
+
+    let list = a.areas.list;
+    // 枠の 1 行下が 0 行目。その次が 1 行目。
+    on_mouse(&mut a, click(list.x + 2, list.y + 2));
+    assert_eq!(a.selected().unwrap().name, "issues");
+}
+
+/// タブはクリックしたものへ切り替わる。
+#[test]
+fn clicking_a_tab_switches_to_it() {
+    use super::on_mouse;
+    let mut a = drawn(&demo(), 100, 26);
+    assert_eq!(a.tab, Tab::Body);
+
+    let query = a.areas.tab_items[2];
+    on_mouse(&mut a, click(query.x, query.y));
+    assert_eq!(a.tab, Tab::Query, "tab_items: {:?}", a.areas.tab_items);
+}
+
+/// **ホイールはフォーカスを移さない。** 見るために回しただけで
+/// キーの当たり先が変わると、次に押したキーが思わぬ場所に効く。
+#[test]
+fn the_wheel_scrolls_without_stealing_the_focus() {
+    use super::{on_mouse, Focus};
+    let mut a = drawn(&demo(), 100, 26);
+    a.focus = Focus::List;
+    a.response_max_top = 30;
+
+    let response = a.areas.response;
+    on_mouse(&mut a, wheel(true, response.x + 2, response.y + 1));
+    assert!(a.response_scroll.top() > 0, "スクロールしていない");
+    assert_eq!(a.focus, Focus::List, "フォーカスが動いている");
+
+    on_mouse(&mut a, wheel(false, response.x + 2, response.y + 1));
+    assert_eq!(a.response_scroll.top(), 0);
+}
+
+/// 何も無いところのクリックは無視する。
+#[test]
+fn clicking_outside_every_pane_does_nothing() {
+    use super::{on_mouse, Focus};
+    let mut a = drawn(&demo(), 100, 26);
+    a.focus = Focus::Response;
+    on_mouse(&mut a, click(0, 0)); // ヘッダの行
+    assert_eq!(a.focus, Focus::Response);
+}
+
+/// 絞り込み中はマウスを効かせない。打った文字がどこへ行ったか分からなくなる。
+#[test]
+fn the_mouse_is_ignored_while_filtering() {
+    use super::{on_mouse, Focus};
+    let mut a = drawn(&demo(), 100, 26);
+    a.focus = Focus::List;
+    on_key(&mut a, key(KeyCode::Char('/')));
+
+    let response = a.areas.response;
+    on_mouse(&mut a, click(response.x + 2, response.y + 1));
+    assert_eq!(a.focus, Focus::List);
+}
+
+/// 一覧を畳んだ狭い端末では、一覧の当たり判定も消える。
+/// 残すと、見えていない場所がクリックに反応する。
+#[test]
+fn a_hidden_sidebar_has_no_hit_area() {
+    use super::on_mouse;
+    use super::Focus;
+    let mut a = drawn(&demo(), 50, 24);
+    assert_eq!(a.areas.list, Rect::default());
+    // 左端は、狭い端末では右側のペインが占めている。
+    // **一覧に当たってはいけない**（一覧は描かれていない）。
+    for y in 1..23 {
+        on_mouse(&mut a, click(1, y));
+        assert_ne!(a.focus, Focus::List, "描いていない一覧に当たった (y={y})");
+    }
+}
+
+/// `m` で捕捉を切れる。切れていることは画面に出す。
+#[test]
+fn mouse_capture_can_be_turned_off_and_says_so() {
+    let mut a = demo();
+    assert!(a.mouse);
+    on_key(&mut a, key(KeyCode::Char('m')));
+    assert!(!a.mouse);
+    assert!(screen(&a, 100, 26).contains("マウス切"), "画面に出ていない");
+    on_key(&mut a, key(KeyCode::Char('m')));
+    assert!(a.mouse);
+    assert!(!screen(&a, 100, 26).contains("マウス切"));
+}

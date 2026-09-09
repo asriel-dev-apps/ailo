@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 
+use ratatui::layout::Rect;
+
 use crate::config::SavedRequest;
 
 /// 右側の切り替えタブ。
@@ -182,6 +184,69 @@ pub struct App {
     /// 描く前に押されたキーは 0 で畳まれるが、1 フレーム目だけの話で害が無い。
     pub definition_max_top: u16,
     pub response_max_top: u16,
+    /// **描画側が毎回書き込む**、各ペインが占めている画面上の矩形。
+    /// マウスのクリックをペインに対応づけるのに要る。
+    pub areas: Areas,
+    /// マウスの捕捉が有効か。
+    ///
+    /// **切れるようにしておく。** 捕捉したままだと端末側のテキスト選択・コピーが
+    /// できなくなる。TUI でこれを塞ぐと、出力を貼りたいだけの人が詰む。
+    pub mouse: bool,
+}
+
+/// 各ペインの矩形。クリックの当たり判定に使う。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Areas {
+    pub list: Rect,
+    pub endpoint: Rect,
+    pub tabs: Rect,
+    /// タブ 1 つずつの矩形。クリックでそのタブへ切り替えるため。
+    pub tab_items: [Rect; Tab::ALL.len()],
+    pub definition: Rect,
+    pub response: Rect,
+}
+
+impl Areas {
+    /// その点がどのペインか。どれでもなければ `None`。
+    pub fn hit(&self, x: u16, y: u16) -> Option<Focus> {
+        let inside = |r: Rect| {
+            r.width > 0
+                && r.height > 0
+                && x >= r.x
+                && x < r.x + r.width
+                && y >= r.y
+                && y < r.y + r.height
+        };
+        // 上から順に見る。重なりは無いが、順序を決めておかないと
+        // 実装を変えたときに当たり先が黙って入れ替わる。
+        if inside(self.list) {
+            Some(Focus::List)
+        } else if inside(self.endpoint) {
+            Some(Focus::Endpoint)
+        } else if inside(self.tabs) {
+            Some(Focus::Tabs)
+        } else if inside(self.definition) {
+            Some(Focus::Definition)
+        } else if inside(self.response) {
+            Some(Focus::Response)
+        } else {
+            None
+        }
+    }
+
+    /// その点にあるタブの番号。
+    pub fn tab_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.tab_items.iter().position(|r| {
+            r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+        })
+    }
+
+    /// 一覧の何行目をクリックしたか。枠の 1 行を差し引く。
+    pub fn list_row_at(&self, y: u16) -> Option<usize> {
+        let inner_top = self.list.y + 1;
+        let inner_bottom = self.list.y + self.list.height.saturating_sub(1);
+        (y >= inner_top && y < inner_bottom).then(|| (y - inner_top) as usize)
+    }
 }
 
 impl App {
@@ -201,6 +266,8 @@ impl App {
             response_scroll: Scroll::default(),
             definition_max_top: 0,
             response_max_top: 0,
+            areas: Areas::default(),
+            mouse: true,
         }
     }
 
@@ -236,6 +303,14 @@ impl App {
         let n = self.visible().len();
         if n > 0 {
             self.selected = (self.selected + n - 1) % n;
+            self.on_request_changed();
+        }
+    }
+
+    /// 一覧の n 番目を選ぶ。範囲外は無視する。
+    pub fn select_visible(&mut self, index: usize) {
+        if index < self.visible().len() && index != self.selected {
+            self.selected = index;
             self.on_request_changed();
         }
     }

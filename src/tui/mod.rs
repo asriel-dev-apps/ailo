@@ -14,7 +14,10 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -111,7 +114,7 @@ fn install_panic_restore() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         previous(info);
     }));
 }
@@ -131,7 +134,8 @@ impl Screen {
         // ここから先で失敗しても raw モードを戻す。
         let guard = RawGuard;
         let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen).context("画面を切り替えられません")?;
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)
+            .context("画面を切り替えられません")?;
         let terminal = Terminal::new(CrosstermBackend::new(out)).context("端末を初期化できません");
         match terminal {
             Ok(terminal) => {
@@ -149,7 +153,13 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        // **マウス捕捉も必ず解く。** 解かないと、抜けたあとの端末で
+        // 選択もスクロールもできないまま残る。
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -170,16 +180,25 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let action = match event::read()? {
+            Event::Key(key) => {
+                // **押した瞬間だけを見る。** Windows は離したときにも同じキーを
+                // 送るので、これを見ないと 1 回の入力が 2 回効く。
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                let was_capturing = app.mouse;
+                let action = on_key(app, key);
+                if app.mouse != was_capturing {
+                    set_mouse_capture(terminal, app.mouse)?;
+                }
+                action
+            }
+            Event::Mouse(m) => on_mouse(app, m),
+            _ => continue,
         };
-        // **押した瞬間だけを見る。** Windows は離したときにも同じキーを送るので、
-        // これを見ないと 1 回の入力が 2 回効く。
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
 
-        match on_key(app, key) {
+        match action {
             Action::None => {}
             Action::Quit => return Ok(()),
             Action::Send => {
@@ -254,6 +273,11 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             app.mode = Mode::Filter;
             Action::None
         }
+        // マウス捕捉の入り切り。切ると端末のテキスト選択が戻る。
+        KeyCode::Char('m') => {
+            app.mouse = !app.mouse;
+            Action::None
+        }
         KeyCode::Enter => Action::Send,
         KeyCode::Char('e') => match app.selected() {
             Some(e) => Action::Edit(e.name.clone()),
@@ -262,6 +286,75 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         _ => on_focused_key(app, key),
     }
 }
+
+/// マウスの捕捉を切り替える。
+///
+/// 捕捉している間は端末側のテキスト選択ができない。**出力を貼りたいだけの人が
+/// 詰まないよう、いつでも切れるようにする。**
+fn set_mouse_capture(terminal: &mut Term, on: bool) -> Result<()> {
+    if on {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
+    Ok(())
+}
+
+/// マウス 1 つに対する判断。端末にも通信にも触らない。
+pub fn on_mouse(app: &mut App, m: MouseEvent) -> Action {
+    // 絞り込み中はキーボードに専念させる。ここでフォーカスが飛ぶと、
+    // 打った文字がどこへ行ったか分からなくなる。
+    if app.mode == Mode::Filter {
+        return Action::None;
+    }
+    let (x, y) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(focus) = app.areas.hit(x, y) else {
+                return Action::None;
+            };
+            app.focus = focus;
+            match focus {
+                Focus::List => {
+                    if let Some(row) = app.areas.list_row_at(y) {
+                        app.select_visible(row);
+                    }
+                }
+                Focus::Tabs => {
+                    if let Some(i) = app.areas.tab_at(x, y) {
+                        app.set_tab(Tab::ALL[i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // **ホイールはカーソルの下のペインを動かす。** フォーカスを移さないのは、
+        // 「見るために回しただけ」でキーの当たり先が変わると事故になるため。
+        MouseEventKind::ScrollDown => match app.areas.hit(x, y) {
+            Some(Focus::Definition) => {
+                let max = app.definition_max_top;
+                app.definition_scroll.down(WHEEL, max);
+            }
+            Some(Focus::Response) => {
+                let max = app.response_max_top;
+                app.response_scroll.down(WHEEL, max);
+            }
+            Some(Focus::List) => app.move_down(),
+            _ => {}
+        },
+        MouseEventKind::ScrollUp => match app.areas.hit(x, y) {
+            Some(Focus::Definition) => app.definition_scroll.up(WHEEL),
+            Some(Focus::Response) => app.response_scroll.up(WHEEL),
+            Some(Focus::List) => app.move_up(),
+            _ => {}
+        },
+        _ => {}
+    }
+    Action::None
+}
+
+/// ホイール 1 刻みで動く行数。
+const WHEEL: u16 = 3;
 
 /// フォーカス中のペインに配るキー。
 ///
@@ -333,13 +426,22 @@ const PAGE: u16 = 10;
 /// 上へ返す（画面を持たないまま描き続けるより、落ちるほうがよい）。
 fn with_terminal_released<T>(terminal: &mut Term, f: impl FnOnce() -> T) -> Result<T> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     let out = f();
 
     enable_raw_mode().context("端末を raw モードに戻せません")?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen).context("画面を戻せません")?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .context("画面を戻せません")?;
     terminal.hide_cursor()?;
     Ok(out)
 }

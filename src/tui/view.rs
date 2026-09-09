@@ -58,6 +58,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     // 狭い端末では一覧を出さない。潰れた 2 ペインより、片方が読めるほうがよい。
     if f.area().width < NARROW {
+        // 一覧は出していないので、当たり判定も消す。残すと見えない場所が
+        // クリックに反応する。
+        app.areas.list = Rect::default();
         detail(f, app, root[1]);
         return;
     }
@@ -67,19 +70,29 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(SIDEBAR), Constraint::Min(20)])
         .split(root[1]);
 
+    app.areas.list = cols[0];
     sidebar(f, app, cols[0]);
     detail(f, app, cols[1]);
 }
 
 fn header(app: &App) -> Paragraph<'_> {
     let env = app.env.clone().unwrap_or_else(|| "-".into());
-    Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(" ailo ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("workspace: {}  env: {env}", app.workspace),
             Style::default().fg(Color::DarkGray),
         ),
-    ]))
+    ];
+    // **切れていることだけを出す。** 既定は入りなので、入っているときに
+    // 出しても場所を食うだけ。切れているのに気づかないほうが困る。
+    if !app.mouse {
+        spans.push(Span::styled(
+            "  マウス切",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 /// 案内の候補。長いものから順に、**実際に収まるもの**を選ぶ。
@@ -88,7 +101,7 @@ fn header(app: &App) -> Paragraph<'_> {
 /// 切れていた。消えるのが**抜け方**なので、初見の利用者は raw モードの画面に
 /// 取り残される。**途中で切れた案内は、無いより悪い。**
 const NORMAL_HINTS: [&str; 4] = [
-    " Tab ペイン   ↑↓ 選択/スクロール   Enter 送信   / 絞り込み   e 編集   q 終了",
+    " Tab ペイン   ↑↓ 選択/スクロール   Enter 送信   / 絞り込み   e 編集   m マウス   q 終了",
     " Tab ペイン   ↑↓ 移動   Enter 送信   e 編集   q 終了",
     " Tab ペイン   Enter 送信   q 終了",
     " q 終了",
@@ -181,6 +194,12 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
         ])
         .split(area);
 
+    app.areas.endpoint = rows[0];
+    app.areas.tabs = rows[1];
+    app.areas.definition = rows[2];
+    app.areas.response = rows[3];
+    app.areas.tab_items = tab_rects(rows[1]);
+
     let Some(entry) = app.selected() else {
         f.render_widget(
             Paragraph::new("リクエストを選んでください")
@@ -266,6 +285,28 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
             .block(framed(&title, app.focus == Focus::Response)),
         rows[3],
     );
+}
+
+/// タブ 1 つずつの矩形。`Tabs` の並べ方（ラベル + `divider(" ")`）に合わせて数える。
+///
+/// ratatui は各タブの位置を教えてくれないので、同じ規則で数え直す。
+/// **`Tabs` の組み立てを変えたらここも変える。** ずれると、隣のタブが選ばれる。
+fn tab_rects(area: Rect) -> [Rect; Tab::ALL.len()] {
+    let mut out = [Rect::default(); Tab::ALL.len()];
+    // `Tabs` は先頭に 1 桁の余白を置く。
+    let mut x = area.x + 1;
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let w = UnicodeWidthStr::width(tab.label()) as u16;
+        out[i] = Rect {
+            x,
+            y: area.y,
+            width: w.min(area.width.saturating_sub(x - area.x)),
+            height: 1,
+        };
+        // ラベル + 区切り(" " の左右に 1 桁ずつ)。
+        x += w + 3;
+    }
+    out
 }
 
 /// スクロールできる枠の見出し。**まだ下があることを見せる。**
