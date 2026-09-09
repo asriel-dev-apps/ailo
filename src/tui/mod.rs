@@ -4,6 +4,7 @@
 //! 見渡し、その場で叩いて結果を確かめるためのもの。定義そのものの編集は
 //! `ailo new` と同じ `$EDITOR` に投げる（画面の中に編集器を作らない）。
 
+mod editor;
 mod model;
 pub(crate) mod view;
 
@@ -30,6 +31,7 @@ use crate::dump;
 use crate::run::Outcome;
 use crate::shape;
 use crate::workspace;
+use editor::{Editing, Target};
 
 pub use model::{App, Areas, Entry, Focus, Mode, Overlay, Pane, Scroll, Tab, VarRow};
 
@@ -37,9 +39,10 @@ pub use model::{App, Areas, Entry, Focus, Mode, Overlay, Pane, Scroll, Tab, VarR
 #[derive(Debug, PartialEq)]
 pub enum Action {
     None,
+    /// 編集した定義を保存する。
+    Save,
     Quit,
     Send,
-    Edit(String),
     /// workspace を切り替える。**同じプロセスでは切り替えられない**ので、
     /// 自分自身を `-w <名前>` で起動し直す（下の `switch_workspace` を見よ）。
     SwitchWorkspace(String),
@@ -247,21 +250,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App) -> Result<Exit> {
                 terminal.draw(|f| view::draw(f, app))?;
                 app.pane = send_watching_for_cancel(&name, app.env.as_deref(), app.dump).await?;
             }
+            Action::Save => save_editing(app)?,
             Action::SwitchWorkspace(name) => return Ok(Exit::Switch(name)),
-            Action::Edit(name) => {
-                // エディタは端末を占有する。**必ず画面を明け渡してから起動する。**
-                // 明け渡さずに起動すると、vim が alternate screen の上に描いて
-                // 何も見えないまま入力だけが通る。
-                let outcome = with_terminal_released(terminal, || crate::run::edit_saved(&name))?;
-                terminal.clear()?;
-                match outcome {
-                    Ok(()) => {
-                        app.reload(load_entries()?);
-                        app.pane = Pane::Idle;
-                    }
-                    Err(e) => app.pane = Pane::Failed(format!("{e}")),
-                }
-            }
         }
         if app.quit {
             return Ok(Exit::Quit);
@@ -273,9 +263,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App) -> Result<Exit> {
 pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     // **Ctrl-C はどの状態からでも抜ける。** 絞り込みの分岐より後ろに置いていたときは、
     // 絞り込み中の Ctrl-C が文字 `c` として検索語に入り、抜ける手段が無くなっていた。
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+    //
+    // 編集中だけは例外。書きかけを Ctrl-C で消し飛ばすのは、どの editor でもしない。
+    // 編集中は `Esc` で破棄、`Ctrl-S` で保存。
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('c')
+        && app.editing.is_none()
+    {
         app.quit = true;
         return Action::Quit;
+    }
+
+    if app.editing.is_some() {
+        return on_editor_key(app, key);
     }
 
     if app.overlay.is_some() {
@@ -347,11 +347,19 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             app.dump = !app.dump;
             Action::None
         }
+        // **フォーカス中のペインを編集する。** どこを編集するかは、
+        // いま当たっている場所で決まる（ユーザー要望 2026-09-09）。
+        KeyCode::Char('e') => {
+            open_editor_for_focus(app);
+            Action::None
+        }
+        // 定義まるごとを TOML で編集する。capture や form など、
+        // ペインに出ていないものを触るときに要る。
+        KeyCode::Char('T') => {
+            open_editor(app, Target::Whole);
+            Action::None
+        }
         KeyCode::Enter => Action::Send,
-        KeyCode::Char('e') => match app.selected() {
-            Some(e) => Action::Edit(e.name.clone()),
-            None => Action::None,
-        },
         _ => on_focused_key(app, key),
     }
 }
@@ -425,6 +433,36 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) -> Action {
 /// ホイール 1 刻みで動く行数。
 const WHEEL: u16 = 3;
 
+/// 編集中の内容を保存する。**落ちても編集器は閉じない。**
+///
+/// 閉じてしまうと、直せば通る内容を書いた人が書いたものごと失う。
+/// 理由を編集器の中に出して、直せるようにする。
+fn save_editing(app: &mut App) -> Result<()> {
+    let Some(editing) = app.editing.as_mut() else {
+        return Ok(());
+    };
+    let outcome = editing
+        .apply()
+        .and_then(|req| crate::run::save_edited(&editing.name, &editing.opened_from, req));
+
+    match outcome {
+        Ok(()) => {
+            app.editing = None;
+            // 書き換わったので読み直す。読み直さないと、画面が古い定義のまま。
+            app.reload(load_entries()?);
+            app.pane = Pane::Idle;
+        }
+        Err(e) => {
+            let mut msg = format!("{e}");
+            for cause in e.chain().skip(1) {
+                msg.push_str(&format!("\n  原因: {cause}"));
+            }
+            editing.error = Some(msg);
+        }
+    }
+    Ok(())
+}
+
 /// 選べる workspace の名前。既定は表示名で出す。
 fn workspace_names() -> Result<Vec<String>> {
     let base = crate::paths::config_base()?;
@@ -446,6 +484,62 @@ fn var_rows(env: Option<&str>) -> Result<Vec<VarRow>> {
             secret: d.secret,
         })
         .collect())
+}
+
+/// フォーカスから、編集する対象を決める。
+fn open_editor_for_focus(app: &mut App) {
+    let target = match app.focus {
+        Focus::Endpoint => Target::Endpoint,
+        Focus::Definition | Focus::Tabs => match app.tab {
+            // capture は「名前 = 式」で item 記法ではない。行単位で編集させると
+            // 保存の形が別物になるので、まるごと TOML に回す。
+            Tab::Capture => Target::Whole,
+            tab => Target::Items(tab),
+        },
+        // 一覧とレスポンスに当たっているときは、まるごと開く。
+        // 「どこを編集するか」が決まらないので、決め打ちで一部を開かない。
+        Focus::List | Focus::Response => Target::Whole,
+    };
+    open_editor(app, target);
+}
+
+fn open_editor(app: &mut App, target: Target) {
+    let Some(entry) = app.selected() else {
+        return;
+    };
+    // 本文を持つリクエストで Body を編集するなら、item ではなく本文を開く。
+    // 両方を 1 つの画面に混ぜると、保存の形が決まらない。
+    let target = match (target, entry.req.raw.is_some()) {
+        (Target::Items(Tab::Body), true) => Target::Raw,
+        (t, _) => t,
+    };
+    app.editing = Some(Editing::open(&entry.name, &entry.req, target));
+}
+
+/// 編集中のキー。**ここで拾わないものは全部 `tui-textarea` に渡す。**
+fn on_editor_key(app: &mut App, key: KeyEvent) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.editing = None;
+            return Action::None;
+        }
+        KeyCode::Char('s') if ctrl => return Action::Save,
+        // 1 行しか受け付けない対象では改行を入れさせない。
+        // 入れさせると、保存時に黙って連結されて意図と違う値になる。
+        KeyCode::Enter => {
+            let single = app.editing.as_ref().is_some_and(|e| e.target.single_line());
+            if single {
+                return Action::Save;
+            }
+        }
+        _ => {}
+    }
+    if let Some(editing) = app.editing.as_mut() {
+        editing.error = None;
+        editing.area.input(key);
+    }
+    Action::None
 }
 
 /// かぶせて出ているものへのキー。**`Esc` はどれでも閉じる。**
@@ -548,33 +642,6 @@ fn scroll_keys(scroll: &mut Scroll, key: KeyEvent, max_top: u16) {
 
 /// 1 ページ分の行数。端末の高さは描くまで分からないので、控えめな固定値にする。
 const PAGE: u16 = 10;
-
-/// 端末を明け渡してから `f` を動かし、戻ってきたら握り直す。
-///
-/// **明け渡さずにエディタを起動すると、vim が alternate screen の上に描いて
-/// 何も見えないまま入力だけが通る。** 握り直しに失敗したときは、そのまま
-/// 上へ返す（画面を持たないまま描き続けるより、落ちるほうがよい）。
-fn with_terminal_released<T>(terminal: &mut Term, f: impl FnOnce() -> T) -> Result<T> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-
-    let out = f();
-
-    enable_raw_mode().context("端末を raw モードに戻せません")?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )
-    .context("画面を戻せません")?;
-    terminal.hide_cursor()?;
-    Ok(out)
-}
 
 /// 送りながら、中断のキーだけを拾い続ける。
 ///

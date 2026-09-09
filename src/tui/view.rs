@@ -89,6 +89,11 @@ fn centred(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
 }
 
 fn overlay(f: &mut Frame, app: &mut App) {
+    // 編集器が一番手前。開いている間はほかのかぶせものを出さない。
+    if app.editing.is_some() {
+        editor(f, app);
+        return;
+    }
     let Some(overlay) = app.overlay.as_mut() else {
         return;
     };
@@ -495,5 +500,52 @@ fn status_colour(status: u16) -> Color {
         300..=399 => Color::Cyan,
         400..=499 => Color::Yellow,
         _ => Color::Red,
+    }
+}
+
+/// 編集器。画面のほとんどを占める。
+fn editor(f: &mut Frame, app: &mut App) {
+    let Some(editing) = app.editing.as_mut() else {
+        return;
+    };
+    let area = centred(f.area(), 84, 80);
+    f.render_widget(Clear, area);
+
+    // 落ちた理由がある回は、その分の行を下に空ける。
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if editing.error.is_some() {
+            [Constraint::Min(3), Constraint::Length(4)]
+        } else {
+            [Constraint::Min(3), Constraint::Length(0)]
+        })
+        .split(area);
+
+    let hint = if editing.target.single_line() {
+        " Enter 保存   Esc 破棄 "
+    } else {
+        " Ctrl-S 保存   Esc 破棄 "
+    };
+    editing.area.set_block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(editing.target.title())
+            .title_bottom(hint)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(&editing.area, rows[0]);
+
+    if let Some(err) = &editing.error {
+        f.render_widget(
+            Paragraph::new(err.clone())
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(Color::Red))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" 保存できません "),
+                ),
+            rows[1],
+        );
     }
 }

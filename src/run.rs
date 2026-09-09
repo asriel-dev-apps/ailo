@@ -1067,7 +1067,7 @@ fn check_definition(req: &SavedRequest) -> Result<()> {
     }
     if !found.is_empty() {
         bail!(
-            "秘匿値が直接書かれています({})。平文のファイルには残せません。\n             `ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照してください",
+            "秘匿値が直接書かれています({})。平文のファイルには残せません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照してください",
             found.join(", ")
         );
     }
@@ -1171,6 +1171,25 @@ pub fn edit_saved(name: &str) -> Result<()> {
     };
     println!("{what}: {name} ({})", crate::workspace::current().label());
     Ok(())
+}
+
+/// 編集した定義を保存する。**TUI の編集器から使う。**
+///
+/// `ailo new` と同じ検証（`check_definition`＝秘匿値の直書きガードを含む）と、
+/// 同じ衝突検出（開いてから保存するまでに書き換わっていたら上書きしない）を通す。
+/// TUI 側に書き込みを持たせると、この 2 つが片方だけ古くなる。
+pub fn save_edited(name: &str, opened_from: &SavedRequest, edited: SavedRequest) -> Result<()> {
+    validate_request_name(name)?;
+    check_definition(&edited)?;
+
+    // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
+    let _lock = crate::config::lock_config()?;
+    let mut reqs = Requests::load()?;
+    if reqs.get(name) != Some(opened_from) {
+        bail!("編集している間に `{name}` が書き換えられました。上書きしていません");
+    }
+    reqs.put(name, edited);
+    reqs.save()
 }
 
 /// いまの workspace を添える 1 行。

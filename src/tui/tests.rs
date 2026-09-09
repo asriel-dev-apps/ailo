@@ -424,10 +424,9 @@ fn q_and_ctrl_c_both_quit() {
 fn e_opens_the_editor_for_the_selected_request() {
     let mut a = app(&["one", "two"]);
     on_key(&mut a, key(KeyCode::Down));
-    assert_eq!(
-        on_key(&mut a, key(KeyCode::Char('e'))),
-        Action::Edit("two".into())
-    );
+    on_key(&mut a, key(KeyCode::Char('e')));
+    let editing = a.editing.as_ref().expect("編集器が開いていない");
+    assert_eq!(editing.name, "two");
 }
 
 // ------------------------------------------------------------------ 描画
@@ -1101,4 +1100,216 @@ fn an_overlay_hides_what_is_behind_it() {
         still < behind,
         "後ろが透けている（{behind} 行 → {still} 行）:\n{out}"
     );
+}
+
+// ------------------------------------------------------------------ 編集器
+
+use super::editor::{apply, Target};
+
+/// 編集する対象は**いま当たっているペイン**で決まる。
+#[test]
+fn what_gets_edited_depends_on_which_pane_has_focus() {
+    use super::Focus;
+    let cases = [
+        (Focus::Endpoint, Tab::Body, Target::Endpoint),
+        (Focus::Definition, Tab::Headers, Target::Items(Tab::Headers)),
+        (Focus::Definition, Tab::Query, Target::Items(Tab::Query)),
+        // capture は「名前 = 式」で item 記法ではない。行単位で編集させると
+        // 保存の形が別物になるので、まるごと TOML に回す。
+        (Focus::Definition, Tab::Capture, Target::Whole),
+        // どこを編集するか決まらないペインでは、まるごと開く。
+        (Focus::List, Tab::Body, Target::Whole),
+        (Focus::Response, Tab::Body, Target::Whole),
+    ];
+    for (focus, tab, want) in cases {
+        let mut a = app(&["x"]);
+        a.focus = focus;
+        a.tab = tab;
+        on_key(&mut a, key(KeyCode::Char('e')));
+        assert_eq!(
+            a.editing.as_ref().map(|e| e.target),
+            Some(want),
+            "{focus:?} / {tab:?}"
+        );
+    }
+}
+
+/// 本文を持つリクエストで Body を開いたら、item ではなく本文を編集する。
+/// 両方を 1 画面に混ぜると、保存の形が決まらない。
+#[test]
+fn opening_body_on_a_request_with_a_raw_payload_edits_the_payload() {
+    use super::Focus;
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some(r#"{"a":1}"#.into());
+    let mut a = App::new(
+        vec![Entry {
+            name: "x".into(),
+            req: r,
+        }],
+        "既定",
+        None,
+    );
+    a.focus = Focus::Definition;
+    on_key(&mut a, key(KeyCode::Char('e')));
+    assert_eq!(a.editing.as_ref().map(|e| e.target), Some(Target::Raw));
+}
+
+/// `Esc` で破棄、`Ctrl-S` で保存。**`Ctrl-C` で書きかけを消し飛ばさない。**
+#[test]
+fn the_editor_discards_on_escape_and_does_not_quit_on_ctrl_c() {
+    let mut a = app(&["x"]);
+    on_key(&mut a, key(KeyCode::Char('e')));
+    assert!(a.editing.is_some());
+
+    let ctrl_c = KeyEvent {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: ratatui::crossterm::event::KeyEventState::NONE,
+    };
+    on_key(&mut a, ctrl_c);
+    assert!(!a.quit, "書きかけを Ctrl-C で消している");
+
+    on_key(&mut a, key(KeyCode::Esc));
+    assert!(a.editing.is_none());
+    assert!(!a.quit);
+}
+
+/// 打った文字は編集器に入る。裏のペインには効かない。
+#[test]
+fn typing_goes_into_the_editor_not_into_the_panes() {
+    let mut a = app(&["one", "two"]);
+    let before = a.selected().unwrap().name.clone();
+    on_key(&mut a, key(KeyCode::Char('e')));
+    for c in "jjq/".chars() {
+        on_key(&mut a, key(KeyCode::Char(c)));
+    }
+    assert!(!a.quit, "q で終了している");
+    assert_eq!(a.selected().unwrap().name, before, "裏の一覧が動いている");
+    let text = a.editing.as_ref().unwrap().lines().join("\n");
+    assert!(text.contains("jjq/"), "{text}");
+}
+
+// -------------------------------------------------- 編集結果の畳み込み（apply）
+
+#[test]
+fn editing_the_endpoint_splits_method_and_url() {
+    let base = req("GET", "http://old/", &[]);
+    let out = apply(&base, Target::Endpoint, &["post https://new/x".into()]).unwrap();
+    assert_eq!(out.method, "POST", "メソッドは大文字に揃える");
+    assert_eq!(out.url, "https://new/x");
+}
+
+#[test]
+fn an_endpoint_without_a_url_is_rejected_with_a_usable_message() {
+    let base = req("GET", "http://old/", &[]);
+    let err = apply(&base, Target::Endpoint, &["GET".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("メソッド"), "{err}");
+}
+
+/// **そのタブの item だけ入れ替える。** 他のタブの item を巻き込むと、
+/// ヘッダを直したつもりでクエリが消える。
+#[test]
+fn editing_one_tab_leaves_the_other_tabs_alone() {
+    let base = req(
+        "POST",
+        "http://x/",
+        &["name=taro", "X-Trace: abc", "limit==50"],
+    );
+    let out = apply(
+        &base,
+        Target::Items(Tab::Headers),
+        &["X-Trace: zzz".into(), "Accept: application/json".into()],
+    )
+    .unwrap();
+
+    assert!(
+        out.items.contains(&"name=taro".to_string()),
+        "{:?}",
+        out.items
+    );
+    assert!(
+        out.items.contains(&"limit==50".to_string()),
+        "{:?}",
+        out.items
+    );
+    assert!(
+        out.items.contains(&"X-Trace: zzz".to_string()),
+        "{:?}",
+        out.items
+    );
+    assert!(
+        !out.items.contains(&"X-Trace: abc".to_string()),
+        "古いヘッダが残っている: {:?}",
+        out.items
+    );
+}
+
+/// 読めない行は保存させない。書き込むと、次に送ったときに落ちる。
+#[test]
+fn an_item_that_cannot_be_parsed_is_rejected_before_saving() {
+    let base = req("POST", "http://x/", &[]);
+    let err = apply(
+        &base,
+        Target::Items(Tab::Body),
+        &["これは記法ではない".into()],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("解釈できません"), "{err}");
+}
+
+/// 空行は落とす。編集中に空行が残るのは普通のこと。
+#[test]
+fn blank_lines_are_dropped() {
+    let base = req("POST", "http://x/", &[]);
+    let out = apply(
+        &base,
+        Target::Items(Tab::Body),
+        &["name=taro".into(), "".into(), "  ".into()],
+    )
+    .unwrap();
+    assert_eq!(out.items, vec!["name=taro"]);
+}
+
+/// 本文を空にしたら、本文そのものを消す（空文字を送らない）。
+#[test]
+fn clearing_the_payload_removes_it_rather_than_sending_an_empty_one() {
+    let mut base = req("POST", "http://x/", &[]);
+    base.raw = Some(r#"{"a":1}"#.into());
+    let out = apply(&base, Target::Raw, &["".into()]).unwrap();
+    assert_eq!(out.raw, None);
+}
+
+/// まるごと編集は TOML として読む。読めなければ落とす。
+#[test]
+fn editing_the_whole_definition_parses_it_as_toml() {
+    let base = req("GET", "http://old/", &[]);
+    let text = "method = \"PUT\"\nurl = \"https://new/y\"\n";
+    let out = apply(
+        &base,
+        Target::Whole,
+        &text.lines().map(str::to_string).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert_eq!(out.method, "PUT");
+    assert_eq!(out.url, "https://new/y");
+
+    let err = apply(&base, Target::Whole, &["これは TOML ではない".into()])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("読めません"), "{err}");
+}
+
+/// **編集器には伏せ字を渡さない。** 渡すと、保存した瞬間に `***` が
+/// 本物の値として書き込まれる。
+#[test]
+fn the_editor_is_given_the_real_definition_not_the_masked_one() {
+    use super::editor::Editing;
+    let r = req("POST", "http://x/", &["Authorization: Bearer {{token}}"]);
+    let e = Editing::open("x", &r, Target::Items(Tab::Headers));
+    assert_eq!(e.lines(), vec!["Authorization: Bearer {{token}}"]);
+    assert!(!e.lines().join("").contains("***"));
 }

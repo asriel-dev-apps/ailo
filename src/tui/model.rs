@@ -256,6 +256,8 @@ pub struct App {
     pub areas: Areas,
     /// かぶせて出ているもの。
     pub overlay: Option<Overlay>,
+    /// 編集中なら、その状態。**編集中はほかのキーを全部そちらへ渡す。**
+    pub editing: Option<crate::tui::editor::Editing>,
     /// ダンプを書くか。**画面から切れるようにする**（ユーザー要望 2026-09-09）。
     pub dump: bool,
     /// マウスの捕捉が有効か。
@@ -339,6 +341,7 @@ impl App {
             response_max_top: 0,
             areas: Areas::default(),
             overlay: None,
+            editing: None,
             dump: true,
             mouse: true,
         }
