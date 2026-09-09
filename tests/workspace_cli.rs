@@ -98,6 +98,43 @@ fn an_explicit_flag_wins_over_the_marker() {
     );
 }
 
+/// **空の `-w` は「マーカーを無視して既定を使う」。**
+///
+/// これが無いと、`.ailo` のあるディレクトリでは既定に戻る言い方が存在しない
+/// （`-w` を外すとマーカーが効く）。TUI のピッカーで「既定」を選んでも同じ
+/// workspace に戻り、無反応に見えていた。
+///
+/// **またぐ側も同時に確かめる。** 既定に戻れることと、戻った先から
+/// マーカー側の値が読めないことは別のこと。
+#[test]
+fn an_empty_workspace_flag_means_the_default_and_still_cannot_read_the_marked_one() {
+    let sb = Sandbox::new();
+    let dir = sb.dir("marked");
+    sb.mark(&dir, "alpha");
+
+    // マーカー側と既定側に、別の値を置く。
+    sb.run_in(&dir, &["config", "set", "who", "alpha-side"])
+        .ok();
+    sb.run_in(&dir, &["-w", "", "config", "set", "who", "default-side"])
+        .ok();
+
+    // コントロール: `-w` を外すとマーカーが効く。
+    assert_eq!(
+        sb.run_in(&dir, &["config", "get", "who"]).ok(),
+        "alpha-side"
+    );
+    // 空の `-w` は既定を指す。
+    assert_eq!(
+        sb.run_in(&dir, &["-w", "", "config", "get", "who"]).ok(),
+        "default-side"
+    );
+    // 既定側から alpha の値は見えない。
+    assert!(!sb
+        .run_in(&dir, &["-w", "", "config", "get", "who"])
+        .ok()
+        .contains("alpha-side"));
+}
+
 /// `.ailo` の無いところは、これまでどおりの置き場所で動くこと（破壊的変更を入れない）。
 #[test]
 fn a_directory_without_a_marker_keeps_using_the_default_place() {

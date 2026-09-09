@@ -351,9 +351,346 @@ impl Redactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 保存済み定義に直接書かれた秘匿値
+//
+// **「画面から落とす」と「保存を拒む」を 1 つの判定にする。** 別々に書いていた
+// ときは、表示だけ落ちて保存は通る（あるいはその逆）穴が、入口を足すたびに開いた。
+// TUI に編集器を足したときも、`mask_*`（表示）と `literal_secret_*`（保存の門）が
+// ずれていて 3 経路が素通りした。**関数が 2 つある限り、次の入口でまたずれる。**
+//
+// 落としたものは `Found` で返す。閾値は 1 か所に並べて置く:
+//
+// - `Found::Assigned` — 名前と値の組として読み取れた。**画面から落とし、保存も拒む。**
+// - `Found::Suspected` — 構造としては読めず、秘匿らしい綴りがあるだけ。
+//   **画面からは落とすが、保存は拒まない**（`"send me a token"` のような
+//   ただの散文まで保存できなくなると、門が通れない側で壊れる）。
+// ---------------------------------------------------------------------------
+
+/// 落とした秘匿値の**名前**。値は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// 名前と値の組。保存も拒む。
+    Assigned(String),
+    /// 秘匿らしい綴りがあるだけ。表示だけ落とす。
+    Suspected(String),
+}
+
+impl Found {
+    pub fn name(&self) -> &str {
+        match self {
+            Found::Assigned(n) | Found::Suspected(n) => n,
+        }
+    }
+
+    /// 保存を拒む側の閾値。
+    pub fn blocks_saving(&self) -> bool {
+        matches!(self, Found::Assigned(_))
+    }
+}
+
+/// 画面に出せる形にした文字列と、落としたものの名前。
+#[derive(Debug, Clone)]
+pub struct Masked {
+    pub text: String,
+    pub found: Option<Found>,
+}
+
+impl Masked {
+    fn clean(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            found: None,
+        }
+    }
+}
+
+/// 秘匿値の綴りらしい語。JSON として読めない本文と、読めない item で使う。
+const SECRET_WORDS: [&str; 6] = ["password", "passwd", "token", "secret", "api_key", "apikey"];
+
+/// 値がテンプレート参照なら、それ自体は漏れない。
+fn is_template(value: &str) -> bool {
+    value.contains("{{")
+}
+
+/// item 1 行。**読めなかった行も素通しにしない。**
+///
+/// `password:=hunter2` のように JSON として壊れた item は `parse_item` が落ちる。
+/// 「読めたものだけ検査する」にすると、一番危ない行だけが素通りする。
+pub fn mask_item(line: &str, r: &Redactor) -> Masked {
+    use crate::args::Item;
+
+    let Ok(item) = crate::args::parse_item(line) else {
+        return mask_unparsed_item(line);
+    };
+    let hit = |name: &str, sep: &str| Masked {
+        text: format!("{name}{sep}{MASK}"),
+        found: Some(Found::Assigned(name.to_string())),
+    };
+    match &item {
+        Item::Header { name, value } if r.is_sensitive_header(name) && !is_template(value) => {
+            hit(name, ": ")
+        }
+        Item::Field { name, value } if is_sensitive_field(name) && !is_template(value) => {
+            hit(name, "=")
+        }
+        Item::Query { name, value } if is_sensitive_field(name) && !is_template(value) => {
+            hit(name, "==")
+        }
+        Item::RawField { name, value }
+            if is_sensitive_field(name) && !is_template(&value.to_string()) =>
+        {
+            hit(name, ":=")
+        }
+        _ => Masked::clean(line),
+    }
+}
+
+/// `parse_item` が読めなかった行。名前らしき先頭だけ残して、後ろを落とす。
+///
+/// **区切りがあるなら、それは名前と値の組**（`password:=hunter2`）。読めなかった
+/// だけで、書いてあるものは秘匿値そのものなので、保存も拒む。
+fn mask_unparsed_item(line: &str) -> Masked {
+    let head: String = line
+        .chars()
+        .take_while(|c| !matches!(c, ':' | '=' | '@'))
+        .collect();
+    let has_separator = head.len() < line.len();
+    if is_sensitive_field(head.trim()) && has_separator && !is_template(line) {
+        return Masked {
+            text: format!("{} {MASK}", head.trim()),
+            found: Some(Found::Assigned(head.trim().to_string())),
+        };
+    }
+    Masked::clean(line)
+}
+
+/// `--raw` の本文。
+///
+/// **item 記法の判定に通してはいけない。** `{"password":"hunter2"}` は
+/// `parse_item` に**成功する**（`{"password"` という名前のヘッダと読まれる）ので、
+/// item として検査すると素通りする。ログインの本文は一番秘匿値が入る場所。
+pub fn mask_body(raw: &str) -> Masked {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+        let found = mask_json_in_place(&mut value);
+        return Masked {
+            text: serde_json::to_string(&value).unwrap_or_else(|_| MASK.to_string()),
+            found,
+        };
+    }
+    // JSON として読めない本文は構造で判断できない。秘匿らしい綴りを探す。
+    // **「読めなかったから素通し」にはしない。**
+    if is_template(raw) {
+        return Masked::clean(raw);
+    }
+    let lower = raw.to_ascii_lowercase();
+    let Some(word) = SECRET_WORDS.iter().find(|w| lower.contains(**w)) else {
+        return Masked::clean(raw);
+    };
+    // 綴りの直後が `=` か `:` なら、名前と値の組。`password: hunter2` を
+    // 「ただ単語が出てきただけ」と読むと、フォーム形式の本文が丸ごと素通りする。
+    let assigned = lower
+        .match_indices(*word)
+        .any(|(i, _)| lower[i + word.len()..].trim_start().starts_with([':', '=']));
+    let name = (*word).to_string();
+    Masked {
+        text: format!("(本文は画面に出しません。`ailo show` で確かめてください) {MASK}"),
+        found: Some(if assigned {
+            Found::Assigned(name)
+        } else {
+            Found::Suspected(name)
+        }),
+    }
+}
+
+fn mask_json_in_place(value: &mut serde_json::Value) -> Option<Found> {
+    let mut found = None;
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, v) in map.iter_mut() {
+                let literal = match v {
+                    serde_json::Value::String(s) => !is_template(s),
+                    _ => true,
+                };
+                if is_sensitive_field(key) && literal {
+                    *v = serde_json::Value::String(MASK.to_string());
+                    found = found.or_else(|| Some(Found::Assigned(key.clone())));
+                } else {
+                    found = found.or_else(|| mask_json_in_place(v));
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items.iter_mut() {
+                found = found.or_else(|| mask_json_in_place(v));
+            }
+        }
+        _ => {}
+    }
+    found
+}
+
+/// URL。`?api_key=<生の値>` は画面にも保存先にも残したくない。
+///
+/// **`Redactor::url` に投げるだけでは足りない。** あれは `Url::parse` に失敗した
+/// 入力をそのまま返すので、`{{base_url}}/x?api_key=...` という**この repo で
+/// 一番普通の形**だけが落ちない。クエリは自分で分解し、そのうえで parse できる
+/// ものは `Redactor::url` にも通す（userinfo のパスワードなど、クエリ以外の経路）。
+pub fn mask_url(url: &str) -> Masked {
+    let mut found = None;
+    let masked = mask_query(url, &mut found);
+    let text = if reqwest::Url::parse(&masked).is_ok() {
+        let r = Redactor::new(true);
+        if let Ok(parsed) = reqwest::Url::parse(&masked) {
+            if parsed.password().is_some_and(|p| !is_template(p)) {
+                found = found.or(Some(Found::Assigned("URL のパスワード".into())));
+            }
+        }
+        r.url(&masked)
+    } else {
+        masked
+    };
+    Masked { text, found }
+}
+
+fn mask_query(url: &str, found: &mut Option<Found>) -> String {
+    let Some((head, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    // fragment は落とさない。秘匿値の置き場所ではないうえ、`#` の後ろまで
+    // クエリとして扱うと、素の断片まで書き換えてしまう。
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, value)) if is_sensitive_field(name) && !is_template(value) => {
+                *found = found.take().or(Some(Found::Assigned(name.to_string())));
+                format!("{name}={MASK}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect();
+    let mut out = format!("{head}?{}", masked.join("&"));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // 定義に直接書かれた秘匿値 — 通す側と塞ぐ側を同数で並べる
+    //
+    // **片方だけ試すと、必ず片方が壊れる。** 塞ぐ側だけ見ていると、門が
+    // 通れない側で壊れていても気づかない（普通の定義が保存できなくなる）。
+    // 通す側だけ見ていると、漏れに気づかない。
+    // ------------------------------------------------------------------
+
+    fn found_in_item(line: &str) -> Option<Found> {
+        mask_item(line, &Redactor::new(true)).found
+    }
+
+    /// 画面から落とし、**保存も拒む**もの。
+    #[test]
+    fn a_literally_written_secret_is_masked_and_blocks_saving() {
+        let cases: Vec<(&str, Option<Found>)> = vec![
+            (
+                "item ヘッダ",
+                found_in_item("Authorization: Bearer sk-live-0123456789"),
+            ),
+            (
+                "item フィールド",
+                found_in_item("password=hunter2-and-more"),
+            ),
+            ("item クエリ", found_in_item("api_key==abcdef0123456789")),
+            // `parse_item` が読めない綴り。「読めたものだけ検査する」にすると
+            // 一番危ない行だけが素通りする。
+            ("読めない item", found_in_item("password:=hunter2")),
+            // JSON でない本文。`password=` しか探していなかったときは素通りした。
+            ("JSON でない本文", mask_body("password: hunter2").found),
+            ("JSON の本文", mask_body(r#"{"password":"hunter2"}"#).found),
+            // `Url::parse` に失敗する形。この repo で一番普通の書き方。
+            (
+                "テンプレート混じりの URL",
+                mask_url("{{base_url}}/x?api_key=abcdef0123").found,
+            ),
+            (
+                "素の URL",
+                mask_url("https://example.com/x?token=abcdef0123").found,
+            ),
+        ];
+        for (what, found) in cases {
+            let found = found.unwrap_or_else(|| panic!("{what}: 何も落ちていない"));
+            assert!(
+                found.blocks_saving(),
+                "{what}: 保存が拒まれない ({found:?})"
+            );
+        }
+    }
+
+    /// **通さないといけないもの。** ここが赤くなると、門が通れない側で壊れる。
+    #[test]
+    fn an_ordinary_definition_is_neither_masked_nor_blocked() {
+        let pass: Vec<(&str, Masked)> = vec![
+            (
+                "ヘッダのテンプレート参照",
+                mask_item("Authorization: Bearer {{token}}", &Redactor::new(true)),
+            ),
+            (
+                "フィールドのテンプレート参照",
+                mask_item("password={{pw}}", &Redactor::new(true)),
+            ),
+            (
+                "秘匿でない item",
+                mask_item("Content-Type: application/json", &Redactor::new(true)),
+            ),
+            ("秘匿でない本文", mask_body("grant_type=client_credentials")),
+            (
+                "本文のテンプレート参照",
+                mask_body(r#"{"password":"{{pw}}"}"#),
+            ),
+            (
+                "URL のテンプレート参照",
+                mask_url("{{base_url}}/x?api_key={{k}}"),
+            ),
+            ("クエリの無い URL", mask_url("https://example.com/tokens")),
+        ];
+        for (what, m) in pass {
+            assert!(m.found.is_none(), "{what}: 落ちてはいけないものが落ちた");
+            assert!(
+                !m.text.contains(MASK),
+                "{what}: 伏せ字が入っている: {}",
+                m.text
+            );
+        }
+    }
+
+    /// 綴りがあるだけの散文は、**画面からは落とすが保存は拒まない。**
+    ///
+    /// 拒むと `"send me a token"` のようなただの文章が保存できなくなる。
+    /// 「画面に出す」と「ファイルに残す」の閾値をここで分けている。
+    #[test]
+    fn a_body_that_merely_mentions_a_secret_word_is_hidden_but_savable() {
+        let m = mask_body("please send me a token when you can");
+        let found = m.found.expect("画面から落ちていない");
+        assert!(!found.blocks_saving(), "保存まで拒んでいる");
+        assert!(m.text.contains(MASK));
+    }
+
+    /// 落とすのは値。**名前は残す**（何が落ちたか分からないと直せない）。
+    #[test]
+    fn the_name_survives_but_the_value_does_not() {
+        let m = mask_item("password=hunter2-and-more", &Redactor::new(true));
+        assert!(m.text.contains("password"), "{}", m.text);
+        assert!(!m.text.contains("hunter2"), "{}", m.text);
+    }
 
     #[test]
     fn masks_default_sensitive_headers() {

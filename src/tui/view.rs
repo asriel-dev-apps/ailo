@@ -54,11 +54,17 @@ fn with_vars(text: &str, known: &[String]) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// 中身の行数と見えている高さから、これ以上下げられない位置を出す。
-fn max_top(lines: usize, height: u16) -> u16 {
-    // 枠の上下 2 行は中身に使えない。
-    let visible = height.saturating_sub(2);
-    (lines as u16).saturating_sub(visible)
+/// 折り返したあとの行数と見えている高さから、これ以上下げられない位置を出す。
+///
+/// **論理行数で数えてはいけない。** `Wrap` で描いているので、幅 200 の JSON が
+/// 10 行に折り返されても `lines.len()` は 1 のままで、末尾まで下げられない。
+/// 折り返し後の行数は描く側にしか分からないので、`Paragraph` 自身に数えさせる。
+///
+/// 渡す `p` は**枠を付ける前**のもの。`line_count` は渡した幅をそのまま折り返しに
+/// 使い、枠の左右を引かないので、こちらで内側の幅を渡す。
+fn max_top(p: &Paragraph, area: Rect) -> u16 {
+    let lines = p.line_count(area.width.saturating_sub(2)) as u16;
+    lines.saturating_sub(area.height.saturating_sub(2))
 }
 
 /// 左ペインの幅。これより狭い端末では一覧を畳む。
@@ -85,6 +91,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // クリックに反応する。
         app.areas.list = Rect::default();
         detail(f, app, root[1]);
+        // **狭い端末でもかぶせものは描く。** 描かないと、`e` を押した人には
+        // 何も起きていないように見えるのにキーは編集器へ行く。
+        overlay(f, app);
         return;
     }
 
@@ -100,9 +109,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// 中央にかぶせる矩形。画面の縦横の割合で決める。
-fn centred(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
-    let w = (area.width * pct_w / 100).clamp(20, area.width);
-    let h = (area.height * pct_h / 100).clamp(3, area.height);
+///
+/// **`clamp` を使わない。** 端末が下限より小さいと `min > max` で `clamp` は panic する。
+/// 100x2 の端末で `v` を押すと実際に落ちていた。掛け算も `u32` で行う。
+/// `u16` のままだと幅 781 桁以上で溢れる。
+pub(super) fn centred(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    // 下限は「あればうれしい」大きさ。端末がそれより小さければ、端末に合わせる。
+    let scaled = |len: u16, pct: u16, floor: u16| -> u16 {
+        let want = (u32::from(len) * u32::from(pct) / 100) as u16;
+        want.max(floor).min(len)
+    };
+    let w = scaled(area.width, pct_w, 20);
+    let h = scaled(area.height, pct_h, 3);
     Rect {
         x: area.x + (area.width - w) / 2,
         y: area.y + (area.height - h) / 2,
@@ -270,7 +288,7 @@ fn footer(app: &App, width: u16) -> Paragraph<'_> {
     Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
-fn sidebar(f: &mut Frame, app: &App, area: Rect) {
+fn sidebar(f: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible();
     let items: Vec<ListItem> = visible
         .iter()
@@ -304,6 +322,7 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
                 .block(block()),
             area,
         );
+        app.areas.list_offset = 0;
         return;
     }
 
@@ -314,6 +333,9 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
     f.render_stateful_widget(list, area, &mut state);
+    // **描いてから実際のスクロール量を書き戻す。** クリックの行番号はこれを足さないと
+    // ずれる。`max_top` と同じで、描く前には決められない。
+    app.areas.list_offset = state.offset();
 }
 
 fn detail(f: &mut Frame, app: &mut App, area: Rect) {
@@ -405,22 +427,20 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|l| Line::from(with_vars(&l, &app.known_vars)))
             .collect()
     };
-    app.definition_max_top = max_top(body.len(), rows[2].height);
+    let para = Paragraph::new(body).wrap(Wrap { trim: false });
+    app.definition_max_top = max_top(&para, rows[2]);
     app.definition_scroll.clamp(app.definition_max_top);
     f.render_widget(
-        Paragraph::new(body)
-            .wrap(Wrap { trim: false })
-            .scroll((app.definition_scroll.top(), 0))
-            .block(framed(
-                &scroll_title("", app.definition_scroll.top(), app.definition_max_top),
-                app.focus == Focus::Definition,
-            )),
+        para.scroll((app.definition_scroll.top(), 0)).block(framed(
+            &scroll_title("", app.definition_scroll.top(), app.definition_max_top),
+            app.focus == Focus::Definition,
+        )),
         rows[2],
     );
 
     // 4. レスポンス
-    let lines = response_lines(app);
-    app.response_max_top = max_top(lines.len(), rows[3].height);
+    let para = Paragraph::new(response_lines(app)).wrap(Wrap { trim: false });
+    app.response_max_top = max_top(&para, rows[3]);
     app.response_scroll.clamp(app.response_max_top);
     let title = scroll_title(
         " レスポンス ",
@@ -428,9 +448,7 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
         app.response_max_top,
     );
     f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((app.response_scroll.top(), 0))
+        para.scroll((app.response_scroll.top(), 0))
             .block(framed(&title, app.focus == Focus::Response)),
         rows[3],
     );

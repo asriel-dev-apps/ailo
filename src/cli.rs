@@ -19,9 +19,10 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
     long_about = None,
 )]
 pub struct Cli {
-    /// 使う workspace (省略時は `.ailo` を上へ辿って探す)
+    /// 使う workspace (省略時は `.ailo` を上へ辿って探す。空文字なら既定)
     ///
     /// どのサブコマンドの後ろにも書ける。`AILO_WORKSPACE` より優先する。
+    /// `-w ''` は「`.ailo` を無視して既定を使う」。
     #[arg(long, short = 'w', global = true, value_name = "名前")]
     pub workspace: Option<String>,
 

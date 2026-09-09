@@ -45,7 +45,9 @@ tokio = { version = "1", features = ["rt", "macros", "fs", "io-util", "time"] }
 # TUI。bitbucket-tui / specto / launchtop と同じ ratatui に揃える。
 # crossterm は直接依存にしない。ratatui が `ratatui::crossterm` として再輸出しており、
 # 別々に固定すると版がずれた瞬間に「型は合うのにイベントが来ない」壊れ方をする。
-ratatui = "0.29"
+# `unstable-rendered-line-info` は `Paragraph::line_count(幅)`。折り返したあとの
+# 行数は描く側にしか分からないので、スクロールの上限をこれで測る。
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 # 端末での表示幅。案内の文字列が収まるかを実幅で決めるのに要る。
 # 自前で範囲表を書くと絵文字や一部の書記素で外す。
 unicode-width = "0.2"

@@ -609,6 +609,11 @@ fn a_templated_secret_is_left_readable() {
 fn an_item_that_cannot_be_parsed_is_still_masked() {
     let r = req("POST", "http://x/", &["password:=hunter2"]);
     let out = tab_lines(&r, Tab::Body).join("\n");
+    // **その行が画面に出ていることを先に確かめる。** 出ていなければ
+    // 「含まない」は空文字に対して真になるだけで、マスクは何も証明していない。
+    // 実際、読めない行がどのタブにも出ていなかったせいで、この防御は
+    // 到達不能なまま緑だった。
+    assert!(out.contains("password"), "その行が画面に出ていない: {out}");
     assert!(!out.contains("hunter2"), "{out}");
 }
 
@@ -1084,22 +1089,59 @@ fn the_dump_toggle_shows_when_it_is_off() {
 /// かぶせものは下を消してから描く。消さないと後ろの文字が透ける。
 #[test]
 fn an_overlay_hides_what_is_behind_it() {
+    // 目印は**かぶせものの中に絶対に現れない文字**にする。
+    // 文字が被っていると「枠やリストの文字で部分的に上書きされた」だけでも
+    // 行数は減り、`Clear` を外しても通ってしまう。
+    const MARK: char = '▚';
+    let (w, h) = (100u16, 26u16);
     let mut a = demo();
-    // レスポンス欄いっぱいに目印を並べる。かぶさった行では見えなくなるはず。
-    let marker = "UNDERNEATH-MARKER";
-    a.pane = Pane::Failed(vec![marker; 40].join("\n"));
-    let without = screen(&a, 100, 26);
-    let behind = without.lines().filter(|l| l.contains(marker)).count();
-    assert!(behind > 0, "前提が崩れている:\n{without}");
+    a.pane = Pane::Failed(vec![MARK.to_string().repeat(80); 40].join("\n"));
+
+    // かぶせものの矩形。`view::overlay` と同じ割合で取る。
+    let box_rect = super::view::centred(Rect::new(0, 0, w, h), 60, 60);
+    let marks_in_box = |a: &App| -> usize {
+        let buf = buffer(a, w, h);
+        (box_rect.y..box_rect.y + box_rect.height)
+            .flat_map(|y| (box_rect.x..box_rect.x + box_rect.width).map(move |x| (x, y)))
+            .filter(|(x, y)| buf[(*x, *y)].symbol() == MARK.to_string())
+            .count()
+    };
+
+    // コントロール: かぶせものが無ければ、その矩形は目印で埋まっている。
+    let behind = marks_in_box(&a);
+    assert!(behind > 0, "前提が崩れている（背後に目印が無い）");
 
     a.open_workspace_picker(vec!["既定".into(), "demo".into()]);
-    let out = screen(&a, 100, 26);
-    assert!(out.contains("workspace を選ぶ"), "{out}");
-    let still = out.lines().filter(|l| l.contains(marker)).count();
-    assert!(
-        still < behind,
-        "後ろが透けている（{behind} 行 → {still} 行）:\n{out}"
+    assert!(screen(&a, w, h).contains("workspace を選ぶ"));
+    assert_eq!(
+        marks_in_box(&a),
+        0,
+        "かぶせものの中に背後の目印が残っている（{behind} セル中）"
     );
+}
+
+/// 描いた結果をセル単位で見る。座標で検査したいとき用。
+fn buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut app = app.clone();
+    let mut t = Terminal::new(TestBackend::new(width, height)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut app))
+        .expect("描けない");
+    t.backend().buffer().clone()
+}
+
+/// 画面のどこに `needle` が出ているか。**先頭セルの座標**を返す。
+///
+/// 「最初に見つかった 1 文字」ではなく、続きも一致することを確かめる。
+fn find_cells(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+    let chars: Vec<String> = needle.chars().map(|c| c.to_string()).collect();
+    (0..buf.area.height)
+        .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            chars.iter().enumerate().all(|(i, c)| {
+                let x = x + i as u16;
+                x < buf.area.width && buf[(x, y)].symbol() == c
+            })
+        })
 }
 
 // ------------------------------------------------------------------ 編集器
@@ -1308,10 +1350,33 @@ fn editing_the_whole_definition_parses_it_as_toml() {
 #[test]
 fn the_editor_is_given_the_real_definition_not_the_masked_one() {
     use super::editor::Editing;
+    // マスクの対象になる綴りで書く。`{{token}}` はそもそも伏せないので、
+    // 伏せ字を渡す実装でもこのテストは通ってしまっていた。
     let r = req("POST", "http://x/", &["Authorization: Bearer {{token}}"]);
+    assert_eq!(
+        tab_lines(&r, Tab::Headers),
+        vec!["Authorization: Bearer {{token}}"],
+        "前提: テンプレート参照は表示でも伏せない"
+    );
     let e = Editing::open("x", &r, Target::Items(Tab::Headers));
     assert_eq!(e.lines(), vec!["Authorization: Bearer {{token}}"]);
-    assert!(!e.lines().join("").contains("***"));
+
+    // **表示が伏せる定義は、そもそも編集器を開かない。**
+    // 生の定義を渡す以上、開いた時点で画面に出るため
+    // （`opening_the_editor_never_reveals_a_literally_written_secret`）。
+    let leaky = req(
+        "POST",
+        "http://x/",
+        &["Authorization: Bearer sk-live-0123456789"],
+    );
+    assert!(
+        tab_lines(&leaky, Tab::Headers)[0].contains("***"),
+        "前提: 表示は伏せている"
+    );
+    assert!(
+        !crate::run::literal_secrets(&leaky).is_empty(),
+        "表示が伏せるのに保存の門は素通り（判定が 2 系統に分かれている）"
+    );
 }
 
 // -------------------------------------------------- 変数の色分けとタブのバッジ
@@ -1357,31 +1422,34 @@ fn text_without_variables_stays_one_piece() {
 /// 解決できない変数は**赤で太字**にする。送る前に気づけるように。
 #[test]
 fn an_unresolved_variable_is_shown_in_a_different_colour() {
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
+    // demo の URL は `{{base_url}}/tokens`。**その 12 セルの全部**を見る。
+    // 「最初に見つかった `{`」だと、別の場所の `{` を見ていても通ってしまう。
+    const VAR: &str = "{{base_url}}";
     let mut a = demo();
-    a.known_vars = vec!["base_url".into()];
 
-    let colour_of = |a: &App, needle: &str| -> Option<Color> {
-        let mut a = a.clone();
-        let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
-        t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
-        let buf = t.backend().buffer().clone();
-        let first = needle.chars().next().unwrap();
-        (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .find(|(x, y)| buf[(*x, *y)].symbol() == first.to_string())
-            .map(|(x, y)| buf[(x, y)].style().fg.unwrap_or(Color::Reset))
+    let style_of_var = |a: &App| -> Vec<(Option<Color>, bool)> {
+        let buf = buffer(a, 100, 26);
+        let (x0, y) = find_cells(&buf, VAR).expect("画面に `{{base_url}}` が無い");
+        (0..VAR.chars().count() as u16)
+            .map(|i| {
+                let st = buf[(x0 + i, y)].style();
+                (st.fg, st.add_modifier.contains(Modifier::BOLD))
+            })
+            .collect()
     };
 
-    // demo の URL は `{{base_url}}/tokens`。解決できるので赤ではない。
-    assert_ne!(colour_of(&a, "{"), Some(Color::Red));
+    a.known_vars = vec!["base_url".into()];
+    for (fg, bold) in style_of_var(&a) {
+        assert_eq!(fg, Some(Color::Magenta), "解決できる変数の色が違う");
+        assert!(!bold, "解決できる変数まで太字になっている");
+    }
 
     a.known_vars.clear();
-    assert_eq!(
-        colour_of(&a, "{"),
-        Some(Color::Red),
-        "解決できない変数が目立たない"
-    );
+    for (fg, bold) in style_of_var(&a) {
+        assert_eq!(fg, Some(Color::Red), "解決できない変数が目立たない");
+        assert!(bold, "解決できない変数が太字になっていない");
+    }
 }
 
 /// タブには件数を出す。空と中身ありが同じ見た目だと、開くまで分からない。
@@ -1487,4 +1555,268 @@ fn a_half_typed_pattern_does_not_blow_up() {
         on_key(&mut a, key(KeyCode::Char(c)));
     }
     assert!(a.editing.is_some());
+}
+
+// ------------------------------------------- M3.2 のレビューで見つかったもの
+
+/// **直書きの秘匿値は、編集器を開いても画面に出ない。**
+///
+/// 編集器には生の定義を渡す（伏せ字を渡すと保存した瞬間に `***` が本物の値に
+/// なる）ので、開いた時点で通常表示が伏せている値が出ていた。
+#[test]
+fn opening_the_editor_never_reveals_a_literally_written_secret() {
+    const SECRET: &str = "sk-live-0123456789abcdefghij";
+    let leaky = req(
+        "GET",
+        "http://x/",
+        &[&format!("Authorization: Bearer {SECRET}")],
+    );
+    // コントロール: 生の定義は、確かにこの検査に引っかかる形をしている。
+    assert!(format!("{leaky:?}").contains(SECRET));
+
+    let mut a = App::new(
+        vec![Entry {
+            name: "leaky".into(),
+            req: leaky,
+        }],
+        "既定",
+        None,
+    );
+
+    for k in ['e', 'T'] {
+        let mut a = a.clone();
+        on_key(&mut a, key(KeyCode::Char(k)));
+        assert!(a.editing.is_none(), "`{k}` で編集器が開いてしまった");
+        assert!(
+            !screen(&a, 100, 26).contains(SECRET),
+            "`{k}` を押したら画面に秘匿値が出た"
+        );
+    }
+
+    // 直書きが無ければ普通に開く（開けなくなっていないことの裏返し）。
+    a.reload(vec![Entry {
+        name: "clean".into(),
+        req: req("GET", "{{base_url}}/x", &["A: {{tok}}"]),
+    }]);
+    on_key(&mut a, key(KeyCode::Char('e')));
+    assert!(a.editing.is_some(), "問題の無い定義まで開けなくなっている");
+}
+
+/// タブの編集画面には、そのタブの種類しか書けない。
+///
+/// Headers の画面に `limit==50` と書けたとき、保存すると Headers が消えて
+/// Query が増えていた（「そのタブだけ入れ替える」の入れ替え元が空になるため）。
+#[test]
+fn a_tab_editor_refuses_an_item_of_another_kind() {
+    let base = req("GET", "http://x/", &["X-Trace: abc", "limit==50"]);
+
+    let err = apply(
+        &base,
+        Target::Items(Tab::Headers),
+        &["limit==99".to_string()],
+    )
+    .expect_err("別種類の item が通った");
+    assert!(format!("{err}").contains("limit==99"), "{err}");
+
+    // 同じ種類なら通り、他タブの item は残る。
+    let ok = apply(
+        &base,
+        Target::Items(Tab::Headers),
+        &["X-Trace: zzz".to_string()],
+    )
+    .expect("同じ種類まで弾いている");
+    assert!(ok.items.contains(&"X-Trace: zzz".to_string()));
+    assert!(
+        ok.items.contains(&"limit==50".to_string()),
+        "{:?}",
+        ok.items
+    );
+}
+
+/// 折り返した分まで数える。数えないと、長い行の末尾まで下げられない。
+#[test]
+fn scrolling_counts_wrapped_lines_not_logical_ones() {
+    let mut a = demo();
+    // 論理 1 行、幅 100 の画面では何行にも折り返す長さ。
+    a.pane = Pane::Failed("x".repeat(2000));
+    let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+    assert!(
+        a.response_max_top > 0,
+        "折り返しを数えていない（max_top={}）",
+        a.response_max_top
+    );
+}
+
+/// かぶせものが出ている間、マウスは背後に届かない。
+#[test]
+fn a_click_does_not_pass_through_an_overlay() {
+    let mut a = demo();
+    let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+    let before = a.selected().unwrap().name.clone();
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: a.areas.list.x + 2,
+        row: a.areas.list.y + 2,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    // コントロール: かぶせものが無ければ、この座標のクリックは効く。
+    let mut plain = a.clone();
+    super::on_mouse(&mut plain, click);
+    assert_ne!(plain.selected().unwrap().name, before, "前提が崩れている");
+
+    let openers: [fn(&mut App); 2] = [
+        |a| a.open_workspace_picker(vec!["既定".into(), "demo".into()]),
+        |a| {
+            on_key(a, key(KeyCode::Char('e')));
+        },
+    ];
+    for open in openers {
+        let mut a = a.clone();
+        open(&mut a);
+        assert!(
+            a.overlay.is_some() || a.editing.is_some(),
+            "前提が崩れている（かぶせものが開いていない）"
+        );
+        let focus = a.focus;
+        super::on_mouse(&mut a, click);
+        assert_eq!(a.selected().unwrap().name, before, "背後の選択が動いた");
+        assert_eq!(a.focus, focus, "背後にフォーカスが移った");
+    }
+}
+
+/// 起動し直すとき、選んでいた環境を落とさない。
+#[test]
+fn restarting_for_a_new_workspace_keeps_the_chosen_environment() {
+    assert_eq!(
+        super::restart_args("demo", Some("stg")),
+        ["-w", "demo", "tui", "--env", "stg"]
+    );
+    // **既定でも `-w` を付ける。** 外すと `.ailo` マーカーが効いて同じ workspace に
+    // 戻り、ピッカーが無反応に見える。既定は空文字で指す。
+    assert_eq!(super::restart_args("既定", None), ["-w", "", "tui"]);
+}
+
+/// スクロールした一覧でも、押した行が選ばれる。
+///
+/// `ListState` の offset を足していなかったとき、下まで送った一覧の最上行を押すと
+/// 先頭が選ばれた。押した覚えのないリクエストが、その場の `Enter` で飛ぶ。
+#[test]
+fn clicking_a_row_in_a_scrolled_list_selects_that_row() {
+    let names: Vec<String> = (0..40).map(|i| format!("req{i:02}")).collect();
+    let mut a = app(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    // 末尾まで送る。高さ 20 なら一覧は必ずスクロールしている。
+    for _ in 0..38 {
+        a.move_down();
+    }
+    assert_eq!(a.selected().unwrap().name, "req38");
+
+    let mut t = Terminal::new(TestBackend::new(100, 20)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+    assert!(
+        a.areas.list_offset > 0,
+        "前提が崩れている（一覧がスクロールしていない）"
+    );
+
+    // 一覧の最上行（枠の 1 つ下）を押す。そこに出ているのは offset 番目。
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: a.areas.list.x + 2,
+        row: a.areas.list.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    let want = names[a.areas.list_offset].clone();
+    super::on_mouse(&mut a, click);
+    assert_eq!(
+        a.selected().unwrap().name,
+        want,
+        "押した行と選ばれた行が違う"
+    );
+}
+
+/// 小さすぎる端末でも落ちない。`clamp(3, 高さ)` は高さ 2 で panic していた。
+#[test]
+fn a_tiny_terminal_does_not_panic() {
+    for (w, h) in [(0, 0), (1, 1), (100, 2), (20, 3), (10, 40), (800, 24)] {
+        let mut a = demo();
+        a.open_vars(vec![]);
+        let mut t = Terminal::new(TestBackend::new(w, h)).expect("TestBackend");
+        t.draw(|f| super::view::draw(f, &mut a))
+            .unwrap_or_else(|e| panic!("{w}x{h} で描けない: {e}"));
+
+        // 編集器も同じ経路を通る。
+        let mut a = demo();
+        on_key(&mut a, key(KeyCode::Char('e')));
+        let mut t = Terminal::new(TestBackend::new(w, h)).expect("TestBackend");
+        t.draw(|f| super::view::draw(f, &mut a))
+            .unwrap_or_else(|e| panic!("{w}x{h} の編集器で描けない: {e}"));
+    }
+}
+
+/// 狭い端末でも、かぶせものは画面に出る。
+///
+/// 出ないと、編集中は `Ctrl-C` を止めてあるので「画面は何も変わらないのに
+/// `q` も `Ctrl-C` も効かない」状態になり、脱出できることが画面から分からない。
+#[test]
+fn an_overlay_is_drawn_even_on_a_narrow_terminal() {
+    let mut a = demo();
+    a.open_workspace_picker(vec!["既定".into(), "demo".into()]);
+    assert!(
+        screen(&a, 50, 20).contains("workspace を選ぶ"),
+        "狭い端末で出ない"
+    );
+
+    let mut a = demo();
+    on_key(&mut a, key(KeyCode::Char('e')));
+    assert!(
+        screen(&a, 50, 20).contains("編集"),
+        "狭い端末で編集器が出ない"
+    );
+}
+
+/// 絞り込みで指すリクエストが変わったら、前のレスポンスは消える。
+///
+/// `move_down` / `select_visible` / `set_env` では守っている不変条件を、
+/// 絞り込みだけ破っていた。`login` の結果が出たまま `users` が選ばれる。
+#[test]
+fn filtering_to_a_different_request_drops_the_previous_response() {
+    let mut a = app(&["login", "users"]);
+    a.move_down();
+    assert_eq!(a.selected().unwrap().name, "users");
+    a.pane = Pane::Failed("login の結果".into());
+
+    for c in "log".chars() {
+        a.push_filter(c);
+    }
+    assert_eq!(a.selected().unwrap().name, "login");
+    assert!(
+        matches!(a.pane, Pane::Idle),
+        "前のリクエストのレスポンスが残っている"
+    );
+}
+
+/// 表示に出ない行が編集器には出る、というずれを作らない。
+///
+/// `parse_item` が読めない行は、表示のどのタブにも出ないのに編集器の Body には
+/// 出ていた。**画面から落ちているものが編集器には出る**ので、そこが漏れ口になった。
+#[test]
+fn the_editor_and_the_panes_agree_on_where_a_line_lives() {
+    use super::model::tab_of;
+    let cases = [
+        ("X-Trace: abc", Tab::Headers),
+        ("limit==50", Tab::Query),
+        ("name=taro", Tab::Body),
+        // 読めない行。どこかには出す（出さないと編集で消える）。
+        ("password:=hunter2", Tab::Body),
+    ];
+    for (line, want) in cases {
+        assert_eq!(tab_of(line), want, "{line}");
+        let r = req("POST", "http://x/", &[line]);
+        for tab in [Tab::Headers, Tab::Query, Tab::Body] {
+            let in_pane = tab_lines(&r, tab).len() == 1;
+            assert_eq!(in_pane, tab == want, "{line} が {tab:?} の表示と食い違う");
+        }
+    }
 }

@@ -317,6 +317,9 @@ pub struct Areas {
     pub tab_items: [Rect; Tab::ALL.len()],
     pub definition: Rect,
     pub response: Rect,
+    /// 一覧が実際にスクロールしていた量。**描画側が書き戻す。**
+    /// `ListState` の offset は描いてみるまで決まらない（`max_top` と同じ理由）。
+    pub list_offset: usize,
 }
 
 impl Areas {
@@ -354,11 +357,14 @@ impl Areas {
         })
     }
 
-    /// 一覧の何行目をクリックしたか。枠の 1 行を差し引く。
+    /// 一覧の何行目をクリックしたか。枠の 1 行を差し引き、**スクロール量を足す。**
+    ///
+    /// 足さないと、下までスクロールした一覧で最上行を押したときに先頭が選ばれる。
+    /// 押した覚えのないリクエストが、その場の `Enter` で飛ぶ。
     pub fn list_row_at(&self, y: u16) -> Option<usize> {
         let inner_top = self.list.y + 1;
         let inner_bottom = self.list.y + self.list.height.saturating_sub(1);
-        (y >= inner_top && y < inner_bottom).then(|| (y - inner_top) as usize)
+        (y >= inner_top && y < inner_bottom).then(|| (y - inner_top) as usize + self.list_offset)
     }
 }
 
@@ -486,12 +492,20 @@ impl App {
     ///
     /// **これを忘れると、絞り込みで一覧が短くなったときに選択が範囲外へ残り、
     /// 「何も選ばれていないのに Enter が効かない」**という無言の壊れ方をする。
+    ///
+    /// **指しているリクエストが変わったら、前のレスポンスも捨てる。**
+    /// ここでやる（呼び出し側 3 か所に足すのではなく）。絞り込みだけこの不変条件を
+    /// 破っていて、`login` の結果が出たまま `users` が選ばれている状態になっていた。
     fn clamp(&mut self) {
+        let before = self.selected().map(|e| e.name.clone());
         let n = self.visible().len();
         if n == 0 {
             self.selected = 0;
         } else if self.selected >= n {
             self.selected = n - 1;
+        }
+        if self.selected().map(|e| e.name.clone()) != before {
+            self.on_request_changed();
         }
     }
 
@@ -538,152 +552,19 @@ pub fn tab_lines(req: &SavedRequest, tab: Tab) -> Vec<String> {
         // Capture は item 記法ではなく「名前 = 式」。値を持たないので落とすものが無く、
         // item として読ませると式のほうが値だと解釈されて潰れる。
         Tab::Capture => lines,
-        _ => lines.iter().map(|l| mask_literal_secret(l)).collect(),
-    }
-}
-
-/// 名前が秘匿らしく、値がテンプレートでないなら値を落とす。
-///
-/// `{{token}}` はそのまま残す。名前しか出ていないので、それ自体は漏れない。
-/// 区切りは正規の綴りで書き直す（escape を含む名前を復元しようとして
-/// 間違えるより、`名前 = ***` と分かる形のほうがよい）。
-fn mask_literal_secret(line: &str) -> String {
-    use crate::args::Item;
-
-    let Ok(item) = crate::args::parse_item(line) else {
-        // **読めなかった行も素通しにしない。** `password:=hunter2` のように
-        // JSON として壊れた item は `parse_item` が落ちる。「読めたものだけ検査する」に
-        // すると、一番危ない行だけが素通りする。
-        return mask_unparsed(line);
-    };
-
-    let literal = |value: &str| !value.contains("{{");
-    match &item {
-        Item::Header { name, value } if is_sensitive_header_name(name) && literal(value) => {
-            format!("{name}: {MASK}")
+        _ => {
+            let r = crate::redact::Redactor::new(true);
+            lines
+                .iter()
+                .map(|l| crate::redact::mask_item(l, &r).text)
+                .collect()
         }
-        Item::Field { name, value } if is_secret_name(name) && literal(value) => {
-            format!("{name}={MASK}")
-        }
-        Item::Query { name, value } if is_secret_name(name) && literal(value) => {
-            format!("{name}=={MASK}")
-        }
-        Item::RawField { name, value } if is_secret_name(name) && literal(&value.to_string()) => {
-            format!("{name}:={MASK}")
-        }
-        _ => line.to_string(),
     }
 }
 
-/// 画面に出すマスク。ダンプ側と同じ綴りにする。
-const MASK: &str = "***";
-
-/// `--raw` の本文を画面に出せる形にする。
-///
-/// **item 記法の判定に通してはいけない。** `{"password":"hunter2"}` は
-/// `parse_item` に**成功する**（`{"password"` という名前のヘッダと読まれる）ので、
-/// item として検査すると素通りする。ログインの本文は一番秘匿値が入る場所なので、
-/// ここが素通りすると「表示側でも落とす」という主張が成り立たない。
-fn mask_raw_body(raw: &str) -> String {
-    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
-        mask_json_in_place(&mut value);
-        return serde_json::to_string(&value).unwrap_or_else(|_| MASK.to_string());
-    }
-    // JSON として読めない本文は構造で判断できない。秘匿らしい綴りがあれば
-    // 行ごと落とす。**「読めなかったから素通し」にはしない。**
-    let lower = raw.to_ascii_lowercase();
-    let suspicious = ["password", "passwd", "token", "secret", "api_key", "apikey"]
-        .iter()
-        .any(|w| lower.contains(*w));
-    if suspicious && !raw.contains("{{") {
-        format!("(本文は画面に出しません。`ailo show` で確かめてください) {MASK}")
-    } else {
-        raw.to_string()
-    }
-}
-
-fn mask_json_in_place(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, v) in map.iter_mut() {
-                let literal = match v {
-                    serde_json::Value::String(s) => !s.contains("{{"),
-                    _ => true,
-                };
-                if is_secret_name(key) && literal {
-                    *v = serde_json::Value::String(MASK.to_string());
-                } else {
-                    mask_json_in_place(v);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(mask_json_in_place),
-        _ => {}
-    }
-}
-
-fn is_secret_name(name: &str) -> bool {
-    crate::redact::is_sensitive_field(name)
-}
-
-/// `parse_item` が読めなかった行。名前らしき先頭だけ残して、後ろを落とす。
-fn mask_unparsed(line: &str) -> String {
-    let head: String = line
-        .chars()
-        .take_while(|c| !matches!(c, ':' | '=' | '@'))
-        .collect();
-    if is_secret_name(&head) && !line.contains("{{") {
-        format!("{head} {MASK}")
-    } else {
-        line.to_string()
-    }
-}
-
-/// 既定の秘匿ヘッダ名。`Redactor` と同じ判定を使う。
-fn is_sensitive_header_name(name: &str) -> bool {
-    crate::redact::Redactor::new(true).is_sensitive_header(name)
-}
-
-/// URL も同じ理由で落とす。`?api_key=<生の値>` は画面にも残したくない。
-///
-/// **`Redactor::url` に投げるだけでは足りない。** あれは `Url::parse` に失敗した入力を
-/// そのまま返すので、`{{base_url}}/x?api_key=...` という**この repo で一番普通の形**だけが
-/// 落ちない。クエリは自分で分解して落とし、そのうえで parse できるものは
-/// `Redactor::url` にも通す（userinfo のパスワードなど、クエリ以外の経路のため）。
+/// URL を画面に出せる形にする。判定は `redact` 側に 1 つだけ置いてある。
 pub fn display_url(url: &str) -> String {
-    let masked = mask_query(url);
-    if reqwest::Url::parse(&masked).is_ok() {
-        crate::redact::Redactor::new(true).url(&masked)
-    } else {
-        masked
-    }
-}
-
-fn mask_query(url: &str) -> String {
-    let Some((head, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    // fragment は落とさない。秘匿値の置き場所ではないうえ、`#` の後ろまで
-    // クエリとして扱うと、素の断片まで書き換えてしまう。
-    let (query, fragment) = match query.split_once('#') {
-        Some((q, f)) => (q, Some(f)),
-        None => (query, None),
-    };
-    let masked: Vec<String> = query
-        .split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some((name, value)) if is_secret_name(name) && !value.contains("{{") => {
-                format!("{name}={MASK}")
-            }
-            _ => pair.to_string(),
-        })
-        .collect();
-    let mut out = format!("{head}?{}", masked.join("&"));
-    if let Some(f) = fragment {
-        out.push('#');
-        out.push_str(f);
-    }
-    out
+    crate::redact::mask_url(url).text
 }
 
 fn tab_lines_raw(req: &SavedRequest, tab: Tab) -> Vec<String> {
@@ -692,27 +573,21 @@ fn tab_lines_raw(req: &SavedRequest, tab: Tab) -> Vec<String> {
             let mut out: Vec<String> = req
                 .items
                 .iter()
-                .filter(|i| is_body_item(i))
+                .filter(|i| tab_of(i) == Tab::Body)
                 .cloned()
                 .collect();
             if let Some(raw) = &req.raw {
-                out.push(mask_raw_body(raw));
+                out.push(crate::redact::mask_body(raw).text);
             }
             if req.form {
                 out.push("(form-urlencoded で送る)".into());
             }
             out
         }
-        Tab::Headers => req
+        Tab::Headers | Tab::Query => req
             .items
             .iter()
-            .filter(|i| matches!(parsed(i), Some(crate::args::Item::Header { .. })))
-            .cloned()
-            .collect(),
-        Tab::Query => req
-            .items
-            .iter()
-            .filter(|i| matches!(parsed(i), Some(crate::args::Item::Query { .. })))
+            .filter(|i| tab_of(i) == tab)
             .cloned()
             .collect(),
         Tab::Capture => capture_lines(&req.capture, &req.secret),
@@ -723,15 +598,19 @@ fn parsed(raw: &str) -> Option<crate::args::Item> {
     crate::args::parse_item(raw).ok()
 }
 
-fn is_body_item(raw: &str) -> bool {
-    matches!(
-        parsed(raw),
-        Some(
-            crate::args::Item::Field { .. }
-                | crate::args::Item::RawField { .. }
-                | crate::args::Item::FileField { .. }
-        )
-    )
+/// その行がどのタブに出るか。**表示と編集器で同じ関数を使う。**
+///
+/// 別々に持っていたとき、`parse_item` が読めない行は表示のどのタブにも出ないのに
+/// 編集器の Body には出ていた。**画面に出ないものが編集器には出る**ので、
+/// そこから秘匿値が漏れた。どちらか一方を直しても、ずれの原因は残る。
+///
+/// 読めない行も落とさない。どこにも出さないと、そのタブを編集した時点で消える。
+pub fn tab_of(raw: &str) -> Tab {
+    match parsed(raw) {
+        Some(crate::args::Item::Header { .. }) => Tab::Headers,
+        Some(crate::args::Item::Query { .. }) => Tab::Query,
+        _ => Tab::Body,
+    }
 }
 
 fn capture_lines(capture: &BTreeMap<String, String>, secret: &[String]) -> Vec<String> {

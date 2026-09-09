@@ -110,7 +110,6 @@ impl Vars {
         self.resolved.is_empty()
     }
 
-    /// 秘匿として解決された値。マスクの literal に登録するために使う。
     /// 一覧に出すための説明。**秘匿値は既に伏せてある。**
     ///
     /// 生の値を外へ出す口を作らないのがこの関数の目的。呼び出し側が
@@ -118,19 +117,27 @@ impl Vars {
     pub fn describe(&self) -> Vec<VarDescription> {
         self.resolved
             .iter()
-            .map(|(name, r)| VarDescription {
-                name: name.clone(),
-                shown: if r.secret {
-                    crate::redact::MASK.to_string()
-                } else {
-                    r.value.clone()
-                },
-                from: r.from,
-                secret: r.secret,
+            .map(|(name, r)| {
+                // **画面に出す側は厳しいほうに倒す。** 層の `secret` 旗だけを見ていた
+                // ときは、`capture` で取ったトークンが（`secret = [...]` の書き忘れで）
+                // `state` 層に入り、変数一覧に全文で出ていた。
+                // プロセス環境変数は名前で判定しているのに capture は出す、という不整合。
+                let secret = r.secret || crate::redact::is_sensitive_field(name);
+                VarDescription {
+                    name: name.clone(),
+                    shown: if secret {
+                        crate::redact::MASK.to_string()
+                    } else {
+                        r.value.clone()
+                    },
+                    from: r.from,
+                    secret,
+                }
             })
             .collect()
     }
 
+    /// 秘匿として解決された値。マスクの literal に登録するために使う。
     pub fn secret_values(&self) -> Vec<&str> {
         self.resolved
             .values()

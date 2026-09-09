@@ -141,21 +141,10 @@ fn items_of(req: &SavedRequest, tab: Tab) -> Vec<String> {
         .collect()
 }
 
+/// **どのタブに属するかは `model::tab_of` が 1 つだけ決める。**
+/// ここで数え直すと、画面に出ていない行が編集器には出る、というずれになる。
 fn belongs_to(raw: &str, tab: Tab) -> bool {
-    use crate::args::Item;
-    let Ok(item) = crate::args::parse_item(raw) else {
-        // 読めない行は Body 扱いにする。どこにも出さないと、編集で消える。
-        return tab == Tab::Body;
-    };
-    matches!(
-        (tab, item),
-        (Tab::Headers, Item::Header { .. })
-            | (Tab::Query, Item::Query { .. })
-            | (
-                Tab::Body,
-                Item::Field { .. } | Item::RawField { .. } | Item::FileField { .. }
-            )
-    )
+    super::model::tab_of(raw) == tab
 }
 
 /// 編集結果を定義へ畳む。
@@ -192,6 +181,15 @@ pub fn apply(base: &SavedRequest, target: Target, lines: &[String]) -> Result<Sa
                 // 次に送ったときに落ちる。
                 crate::args::parse_item(line)
                     .with_context(|| format!("`{line}` を解釈できません"))?;
+                // **そのタブに属する種類だけを受ける。** 課さないと、Headers の
+                // 画面に `limit==50` と書くだけで Headers が消えて Query が増える
+                // （下の `kept` が「そのタブでないもの」を残すため）。
+                if !belongs_to(line, tab) {
+                    anyhow::bail!(
+                        "`{line}` は {} の書き方ではありません。ほかのタブか `T`（定義まるごと）で編集してください",
+                        tab.label()
+                    );
+                }
                 edited.push(line.to_string());
             }
             out.items = kept;

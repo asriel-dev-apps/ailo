@@ -19,7 +19,7 @@ use crate::dump::{self, Dump, Retention};
 use crate::output::{self, Format, Palette};
 use crate::paths;
 use crate::pick;
-use crate::redact::Redactor;
+use crate::redact::{self, Redactor};
 use crate::secrets;
 use crate::shape;
 use crate::vars::{self, Layer, Vars};
@@ -85,74 +85,44 @@ async fn adhoc(method: &str, a: &RequestArgs) -> Result<Outcome> {
     execute(recipe, &a.common).await
 }
 
-/// 直書きされた秘匿値を含む item かどうか。含むならその項目名を返す。
+/// 定義に直接書かれた秘匿値の**名前**。値は返さない。
 ///
-/// 「秘匿らしいヘッダ名」と「秘匿らしいフィールド名」の両方を見る。ヘッダだけを見ていた
-/// ときは、ログインの `password=...` や `token=...` がそのままファイルに残った。
-fn literal_secret_name(raw: &str, r: &Redactor) -> Option<String> {
-    match args::parse_item(raw).ok()? {
-        Item::Header { name, value } if r.is_sensitive_header(&name) && !value.contains("{{") => {
-            Some(name)
-        }
-        Item::Field { name, value } | Item::Query { name, value }
-            if crate::redact::is_sensitive_field(&name) && !value.contains("{{") =>
-        {
-            Some(name)
-        }
-        Item::RawField { name, value }
-            if crate::redact::is_sensitive_field(&name) && !value.to_string().contains("{{") =>
-        {
-            Some(name)
-        }
-        _ => None,
-    }
+/// **判定は `redact` 側に 1 つしかない。** 表示のマスクと保存の門が別の関数だった
+/// ときは、片方だけ塞がった穴が入口を足すたびに開いた（TUI の編集器で 3 経路）。
+/// ここは同じ判定の「保存を拒む側の閾値」を選ぶだけにする。
+pub(crate) fn literal_secrets(req: &SavedRequest) -> Vec<String> {
+    literal_secrets_with(req, &Redactor::new(true))
 }
 
-/// `--raw` の本文に秘匿値が直書きされていないか。
-///
-/// item と違って `--raw` は構造を持たない文字列なので、名前で当たりを付ける。
-/// JSON として読めればキーを見る。読めなければ `password=` `token=` のような
-/// 綴りを探す。ここを見ていなかったとき、`--raw '{"password":"hunter2"}'` が
-/// `last.toml` と `requests.toml` に平文で残った。
-fn raw_literal_secret(raw: &str) -> Option<String> {
-    fn walk(v: &serde_json::Value) -> Option<String> {
-        match v {
-            serde_json::Value::Object(o) => o.iter().find_map(|(k, val)| {
-                if crate::redact::is_sensitive_field(k) {
-                    if let serde_json::Value::String(s) = val {
-                        if !s.contains("{{") {
-                            return Some(k.clone());
-                        }
-                    }
-                }
-                walk(val)
-            }),
-            serde_json::Value::Array(a) => a.iter().find_map(walk),
-            _ => None,
-        }
-    }
-
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        return walk(&v);
-    }
-    // JSON でない本文(フォーム形式など)。`名前=値` と `"名前": "値"` を素朴に探す。
-    let lower = raw.to_ascii_lowercase();
-    ["password", "passwd", "token", "secret", "api_key", "apikey"]
+fn literal_secrets_with(req: &SavedRequest, r: &Redactor) -> Vec<String> {
+    let mut found: Vec<String> = req
+        .items
         .iter()
-        .find(|word| lower.contains(&format!("{word}=")) || lower.contains(&format!("\"{word}\"")))
-        .filter(|_| !raw.contains("{{"))
-        .map(|w| (*w).to_string())
+        .filter_map(|raw| blocking_name(redact::mask_item(raw, r).found))
+        .collect();
+    if let Some(name) = req
+        .raw
+        .as_deref()
+        .and_then(|b| blocking_name(redact::mask_body(b).found))
+    {
+        found.push(format!("--raw の {name}"));
+    }
+    if let Some(name) = blocking_name(redact::mask_url(&req.url).found) {
+        found.push(name);
+    }
+    found
 }
 
-/// URL のクエリに秘匿値が直書きされていないか。
-fn url_literal_secret(url: &str) -> Option<String> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    if parsed.password().is_some_and(|p| !p.contains("{{")) {
-        return Some("URL のパスワード".to_string());
-    }
-    parsed.query_pairs().find_map(|(k, v)| {
-        (crate::redact::is_sensitive_field(&k) && !v.contains("{{")).then(|| k.to_string())
-    })
+/// テスト用の薄い包み。1 行に対する「保存を拒む側の閾値」。
+#[cfg(test)]
+fn blocking_name_of(raw: &str, r: &Redactor) -> Option<String> {
+    blocking_name(redact::mask_item(raw, r).found)
+}
+
+fn blocking_name(found: Option<redact::Found>) -> Option<String> {
+    found
+        .filter(redact::Found::blocks_saving)
+        .map(|f| f.name().to_string())
 }
 
 /// 直前のリクエストを記録する。直書きの秘匿値は値を落とし、名前だけ残す。
@@ -168,7 +138,7 @@ fn record_last(recipe: &Recipe) -> Result<()> {
     let mut items = Vec::with_capacity(recipe.items.len());
     let mut redacted = Vec::new();
     for raw in &recipe.items {
-        match literal_secret_name(raw, &r) {
+        match blocking_name(redact::mask_item(raw, &r).found) {
             Some(name) => {
                 // 値そのものは書かない。何が落ちたかだけ残す。
                 redacted.push(name);
@@ -179,12 +149,16 @@ fn record_last(recipe: &Recipe) -> Result<()> {
 
     // `--raw` と URL も同じ扱いにする。片方だけ守っても意味がない。
     let mut raw_body = recipe.raw.clone();
-    if let Some(name) = recipe.raw.as_deref().and_then(raw_literal_secret) {
+    if let Some(name) = recipe
+        .raw
+        .as_deref()
+        .and_then(|b| blocking_name(redact::mask_body(b).found))
+    {
         redacted.push(format!("--raw の {name}"));
         raw_body = None;
     }
     let mut url = recipe.url.clone();
-    if let Some(name) = url_literal_secret(&recipe.url) {
+    if let Some(name) = blocking_name(redact::mask_url(&recipe.url).found) {
         redacted.push(name);
         url = r.url(&recipe.url);
     }
@@ -1053,18 +1027,7 @@ fn check_definition(req: &SavedRequest) -> Result<()> {
         }
     }
 
-    let r = Redactor::new(true);
-    let mut found: Vec<String> = req
-        .items
-        .iter()
-        .filter_map(|raw| literal_secret_name(raw, &r))
-        .collect();
-    if let Some(name) = req.raw.as_deref().and_then(raw_literal_secret) {
-        found.push(format!("--raw の {name}"));
-    }
-    if let Some(name) = url_literal_secret(&req.url) {
-        found.push(name);
-    }
+    let found = literal_secrets(req);
     if !found.is_empty() {
         bail!(
             "秘匿値が直接書かれています({})。平文のファイルには残せません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照してください",
@@ -1406,7 +1369,7 @@ mod tests {
     fn a_literal_token_in_a_sensitive_header_is_caught() {
         let r = Redactor::new(true);
         assert_eq!(
-            literal_secret_name("Authorization: Bearer s3cr3t-token-value", &r).as_deref(),
+            blocking_name_of("Authorization: Bearer s3cr3t-token-value", &r).as_deref(),
             Some("Authorization")
         );
     }
@@ -1416,11 +1379,11 @@ mod tests {
         // ヘッダだけを見ていたときは、これが requests.toml に平文で残った。
         let r = Redactor::new(true);
         assert_eq!(
-            literal_secret_name("password=hunter2-and-more", &r).as_deref(),
+            blocking_name_of("password=hunter2-and-more", &r).as_deref(),
             Some("password")
         );
         assert_eq!(
-            literal_secret_name("token=stg-token-abcdefgh", &r).as_deref(),
+            blocking_name_of("token=stg-token-abcdefgh", &r).as_deref(),
             Some("token")
         );
     }
@@ -1428,15 +1391,15 @@ mod tests {
     #[test]
     fn a_templated_secret_is_fine_to_save() {
         let r = Redactor::new(true);
-        assert!(literal_secret_name("Authorization: Bearer {{access_token}}", &r).is_none());
-        assert!(literal_secret_name("password={{password}}", &r).is_none());
+        assert!(blocking_name_of("Authorization: Bearer {{access_token}}", &r).is_none());
+        assert!(blocking_name_of("password={{password}}", &r).is_none());
     }
 
     #[test]
     fn ordinary_items_never_block_saving() {
         let r = Redactor::new(true);
         for raw in ["X-Trace: abc", "name=taro", "limit==50", "age:=30"] {
-            assert!(literal_secret_name(raw, &r).is_none(), "{raw}");
+            assert!(blocking_name_of(raw, &r).is_none(), "{raw}");
         }
     }
 
@@ -1460,7 +1423,7 @@ mod tests {
         let kept: Vec<&String> = recipe
             .items
             .iter()
-            .filter(|i| literal_secret_name(i, &r).is_none())
+            .filter(|i| blocking_name_of(i, &r).is_none())
             .collect();
         assert_eq!(kept, vec!["email=a@example.com"]);
     }

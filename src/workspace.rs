@@ -95,6 +95,13 @@ pub fn list(config_base: &Path) -> Vec<Workspace> {
 
 fn resolve(explicit: Option<&str>, from: &Path) -> Result<Workspace> {
     if let Some(name) = explicit {
+        // **空文字は「既定を使う」。** これが無いと、`.ailo` があるディレクトリでは
+        // 既定に戻る言い方が存在しない（`-w` を外すとマーカーが効くため）。
+        // TUI のピッカーで「既定」を選んでも同じ workspace に戻り、無反応に見えていた。
+        // 名前として空は通らないので、意味が衝突しない。
+        if name.trim().is_empty() {
+            return Ok(Workspace::Default);
+        }
         return named(name, "--workspace");
     }
     if let Some(name) = std::env::var(ENV_VAR).ok().filter(|v| !v.trim().is_empty()) {

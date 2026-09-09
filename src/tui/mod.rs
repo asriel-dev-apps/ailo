@@ -1,8 +1,8 @@
 //! `ailo tui` — 保存済みリクエストを人が読んで、選んで、送る画面。
 //!
 //! エージェントは CLI を使う。TUI は**人が副の利用者として**、保存済みの定義を
-//! 見渡し、その場で叩いて結果を確かめるためのもの。定義そのものの編集は
-//! `ailo new` と同じ `$EDITOR` に投げる（画面の中に編集器を作らない）。
+//! 見渡し、その場で叩いて結果を確かめるためのもの。定義の編集も画面の中で行うが、
+//! **書き込みは `run::save_edited` を通す**（`ailo new` と同じガードと衝突検出）。
 
 mod editor;
 mod model;
@@ -75,7 +75,9 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
 
     match result? {
         Exit::Quit => Ok(Outcome { code: 0 }),
-        Exit::Switch(name) => switch_workspace(&name),
+        // **選んでいた環境も引き継ぐ。** 落とすと、workspace を変えた瞬間に
+        // 変数が全部未解決になり、原因が画面のどこにも出ない。
+        Exit::Switch(name) => switch_workspace(&name, app.env.as_deref()),
     }
 }
 
@@ -86,22 +88,39 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
 /// 食い違う。その不変条件を崩すより、自分自身を `-w <名前>` で起動し直すほうが安い。
 ///
 /// **端末は既に戻してから呼ぶこと。** `exec` は戻ってこないので、後始末の機会が無い。
-fn switch_workspace(name: &str) -> Result<Outcome> {
+fn switch_workspace(name: &str, env: Option<&str>) -> Result<Outcome> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe().context("自分自身の場所が分かりません")?;
     let mut cmd = std::process::Command::new(exe);
-    // 既定は名前を持たないので、`-w` を付けずに起動する。
-    if name != crate::workspace::Workspace::Default.label() {
-        cmd.arg("-w").arg(name);
-    }
-    cmd.arg("tui");
+    cmd.args(restart_args(name, env));
     // `AILO_WORKSPACE` が残っていると `-w` の無い既定側で効いてしまう。
     cmd.env_remove(crate::workspace::ENV_VAR);
 
     // 戻ってきたということは起動できなかったということ。
     let err = cmd.exec();
     Err(anyhow::Error::new(err).context("起動し直せませんでした"))
+}
+
+/// 起動し直すときの引数。**いまの画面の状態を落とさない。**
+///
+/// `exec` そのものはテストできないので、引数の組み立てだけを分けてある。
+pub fn restart_args(name: &str, env: Option<&str>) -> Vec<String> {
+    let mut args = vec!["-w".to_string()];
+    // **既定を選んだときも `-w` を付ける。** 外すと `.ailo` マーカーが効いて
+    // 同じ workspace に戻り、ピッカーが無反応に見える。既定は空文字で指す。
+    args.push(if name == crate::workspace::Workspace::Default.label() {
+        String::new()
+    } else {
+        name.to_string()
+    });
+    args.push("tui".into());
+    // 画面で選んでいた環境を持ち越す。
+    if let Some(env) = env {
+        args.push("--env".into());
+        args.push(env.to_string());
+    }
+    args
 }
 
 fn load_entries() -> Result<Vec<Entry>> {
@@ -178,7 +197,9 @@ impl Screen {
                 Ok(Self { terminal })
             }
             Err(e) => {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                // **入れたものは全部戻す。** マウス捕捉を残すと、抜けたあとの
+                // 端末で選択もスクロールもできない。
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
                 Err(e)
             }
         }
@@ -209,7 +230,7 @@ impl Drop for RawGuard {
 }
 
 /// イベントループの抜け方。
-pub enum Exit {
+enum Exit {
     Quit,
     /// workspace を変えて起動し直す。
     Switch(String),
@@ -388,6 +409,11 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) -> Action {
     if app.mode == Mode::Filter {
         return Action::None;
     }
+    // **かぶせものが出ている間は背後に通さない。** キーは `on_key` が遮っているのに
+    // マウスだけ素通りしていた。閉じたときに、触った覚えのない画面になる。
+    if app.editing.is_some() || app.overlay.is_some() {
+        return Action::None;
+    }
     let (x, y) = (m.column, m.row);
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -518,9 +544,23 @@ fn open_editor_for_focus(app: &mut App) {
 }
 
 fn open_editor(app: &mut App, target: Target) {
-    let Some(entry) = app.selected() else {
+    let Some(entry) = app.selected().cloned() else {
         return;
     };
+    // **開く前に、直書きの秘匿値で止める。**
+    //
+    // 編集器には生の定義を渡す（伏せ字を渡すと保存した瞬間に `***` が本物の値として
+    // 書き込まれる）。つまり直書きがあると、開いただけで通常表示が伏せている値が
+    // 画面に出る。保存時のガード（`check_definition`）では表示漏洩に間に合わない。
+    let literal = crate::run::literal_secrets(&entry.req);
+    if !literal.is_empty() {
+        app.pane = Pane::Failed(format!(
+            "`{}` には秘匿値が直接書かれています({})。画面に出すので編集器を開きません。\n`ailo secret set <環境> <キー>` に預けて `{{{{<キー>}}}}` で参照する形に、CLI で直してください",
+            entry.name,
+            literal.join(", ")
+        ));
+        return;
+    }
     // 本文を持つリクエストで Body を編集するなら、item ではなく本文を開く。
     // 両方を 1 つの画面に混ぜると、保存の形が決まらない。
     let target = match (target, entry.req.raw.is_some()) {
