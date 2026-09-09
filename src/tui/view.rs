@@ -10,14 +10,40 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::model::{display_url, tab_lines, App, Mode, Pane, Tab};
+use super::model::{display_url, tab_lines, App, Focus, Mode, Pane, Tab};
+
+/// フォーカス中のペインの枠。
+///
+/// **どこにキーが当たっているかを、常に 1 目で分かるようにする。**
+/// 当たり先で `j` の意味が変わるので、分からないまま押すと意図しない場所が動く。
+fn framed(title: &str, focused: bool) -> Block<'_> {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_string());
+    if focused {
+        block.border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        block
+    }
+}
+
+/// 中身の行数と見えている高さから、これ以上下げられない位置を出す。
+fn max_top(lines: usize, height: u16) -> u16 {
+    // 枠の上下 2 行は中身に使えない。
+    let visible = height.saturating_sub(2);
+    (lines as u16).saturating_sub(visible)
+}
 
 /// 左ペインの幅。これより狭い端末では一覧を畳む。
 const SIDEBAR: u16 = 26;
 /// 一覧を畳む閾値。
 const NARROW: u16 = 60;
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -61,9 +87,10 @@ fn header(app: &App) -> Paragraph<'_> {
 /// 幅の閾値を定数で決めていたときは、60〜63 セルで最後の `q 終了` だけが
 /// 切れていた。消えるのが**抜け方**なので、初見の利用者は raw モードの画面に
 /// 取り残される。**途中で切れた案内は、無いより悪い。**
-const NORMAL_HINTS: [&str; 3] = [
-    " ↑↓ 選択   Tab タブ   Enter 送信   / 絞り込み   e 編集   q 終了",
-    " Enter 送信   e 編集   q 終了",
+const NORMAL_HINTS: [&str; 4] = [
+    " Tab ペイン   ↑↓ 選択/スクロール   Enter 送信   / 絞り込み   e 編集   q 終了",
+    " Tab ペイン   ↑↓ 移動   Enter 送信   e 編集   q 終了",
+    " Tab ペイン   Enter 送信   q 終了",
     " q 終了",
 ];
 
@@ -117,6 +144,7 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" 保存済み /{} ", app.filter)
     };
+    let block = || framed(&title, app.focus == Focus::List);
 
     if items.is_empty() {
         let hint = if app.filter.is_empty() {
@@ -127,7 +155,7 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(hint)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().borders(Borders::ALL).title(title)),
+                .block(block()),
             area,
         );
         return;
@@ -136,13 +164,13 @@ fn sidebar(f: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.selected_index()));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(block())
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("");
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn detail(f: &mut Frame, app: &App, area: Rect) {
+fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -174,31 +202,34 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(display_url(&entry.req.url)),
         ]))
         .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" エンドポイント "),
-        ),
+        .block(framed(" エンドポイント ", app.focus == Focus::Endpoint)),
         rows[0],
     );
 
     // 2. タブ
     let selected = Tab::ALL.iter().position(|t| *t == app.tab).unwrap_or(0);
+    let tabs_focused = app.focus == Focus::Tabs;
     f.render_widget(
         Tabs::new(Tab::ALL.iter().map(|t| t.label()).collect::<Vec<_>>())
             .select(selected)
             .divider(" ")
-            .highlight_style(
+            // フォーカスが当たっているときだけ、選択中のタブを反転させる。
+            // 反転しっぱなしだと、左右キーが効く状態かどうかが分からない。
+            .highlight_style(if tabs_focused {
                 Style::default()
                     .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            }),
         rows[1],
     );
 
     // 3. タブの中身
     let lines = tab_lines(&entry.req, app.tab);
-    let body = if lines.is_empty() {
+    let body: Vec<Line> = if lines.is_empty() {
         vec![Line::from(Span::styled(
             "（なし）",
             Style::default().fg(Color::DarkGray),
@@ -206,30 +237,56 @@ fn detail(f: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.into_iter().map(Line::from).collect()
     };
+    app.definition_max_top = max_top(body.len(), rows[2].height);
+    app.definition_scroll.clamp(app.definition_max_top);
     f.render_widget(
         Paragraph::new(body)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
+            .scroll((app.definition_scroll.top(), 0))
+            .block(framed(
+                &scroll_title("", app.definition_scroll.top(), app.definition_max_top),
+                app.focus == Focus::Definition,
+            )),
         rows[2],
     );
 
     // 4. レスポンス
-    f.render_widget(response(app), rows[3]);
+    let lines = response_lines(app);
+    app.response_max_top = max_top(lines.len(), rows[3].height);
+    app.response_scroll.clamp(app.response_max_top);
+    let title = scroll_title(
+        " レスポンス ",
+        app.response_scroll.top(),
+        app.response_max_top,
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.response_scroll.top(), 0))
+            .block(framed(&title, app.focus == Focus::Response)),
+        rows[3],
+    );
 }
 
-fn response(app: &App) -> Paragraph<'_> {
-    let block = Block::default().borders(Borders::ALL).title(" レスポンス ");
+/// スクロールできる枠の見出し。**まだ下があることを見せる。**
+/// 見せないと、最後まで読んだのか途中なのかが分からない。
+fn scroll_title(name: &str, top: u16, max_top: u16) -> String {
+    if max_top == 0 {
+        return name.to_string();
+    }
+    format!("{name}[{top}/{max_top}] ")
+}
+
+/// レスポンス欄に描く行。**枠は呼び出し側が付ける**（スクロールの見出しを載せるため）。
+fn response_lines(app: &App) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
     match &app.pane {
-        Pane::Idle => Paragraph::new(Span::styled(
-            "Enter で送信",
-            Style::default().fg(Color::DarkGray),
-        ))
-        .block(block),
-        Pane::Sending => Paragraph::new("送信中…").block(block),
-        Pane::Failed(msg) => Paragraph::new(msg.clone())
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::Red))
-            .block(block),
+        Pane::Idle => vec![Line::from(Span::styled("Enter で送信", dim))],
+        Pane::Sending => vec![Line::from("送信中…（Esc で打ち切り）".to_string())],
+        Pane::Failed(msg) => msg
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(Color::Red))))
+            .collect(),
         Pane::Done {
             status,
             status_text,
@@ -253,14 +310,11 @@ fn response(app: &App) -> Paragraph<'_> {
                         "  {ms}ms  {}  {content_type}",
                         crate::output::human_size(*bytes)
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    dim,
                 ),
             ])];
             if let Some(path) = dump {
-                lines.push(Line::from(Span::styled(
-                    format!("dump: {path}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                lines.push(Line::from(Span::styled(format!("dump: {path}"), dim)));
             }
             for note in notes {
                 lines.push(Line::from(Span::styled(
@@ -268,12 +322,13 @@ fn response(app: &App) -> Paragraph<'_> {
                     Style::default().fg(Color::Yellow),
                 )));
             }
-            // 形があるならそれを先に出す。全文はダンプにある。
-            let shown = shape.as_deref().unwrap_or(body.as_str());
-            lines.extend(shown.lines().map(|l| Line::from(l.to_string())));
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(block)
+            // 形があるならそれを先に。全文はこの下に続く。
+            if let Some(shape) = shape {
+                lines.extend(shape.lines().map(|l| Line::from(l.to_string())));
+                lines.push(Line::from(Span::styled("── 本文 ──", dim)));
+            }
+            lines.extend(body.lines().map(|l| Line::from(l.to_string())));
+            lines
         }
     }
 }

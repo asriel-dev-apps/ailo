@@ -28,10 +28,7 @@ use crate::run::Outcome;
 use crate::shape;
 use crate::workspace;
 
-pub use model::{App, Entry, Mode, Pane, Tab};
-
-/// レスポンス欄に載せる本文の行数。全文はダンプで読む。
-const BODY_LINES: usize = 200;
+pub use model::{App, Entry, Focus, Mode, Pane, Scroll, Tab};
 
 /// 押されたキーに対して何をするか。**端末を触らずに決める**ので、テストできる。
 #[derive(Debug, PartialEq)]
@@ -242,20 +239,15 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             app.quit = true;
             Action::Quit
         }
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.move_down();
+        // **`Tab` はペインを移る。** タブの切り替えではない。
+        // ペインが増えた以上、一番押されるキーは「どこに当てるか」に要る。
+        // タブは、タブのペインに当たっているときの左右で切り替える。
+        KeyCode::Tab => {
+            app.focus = app.focus.next();
             Action::None
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.move_up();
-            Action::None
-        }
-        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-            app.tab = app.tab.next();
-            Action::None
-        }
-        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-            app.tab = app.tab.prev();
+        KeyCode::BackTab => {
+            app.focus = app.focus.prev();
             Action::None
         }
         KeyCode::Char('/') => {
@@ -267,9 +259,72 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             Some(e) => Action::Edit(e.name.clone()),
             None => Action::None,
         },
-        _ => Action::None,
+        _ => on_focused_key(app, key),
     }
 }
+
+/// フォーカス中のペインに配るキー。
+///
+/// **同じ `j` でも、一覧では「次のリクエスト」、レスポンスでは「1 行下へ」。**
+/// ペインごとに意味が変わるので、ここで振り分ける。
+fn on_focused_key(app: &mut App, key: KeyEvent) -> Action {
+    let down = matches!(key.code, KeyCode::Char('j') | KeyCode::Down);
+    let up = matches!(key.code, KeyCode::Char('k') | KeyCode::Up);
+    let right = matches!(key.code, KeyCode::Char('l') | KeyCode::Right);
+    let left = matches!(key.code, KeyCode::Char('h') | KeyCode::Left);
+
+    match app.focus {
+        Focus::List => {
+            if down {
+                app.move_down();
+            } else if up {
+                app.move_up();
+            }
+        }
+        // タブに当たっているときは左右で切り替える。上下は当たり先を移す
+        // (タブは 1 行しか無いので、上下にスクロールするものが無い)。
+        Focus::Tabs => {
+            if right {
+                let next = app.tab.next();
+                app.set_tab(next);
+            } else if left {
+                let prev = app.tab.prev();
+                app.set_tab(prev);
+            } else if down {
+                app.focus = Focus::Definition;
+            } else if up {
+                app.focus = Focus::Endpoint;
+            }
+        }
+        Focus::Definition => scroll_keys(&mut app.definition_scroll, key, app.definition_max_top),
+        Focus::Response => scroll_keys(&mut app.response_scroll, key, app.response_max_top),
+        // エンドポイントは 1〜2 行。スクロールするものが無いので、上下で隣のペインへ。
+        Focus::Endpoint => {
+            if down {
+                app.focus = Focus::Tabs;
+            } else if up {
+                app.focus = Focus::List;
+            }
+        }
+    }
+    Action::None
+}
+
+/// スクロールできるペインの共通のキー。
+fn scroll_keys(scroll: &mut Scroll, key: KeyEvent, max_top: u16) {
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => scroll.down(1, max_top),
+        KeyCode::Char('k') | KeyCode::Up => scroll.up(1),
+        KeyCode::PageDown | KeyCode::Char('f') => scroll.down(PAGE, max_top),
+        KeyCode::PageUp | KeyCode::Char('b') => scroll.up(PAGE),
+        KeyCode::Home | KeyCode::Char('g') => scroll.to_start(),
+        KeyCode::End | KeyCode::Char('G') => scroll.to_end(max_top),
+        _ => {}
+    }
+}
+
+/// 1 ページ分の行数。端末の高さは描くまで分からないので、控えめな固定値にする。
+const PAGE: u16 = 10;
 
 /// 端末を明け渡してから `f` を動かし、戻ってきたら握り直す。
 ///
@@ -378,11 +433,8 @@ pub fn fold(done: crate::run::Performed, notes: Vec<String>) -> Pane {
         dump::BodyRecord::Json { value } => Some(shape::of(value).render()),
         _ => None,
     };
-    let body = res
-        .body
-        .as_text()
-        .map(|t| t.lines().take(BODY_LINES).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_default();
+    // **全文を持つ。** 画面はスクロールできるので、ここで切る理由が無い。
+    let body = res.body.as_text().unwrap_or_default();
     Pane::Done {
         status: res.status,
         status_text: res.status_text.clone(),

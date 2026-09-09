@@ -136,17 +136,117 @@ fn reloading_after_an_edit_keeps_the_selection_in_range() {
 
 // ---------------------------------------------------------------------- タブ
 
+/// `Tab` はペインを移る。タブの切り替えではない。
+/// ペインが 5 つある以上、一番押されるキーは「どこに当てるか」に要る。
 #[test]
-fn tab_cycles_forward_and_backward() {
+fn tab_moves_between_panes() {
+    use super::Focus;
     let mut a = app(&["x"]);
-    assert_eq!(a.tab, Tab::Body);
+    assert_eq!(a.focus, Focus::List);
     on_key(&mut a, key(KeyCode::Tab));
-    assert_eq!(a.tab, Tab::Headers);
+    assert_eq!(a.focus, Focus::Endpoint);
     on_key(&mut a, key(KeyCode::BackTab));
-    assert_eq!(a.tab, Tab::Body);
+    assert_eq!(a.focus, Focus::List);
     // 先頭から戻ると末尾へ回る。
     on_key(&mut a, key(KeyCode::BackTab));
+    assert_eq!(a.focus, Focus::Response);
+}
+
+/// タブの切り替えは、タブのペインに当たっているときの左右。
+#[test]
+fn tabs_switch_with_left_and_right_when_that_pane_has_focus() {
+    use super::Focus;
+    let mut a = app(&["x"]);
+    a.focus = Focus::Tabs;
+    assert_eq!(a.tab, Tab::Body);
+    on_key(&mut a, key(KeyCode::Right));
+    assert_eq!(a.tab, Tab::Headers);
+    on_key(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, Tab::Body);
+    on_key(&mut a, key(KeyCode::Left));
     assert_eq!(a.tab, Tab::Capture);
+}
+
+/// 一覧に当たっているときの左右はタブを動かさない。
+/// **当たっていない場所が動くのが、この手の画面で一番たちが悪い。**
+#[test]
+fn left_and_right_do_nothing_to_tabs_while_the_list_has_focus() {
+    use super::Focus;
+    let mut a = app(&["x", "y"]);
+    assert_eq!(a.focus, Focus::List);
+    on_key(&mut a, key(KeyCode::Right));
+    on_key(&mut a, key(KeyCode::Left));
+    assert_eq!(a.tab, Tab::Body);
+}
+
+/// 同じ `j` でも、一覧では次のリクエスト、レスポンスでは 1 行下。
+#[test]
+fn j_means_a_different_thing_in_each_pane() {
+    use super::Focus;
+    let mut a = app(&["one", "two"]);
+    on_key(&mut a, key(KeyCode::Char('j')));
+    assert_eq!(a.selected().unwrap().name, "two");
+
+    a.focus = Focus::Response;
+    a.response_max_top = 40;
+    let before = a.selected().unwrap().name.clone();
+    on_key(&mut a, key(KeyCode::Char('j')));
+    assert_eq!(a.response_scroll.top(), 1);
+    assert_eq!(a.selected().unwrap().name, before, "一覧まで動いている");
+}
+
+/// スクロールは実測の上限で畳む。**描いた行数より下へは行かない。**
+/// 行かせると、中身の無い空白まで進んで「壊れた」ように見える。
+#[test]
+fn scrolling_stops_at_the_measured_end() {
+    use super::Focus;
+    let mut a = app(&["x"]);
+    a.focus = Focus::Response;
+    a.response_max_top = 3;
+    for _ in 0..10 {
+        on_key(&mut a, key(KeyCode::Char('j')));
+    }
+    assert_eq!(a.response_scroll.top(), 3);
+    on_key(&mut a, key(KeyCode::Char('g')));
+    assert_eq!(a.response_scroll.top(), 0);
+    on_key(&mut a, key(KeyCode::Char('G')));
+    assert_eq!(a.response_scroll.top(), 3);
+}
+
+/// 回帰: リクエストを変えたらスクロールとレスポンスを捨てる。
+/// 持ち越すと、短い定義に切り替えた瞬間に空白だけが見える。
+/// 前のリクエストのレスポンスが残るのは、もっとたちが悪い。
+#[test]
+fn changing_the_request_drops_the_scroll_and_the_previous_response() {
+    use super::Focus;
+    let mut a = app(&["one", "two"]);
+    a.focus = Focus::Definition;
+    a.definition_max_top = 20;
+    on_key(&mut a, key(KeyCode::Char('j')));
+    assert_eq!(a.definition_scroll.top(), 1);
+
+    a.pane = Pane::Failed("前のリクエストの結果".into());
+    a.focus = Focus::List;
+    on_key(&mut a, key(KeyCode::Char('j')));
+
+    assert_eq!(a.definition_scroll.top(), 0);
+    assert_eq!(a.response_scroll.top(), 0);
+    assert_eq!(a.pane, Pane::Idle, "前のレスポンスが残っている");
+}
+
+/// タブを変えたときも定義のスクロールは先頭へ戻す。
+#[test]
+fn changing_the_tab_resets_the_definition_scroll() {
+    use super::Focus;
+    let mut a = app(&["x"]);
+    a.focus = Focus::Definition;
+    a.definition_max_top = 20;
+    on_key(&mut a, key(KeyCode::Char('j')));
+    assert_eq!(a.definition_scroll.top(), 1);
+
+    a.focus = Focus::Tabs;
+    on_key(&mut a, key(KeyCode::Right));
+    assert_eq!(a.definition_scroll.top(), 0);
 }
 
 /// 項目の振り分け。ヘッダが Body に出たり、クエリが消えたりすると、
@@ -286,9 +386,10 @@ fn control_without_masking_the_secret_would_have_been_visible() {
     );
 }
 
-/// 本文は打ち切る。全文はダンプにある。
+/// 本文は**全文**を持つ。画面はスクロールできるので、ここで切る理由が無い。
+/// 先頭だけを持っていたときは、画面で追える量がそこで頭打ちだった。
 #[test]
-fn a_long_body_is_cut_so_the_pane_does_not_hold_the_whole_response() {
+fn the_pane_keeps_the_whole_body_so_it_can_be_scrolled() {
     let items: Vec<_> = (0..5000).map(|i| serde_json::json!({"id": i})).collect();
     let pane = fold_of(performed(
         serde_json::json!({ "items": items }),
@@ -297,11 +398,7 @@ fn a_long_body_is_cut_so_the_pane_does_not_hold_the_whole_response() {
     let Pane::Done { body, .. } = &pane else {
         panic!("{pane:?}");
     };
-    assert!(
-        body.lines().count() <= super::BODY_LINES,
-        "{}",
-        body.lines().count()
-    );
+    assert!(body.lines().count() > 5000, "{}", body.lines().count());
 }
 
 // ------------------------------------------------------------------ 終了
@@ -340,8 +437,12 @@ use ratatui::Terminal;
 
 /// 描いた画面を文字列にする。TestBackend なので端末は要らない。
 fn screen(app: &App, width: u16, height: u16) -> String {
+    // 描画は測った行数を書き戻すので `&mut` が要る。テストからは複製を渡し、
+    // 呼び出し側の状態を触らない。
+    let mut app = app.clone();
     let mut t = Terminal::new(TestBackend::new(width, height)).expect("TestBackend");
-    t.draw(|f| super::view::draw(f, app)).expect("描けない");
+    t.draw(|f| super::view::draw(f, &mut app))
+        .expect("描けない");
     let buf = t.backend().buffer().clone();
     // **全角は 2 セルを占め、2 セル目には空白が入る。** そのまま連結すると
     // `保存済み` が `保 存 済 み` になり、「画面に出ているのに一致しない」で
@@ -643,4 +744,78 @@ fn the_filter_hint_keeps_the_way_back_even_with_a_long_search_term() {
         let last = out.lines().last().unwrap_or_default().to_string();
         assert!(last.contains("Esc 取消"), "幅 {width}: {last:?}");
     }
+}
+
+/// フォーカス中のペインは枠の色が変わる。
+///
+/// **文字だけを見るテストでは落ちない**ので、色そのものを確かめる。
+/// 当たり先で `j` の意味が変わる以上、どこに当たっているか分からない画面は使えない。
+#[test]
+fn the_focused_pane_is_the_only_one_with_a_highlighted_border() {
+    use super::Focus;
+    use ratatui::style::Color;
+
+    let border_colours = |focus: Focus| -> Vec<Color> {
+        let mut a = demo();
+        a.focus = focus;
+        let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
+        t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+        let buf = t.backend().buffer().clone();
+        // 枠線に使われている文字のセルだけ拾う。
+        (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| matches!(buf[(*x, *y)].symbol(), "┌" | "┐" | "└" | "┘" | "─" | "│"))
+            .map(|(x, y)| buf[(x, y)].style().fg.unwrap_or(Color::Reset))
+            .collect()
+    };
+
+    for focus in Focus::RING {
+        let colours = border_colours(focus);
+        let highlighted = colours.iter().filter(|c| **c == Color::Cyan).count();
+        match focus {
+            // タブは枠を持たない行なので、強調される枠は無い。
+            Focus::Tabs => assert_eq!(highlighted, 0, "{focus:?}"),
+            _ => assert!(highlighted > 0, "{focus:?} に強調された枠が無い"),
+        }
+    }
+
+    // 何も当たっていない状態は作れないが、当たっている枠が
+    // **1 つだけ**であることは確かめられる。
+    let mut a = demo();
+    a.focus = Focus::Response;
+    let mut t = Terminal::new(TestBackend::new(100, 26)).expect("TestBackend");
+    t.draw(|f| super::view::draw(f, &mut a)).expect("描けない");
+    let buf = t.backend().buffer().clone();
+    let cyan_rows: std::collections::BTreeSet<u16> = (0..buf.area.height)
+        .filter(|y| {
+            (0..buf.area.width).any(|x| {
+                buf[(x, *y)].symbol() == "│"
+                    && buf[(x, *y)].style().fg == Some(ratatui::style::Color::Cyan)
+            })
+        })
+        .collect();
+    assert!(!cyan_rows.is_empty(), "レスポンスの枠が強調されていない");
+}
+
+/// スクロールできるときは、どこまで来たかを枠の見出しに出す。
+/// 出さないと、最後まで読んだのか途中なのかが分からない。
+#[test]
+fn a_scrollable_pane_shows_how_far_down_it_is() {
+    let mut a = demo();
+    a.pane = Pane::Done {
+        status: 200,
+        status_text: "OK".into(),
+        ms: 1,
+        bytes: 1,
+        content_type: "application/json".into(),
+        shape: None,
+        body: (0..80)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        dump: None,
+        notes: Vec::new(),
+    };
+    let out = screen(&a, 100, 26);
+    assert!(out.contains("レスポンス [0/"), "{out}");
 }

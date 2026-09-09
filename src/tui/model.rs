@@ -39,6 +39,85 @@ impl Tab {
     }
 }
 
+/// いまキーが効く場所。**ペインごとに「選ぶ」「スクロールする」の意味が変わる**ので、
+/// どこに当たっているかを常に画面に出す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// 左の一覧。
+    List,
+    /// 右上のエンドポイント。
+    Endpoint,
+    /// タブの切り替え。
+    Tabs,
+    /// タブの中身（Body / Headers / Query / Capture）。
+    Definition,
+    /// レスポンス。
+    Response,
+}
+
+impl Focus {
+    /// 右回り。左の一覧から始めて、上から下へ辿る。
+    pub const RING: [Focus; 5] = [
+        Focus::List,
+        Focus::Endpoint,
+        Focus::Tabs,
+        Focus::Definition,
+        Focus::Response,
+    ];
+
+    pub fn next(self) -> Focus {
+        let i = Self::RING.iter().position(|f| *f == self).unwrap_or(0);
+        Self::RING[(i + 1) % Self::RING.len()]
+    }
+
+    pub fn prev(self) -> Focus {
+        let i = Self::RING.iter().position(|f| *f == self).unwrap_or(0);
+        Self::RING[(i + Self::RING.len() - 1) % Self::RING.len()]
+    }
+}
+
+/// 縦スクロールの位置。**行数を持たせない。**
+///
+/// 中身の行数は描くときにしか分からない（折り返しがある）。位置だけを持ち、
+/// 上限は描画側が知っている行数で毎回畳む。持たせると、内容が変わったのに
+/// 上限が古いまま残り、「スクロールできない」「空白まで進む」になる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Scroll {
+    top: u16,
+}
+
+impl Scroll {
+    pub fn top(self) -> u16 {
+        self.top
+    }
+
+    pub fn down(&mut self, lines: u16, max_top: u16) {
+        self.top = (self.top + lines).min(max_top);
+    }
+
+    pub fn up(&mut self, lines: u16) {
+        self.top = self.top.saturating_sub(lines);
+    }
+
+    pub fn to_start(&mut self) {
+        self.top = 0;
+    }
+
+    pub fn to_end(&mut self, max_top: u16) {
+        self.top = max_top;
+    }
+
+    /// 内容が変わったら先頭へ戻す。前の位置を残すと、短い中身で空白が出る。
+    pub fn reset(&mut self) {
+        self.top = 0;
+    }
+
+    /// 描画時に、実際の行数で畳む。
+    pub fn clamp(&mut self, max_top: u16) {
+        self.top = self.top.min(max_top);
+    }
+}
+
 /// レスポンス欄の状態。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pane {
@@ -54,7 +133,10 @@ pub enum Pane {
         content_type: String,
         /// 形の要約。JSON でなければ `None`。
         shape: Option<String>,
-        /// マスク済みの本文（先頭のみ）。
+        /// マスク済みの本文。**全文**を持つ。
+        ///
+        /// 先頭だけを持っていたときは、画面で追える量がそこで頭打ちだった。
+        /// スクロールできる以上、切る理由が無い。全文はどのみちダンプにある。
         body: String,
         dump: Option<String>,
         notes: Vec<String>,
@@ -76,6 +158,7 @@ pub enum Mode {
     Filter,
 }
 
+#[derive(Clone)]
 pub struct App {
     all: Vec<Entry>,
     pub filter: String,
@@ -87,6 +170,18 @@ pub struct App {
     pub workspace: String,
     pub env: Option<String>,
     pub quit: bool,
+    pub focus: Focus,
+    /// 定義（タブの中身）のスクロール位置。
+    pub definition_scroll: Scroll,
+    /// レスポンスのスクロール位置。
+    pub response_scroll: Scroll,
+    /// **描画側が毎回書き込む**、これ以上は下げられない位置。
+    ///
+    /// 何行あるかは、幅が決まって折り返してみるまで分からない。だから状態には
+    /// 持たず、描いた側が実測を書き戻す。キー操作はその値で畳む。
+    /// 描く前に押されたキーは 0 で畳まれるが、1 フレーム目だけの話で害が無い。
+    pub definition_max_top: u16,
+    pub response_max_top: u16,
 }
 
 impl App {
@@ -101,6 +196,11 @@ impl App {
             workspace: workspace.into(),
             env,
             quit: false,
+            focus: Focus::List,
+            definition_scroll: Scroll::default(),
+            response_scroll: Scroll::default(),
+            definition_max_top: 0,
+            response_max_top: 0,
         }
     }
 
@@ -128,6 +228,7 @@ impl App {
         let n = self.visible().len();
         if n > 0 {
             self.selected = (self.selected + 1) % n;
+            self.on_request_changed();
         }
     }
 
@@ -135,6 +236,24 @@ impl App {
         let n = self.visible().len();
         if n > 0 {
             self.selected = (self.selected + n - 1) % n;
+            self.on_request_changed();
+        }
+    }
+
+    /// 見ているリクエストが変わったときの後始末。
+    ///
+    /// **スクロール位置を持ち越さない。** 持ち越すと、短い定義に切り替えた瞬間に
+    /// 空白だけが見え、「壊れた」と読める。レスポンスも前のリクエストのものなので捨てる。
+    pub fn on_request_changed(&mut self) {
+        self.definition_scroll.reset();
+        self.response_scroll.reset();
+        self.pane = Pane::Idle;
+    }
+
+    pub fn set_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.definition_scroll.reset();
         }
     }
 
