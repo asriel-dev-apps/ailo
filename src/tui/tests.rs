@@ -1441,3 +1441,50 @@ fn clicking_a_tab_still_works_when_the_labels_carry_counts() {
     on_mouse(&mut a, click(query.x, query.y));
     assert_eq!(a.tab, Tab::Query, "tab_items: {:?}", a.areas.tab_items);
 }
+
+/// 検索は編集器の中の小さなモード。**`Esc` は先に検索を閉じる**（編集は破棄しない）。
+#[test]
+fn search_is_a_mode_inside_the_editor_and_escape_closes_it_first() {
+    let mut a = app(&["x"]);
+    on_key(&mut a, key(KeyCode::Char('e')));
+    let ctrl_f = KeyEvent {
+        code: KeyCode::Char('f'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: ratatui::crossterm::event::KeyEventState::NONE,
+    };
+    on_key(&mut a, ctrl_f);
+    assert_eq!(a.editing.as_ref().unwrap().search.as_deref(), Some(""));
+
+    for c in "tar".chars() {
+        on_key(&mut a, key(KeyCode::Char(c)));
+    }
+    assert_eq!(a.editing.as_ref().unwrap().search.as_deref(), Some("tar"));
+    // 検索語は本文に入らない。
+    assert!(!a.editing.as_ref().unwrap().lines().join("").contains("tar"));
+
+    on_key(&mut a, key(KeyCode::Esc));
+    assert!(a.editing.is_some(), "編集まで閉じている");
+    assert!(a.editing.as_ref().unwrap().search.is_none());
+
+    on_key(&mut a, key(KeyCode::Esc));
+    assert!(a.editing.is_none(), "2 回目の Esc で閉じない");
+}
+
+/// 正規表現として途中の入力（`(` を打った瞬間など）で落ちない。
+#[test]
+fn a_half_typed_pattern_does_not_blow_up() {
+    let mut a = app(&["x"]);
+    on_key(&mut a, key(KeyCode::Char('e')));
+    let ctrl_f = KeyEvent {
+        code: KeyCode::Char('f'),
+        modifiers: KeyModifiers::CONTROL,
+        kind: KeyEventKind::Press,
+        state: ratatui::crossterm::event::KeyEventState::NONE,
+    };
+    on_key(&mut a, ctrl_f);
+    for c in "([".chars() {
+        on_key(&mut a, key(KeyCode::Char(c)));
+    }
+    assert!(a.editing.is_some());
+}

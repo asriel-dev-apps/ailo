@@ -533,12 +533,47 @@ fn open_editor(app: &mut App, target: Target) {
 /// 編集中のキー。**ここで拾わないものは全部 `tui-textarea` に渡す。**
 fn on_editor_key(app: &mut App, key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // 検索中は編集器の中の小さなモード。**外側の `Esc`（編集の破棄）より先に拾う。**
+    if app.editing.as_ref().is_some_and(|e| e.search.is_some()) {
+        let Some(editing) = app.editing.as_mut() else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                editing.search = None;
+                editing.apply_search(true);
+            }
+            KeyCode::Enter => editing.apply_search(true),
+            KeyCode::Backspace => {
+                if let Some(s) = editing.search.as_mut() {
+                    s.pop();
+                }
+                editing.apply_search(true);
+            }
+            KeyCode::Char(c) => {
+                if let Some(s) = editing.search.as_mut() {
+                    s.push(c);
+                }
+                editing.apply_search(true);
+            }
+            _ => {}
+        }
+        return Action::None;
+    }
+
     match key.code {
         KeyCode::Esc => {
             app.editing = None;
             return Action::None;
         }
         KeyCode::Char('s') if ctrl => return Action::Save,
+        KeyCode::Char('f') if ctrl => {
+            if let Some(editing) = app.editing.as_mut() {
+                editing.search = Some(String::new());
+            }
+            return Action::None;
+        }
         // 1 行しか受け付けない対象では改行を入れさせない。
         // 入れさせると、保存時に黙って連結されて意図と違う値になる。
         KeyCode::Enter => {

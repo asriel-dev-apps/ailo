@@ -560,10 +560,10 @@ fn editor(f: &mut Frame, app: &mut App) {
         })
         .split(area);
 
-    let hint = if editing.target.single_line() {
-        " Enter 保存   Esc 破棄 "
-    } else {
-        " Ctrl-S 保存   Esc 破棄 "
+    let hint = match (&editing.search, editing.target.single_line()) {
+        (Some(pattern), _) => format!(" 検索: {pattern}   Enter 次へ   Esc 検索を閉じる "),
+        (None, true) => " Enter 保存   Esc 破棄 ".to_string(),
+        (None, false) => " Ctrl-S 保存   Ctrl-F 検索   Esc 破棄 ".to_string(),
     };
     editing.area.set_block(
         Block::default()

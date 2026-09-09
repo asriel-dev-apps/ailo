@@ -46,6 +46,9 @@ impl Target {
 /// 編集中の状態。
 #[derive(Clone)]
 pub struct Editing {
+    /// 検索中なら、打ちかけの語。**編集器の中の小さなモード**で、
+    /// `Esc` で閉じる（外側の `Esc` は編集の破棄なので、先にこちらが拾う）。
+    pub search: Option<String>,
     pub name: String,
     pub target: Target,
     pub area: TextArea<'static>,
@@ -63,11 +66,37 @@ impl Editing {
             ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
         );
         Self {
+            search: None,
             name: name.to_string(),
             target,
             area,
             opened_from: req.clone(),
             error: None,
+        }
+    }
+
+    /// 検索語を反映し、次の一致へ飛ぶ。
+    ///
+    /// **語が空なら強調を消す。** 消さないと、閉じたあとも当たった場所が
+    /// 光ったまま残る。
+    pub fn apply_search(&mut self, forward: bool) {
+        let Some(pattern) = self.search.clone() else {
+            let _ = self.area.set_search_pattern("");
+            return;
+        };
+        if pattern.is_empty() {
+            let _ = self.area.set_search_pattern("");
+            return;
+        }
+        // 正規表現として読めない途中の入力（`(` を打った瞬間など）で
+        // 落とさない。打ち終わるまで一致が無いだけ。
+        if self.area.set_search_pattern(&pattern).is_err() {
+            return;
+        }
+        if forward {
+            self.area.search_forward(false);
+        } else {
+            self.area.search_back(false);
         }
     }
 
