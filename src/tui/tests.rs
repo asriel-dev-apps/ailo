@@ -964,3 +964,141 @@ fn mouse_capture_can_be_turned_off_and_says_so() {
     assert!(a.mouse);
     assert!(!screen(&a, 100, 26).contains("マウス切"));
 }
+
+// -------------------------------------------- 切り替えと変数の確認（overlay）
+
+use super::model::{Overlay, VarRow};
+
+fn var(name: &str, shown: &str, secret: bool) -> VarRow {
+    VarRow {
+        name: name.into(),
+        shown: shown.into(),
+        source: "config".into(),
+        expires: String::new(),
+        secret,
+    }
+}
+
+/// `Esc` はどのかぶせものでも閉じる。閉じ方が状態ごとに変わると迷子になる。
+#[test]
+fn escape_closes_any_overlay() {
+    for open in [
+        |a: &mut App| a.open_workspace_picker(vec!["既定".into(), "demo".into()]),
+        |a: &mut App| a.open_env_picker(vec!["stg".into()]),
+        |a: &mut App| a.open_vars(vec![var("x", "1", false)]),
+    ] {
+        let mut a = demo();
+        open(&mut a);
+        assert!(a.overlay.is_some());
+        on_key(&mut a, key(KeyCode::Esc));
+        assert!(a.overlay.is_none(), "閉じない");
+    }
+}
+
+/// かぶせものが出ている間、下のペインにキーを通さない。
+/// 通すと、選んでいるつもりで裏のリクエストが変わる。
+#[test]
+fn keys_do_not_reach_the_panes_while_an_overlay_is_open() {
+    let mut a = demo();
+    let before = a.selected().unwrap().name.clone();
+    a.open_workspace_picker(vec!["既定".into(), "demo".into()]);
+    on_key(&mut a, key(KeyCode::Char('j')));
+    assert_eq!(a.selected().unwrap().name, before, "裏の一覧が動いている");
+}
+
+/// 環境を選ぶと切り替わり、前の環境のレスポンスは捨てる。
+#[test]
+fn choosing_an_environment_switches_and_drops_the_previous_response() {
+    let mut a = demo();
+    a.pane = Pane::Failed("stg で失敗した結果".into());
+    a.open_env_picker(vec!["prd".into(), "stg".into()]);
+    // いまの環境(stg)に当たっている。1 つ上へ動かして prd を選ぶ。
+    on_key(&mut a, key(KeyCode::Up));
+    on_key(&mut a, key(KeyCode::Enter));
+
+    assert_eq!(a.env.as_deref(), Some("prd"));
+    assert_eq!(a.pane, Pane::Idle, "別の環境の結果が残っている");
+    assert!(a.overlay.is_none());
+}
+
+/// ピッカーはいまの値に当たりを合わせて開く。
+#[test]
+fn a_picker_opens_on_the_current_value() {
+    let mut a = demo();
+    a.env = Some("stg".into());
+    a.open_env_picker(vec!["dev".into(), "prd".into(), "stg".into()]);
+    let Some(Overlay::Env { cursor, .. }) = &a.overlay else {
+        panic!("{:?}", a.overlay);
+    };
+    assert_eq!(*cursor, 2);
+}
+
+/// workspace は選んでも**その場では変えない**。
+/// 置き場所は起動時に 1 度だけ決める作りなので、起動し直すことを上へ返す。
+#[test]
+fn choosing_a_workspace_asks_to_restart_instead_of_switching_in_place() {
+    let mut a = demo();
+    a.open_workspace_picker(vec!["既定".into(), "demo".into()]);
+    on_key(&mut a, key(KeyCode::Char('j')));
+    let action = on_key(&mut a, key(KeyCode::Enter));
+    assert_eq!(action, Action::SwitchWorkspace("demo".into()));
+    // いまの workspace は変えない。変えると読んだ場所と書いた場所が食い違う。
+    assert_eq!(a.workspace, "vecta");
+}
+
+/// 変数一覧は**秘匿値を出さない**。伏せ字が入っていることを画面で確かめる。
+#[test]
+fn the_variable_list_never_shows_a_secret_value() {
+    let mut a = demo();
+    a.open_vars(vec![
+        var("base_url", "https://api.example.com", false),
+        var("access_token", "***", true),
+    ]);
+    let out = screen(&a, 100, 26);
+    assert!(out.contains("access_token"), "{out}");
+    assert!(out.contains("***"), "{out}");
+    assert!(out.contains("https://api.example.com"), "{out}");
+}
+
+/// コントロール: 秘匿でない値は**そのまま出る**。
+/// 出なければ、単に全部を伏せているだけで検査になっていない。
+#[test]
+fn control_a_non_secret_variable_is_shown_in_full() {
+    let mut a = demo();
+    a.open_vars(vec![var("page_size", "50", false)]);
+    assert!(screen(&a, 100, 26).contains("50"));
+}
+
+/// ダンプの入り切り。切れていることは画面に出す。
+#[test]
+fn the_dump_toggle_shows_when_it_is_off() {
+    let mut a = demo();
+    assert!(a.dump);
+    on_key(&mut a, key(KeyCode::Char('d')));
+    assert!(!a.dump);
+    assert!(screen(&a, 100, 26).contains("ダンプ切"), "画面に出ていない");
+    on_key(&mut a, key(KeyCode::Char('d')));
+    assert!(a.dump);
+    assert!(!screen(&a, 100, 26).contains("ダンプ切"));
+}
+
+/// かぶせものは下を消してから描く。消さないと後ろの文字が透ける。
+#[test]
+fn an_overlay_hides_what_is_behind_it() {
+    let mut a = demo();
+    // レスポンス欄いっぱいに目印を並べる。かぶさった行では見えなくなるはず。
+    let marker = "UNDERNEATH-MARKER";
+    a.pane = Pane::Failed(vec![marker; 40].join("\n"));
+    let without = screen(&a, 100, 26);
+    let behind = without.lines().filter(|l| l.contains(marker)).count();
+    assert!(behind > 0, "前提が崩れている:\n{without}");
+
+    a.open_workspace_picker(vec!["既定".into(), "demo".into()]);
+    let out = screen(&a, 100, 26);
+    assert!(out.contains("workspace を選ぶ"), "{out}");
+    let still = out.lines().filter(|l| l.contains(marker)).count();
+    assert!(
+        still < behind,
+        "後ろが透けている（{behind} 行 → {still} 行）:\n{out}"
+    );
+}

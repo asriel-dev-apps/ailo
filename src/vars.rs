@@ -38,7 +38,17 @@ impl Layer {
     }
 }
 
+/// 変数 1 つの、**外へ出してよい**説明。
 #[derive(Debug, Clone, PartialEq)]
+pub struct VarDescription {
+    pub name: String,
+    /// 秘匿値なら伏せ字になっている。
+    pub shown: String,
+    pub from: &'static str,
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Resolved {
     pub value: String,
     pub secret: bool,
@@ -101,6 +111,26 @@ impl Vars {
     }
 
     /// 秘匿として解決された値。マスクの literal に登録するために使う。
+    /// 一覧に出すための説明。**秘匿値は既に伏せてある。**
+    ///
+    /// 生の値を外へ出す口を作らないのがこの関数の目的。呼び出し側が
+    /// 「秘匿なら伏せる」を書く形にすると、書き忘れた場所から漏れる。
+    pub fn describe(&self) -> Vec<VarDescription> {
+        self.resolved
+            .iter()
+            .map(|(name, r)| VarDescription {
+                name: name.clone(),
+                shown: if r.secret {
+                    crate::redact::MASK.to_string()
+                } else {
+                    r.value.clone()
+                },
+                from: r.from,
+                secret: r.secret,
+            })
+            .collect()
+    }
+
     pub fn secret_values(&self) -> Vec<&str> {
         self.resolved
             .values()

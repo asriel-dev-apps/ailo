@@ -39,9 +39,14 @@ pub fn data_dir() -> Result<PathBuf> {
 /// **workspace は置き場所ごと分ける。** 設定・保存済みリクエスト・秘匿値の索引・
 /// ダンプが同じ木の下に揃うので、「いまどの workspace か」を 1 か所で決めれば
 /// 残りは自動的に付いてくる。
+/// workspace で分ける**前**の設定の土台。workspace の一覧を作るのに要る。
+pub fn config_base() -> Result<PathBuf> {
+    Ok(xdg("XDG_CONFIG_HOME", ".config")?.join("ailo"))
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     Ok(crate::workspace::scoped(
-        xdg("XDG_CONFIG_HOME", ".config")?.join("ailo"),
+        config_base()?,
         crate::workspace::current(),
     ))
 }

@@ -250,6 +250,27 @@ async fn saved(a: &RunArgs) -> Result<Outcome> {
     execute(saved_recipe(&a.name, &a.items)?, &a.common).await
 }
 
+/// いま効いている変数の一覧。**秘匿値は伏せた形で返る。**
+///
+/// TUI の変数一覧から使う。CLI と同じ層の組み方(`build_vars`)を通すので、
+/// 「画面で見えている値」と「送るときに使われる値」がずれない。
+pub fn variables(env: Option<&str>) -> Result<Vec<(vars::VarDescription, Option<String>)>> {
+    let cfg = Config::load()?;
+    let env = cfg.resolve_env(env);
+    let v = build_vars(&cfg, env.as_deref(), &[])?;
+    let expiry = match env.as_deref() {
+        Some(name) => State::load(name)?.expires_at,
+        None => BTreeMap::new(),
+    };
+    Ok(v.describe()
+        .into_iter()
+        .map(|d| {
+            let at = expiry.get(&d.name).cloned();
+            (d, at)
+        })
+        .collect())
+}
+
 /// 変数の層を優先順に組む。先頭が最優先。
 fn build_vars(cfg: &Config, env: Option<&str>, cli_vars: &[String]) -> Result<Vars> {
     let mut layers = Vec::new();
@@ -769,6 +790,19 @@ fn list_requests() -> Result<Outcome> {
         println!("{:<20} {:<6} {}{}", name, r.method, r.url, captured);
     }
     Ok(OK)
+}
+
+/// 使える環境の名前。設定にあるものと、秘匿値の索引にあるものを合わせる。
+pub fn environment_names() -> Result<Vec<String>> {
+    let cfg = Config::load()?;
+    let mut names: Vec<String> = cfg.environments().iter().map(|s| s.to_string()).collect();
+    for e in secrets::Index::load()?.environments() {
+        if !names.iter().any(|n| n == e) {
+            names.push(e.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 fn list_envs() -> Result<Outcome> {

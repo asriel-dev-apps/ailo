@@ -120,6 +120,73 @@ impl Scroll {
     }
 }
 
+/// 画面の上にかぶせるもの。**同時に 1 つだけ**。
+///
+/// 重ねられるようにすると、閉じ方が状態ごとに変わって迷子になる。
+/// どれが出ていても `Esc` で閉じる。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Overlay {
+    /// workspace を選ぶ。
+    Workspace { items: Vec<String>, cursor: usize },
+    /// 環境を選ぶ。
+    Env { items: Vec<String>, cursor: usize },
+    /// 変数の一覧。選ぶものではないのでカーソルは持たず、スクロールだけ。
+    Vars { rows: Vec<VarRow>, scroll: Scroll },
+}
+
+impl Overlay {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Overlay::Workspace { .. } => " workspace を選ぶ ",
+            Overlay::Env { .. } => " 環境を選ぶ ",
+            Overlay::Vars { .. } => " 変数 ",
+        }
+    }
+
+    pub fn move_cursor(&mut self, down: bool) {
+        let (items, cursor) = match self {
+            Overlay::Workspace { items, cursor } | Overlay::Env { items, cursor } => {
+                (items.len(), cursor)
+            }
+            Overlay::Vars { .. } => return,
+        };
+        if items == 0 {
+            return;
+        }
+        *cursor = if down {
+            (*cursor + 1) % items
+        } else {
+            (*cursor + items - 1) % items
+        };
+    }
+
+    /// いま当たっている項目。変数一覧には無い。
+    pub fn chosen(&self) -> Option<&str> {
+        match self {
+            Overlay::Workspace { items, cursor } | Overlay::Env { items, cursor } => {
+                items.get(*cursor).map(String::as_str)
+            }
+            Overlay::Vars { .. } => None,
+        }
+    }
+}
+
+/// 変数 1 つ。**値は「見せてよいものだけ」を入れて渡す。**
+///
+/// 秘匿かどうかの判断をここでやらない。作る側が済ませたものだけを持つので、
+/// 描画側が誤って生の値を出す経路が無い。
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarRow {
+    pub name: String,
+    /// 表示してよい値。秘匿値は既に伏せてある。
+    pub shown: String,
+    /// どこから来たか（`config` / `capture` / 環境変数 など）。
+    pub source: String,
+    /// 失効時刻。無ければ空。
+    pub expires: String,
+    pub secret: bool,
+}
+
 /// レスポンス欄の状態。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pane {
@@ -187,6 +254,10 @@ pub struct App {
     /// **描画側が毎回書き込む**、各ペインが占めている画面上の矩形。
     /// マウスのクリックをペインに対応づけるのに要る。
     pub areas: Areas,
+    /// かぶせて出ているもの。
+    pub overlay: Option<Overlay>,
+    /// ダンプを書くか。**画面から切れるようにする**（ユーザー要望 2026-09-09）。
+    pub dump: bool,
     /// マウスの捕捉が有効か。
     ///
     /// **切れるようにしておく。** 捕捉したままだと端末側のテキスト選択・コピーが
@@ -267,6 +338,8 @@ impl App {
             definition_max_top: 0,
             response_max_top: 0,
             areas: Areas::default(),
+            overlay: None,
+            dump: true,
             mouse: true,
         }
     }
@@ -312,6 +385,39 @@ impl App {
         if index < self.visible().len() && index != self.selected {
             self.selected = index;
             self.on_request_changed();
+        }
+    }
+
+    /// workspace のピッカーを開く。いまの workspace に当たりを合わせる。
+    pub fn open_workspace_picker(&mut self, items: Vec<String>) {
+        let cursor = items.iter().position(|n| *n == self.workspace).unwrap_or(0);
+        self.overlay = Some(Overlay::Workspace { items, cursor });
+    }
+
+    /// 環境のピッカーを開く。
+    pub fn open_env_picker(&mut self, items: Vec<String>) {
+        let cursor = self
+            .env
+            .as_deref()
+            .and_then(|e| items.iter().position(|n| n == e))
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::Env { items, cursor });
+    }
+
+    pub fn open_vars(&mut self, rows: Vec<VarRow>) {
+        self.overlay = Some(Overlay::Vars {
+            rows,
+            scroll: Scroll::default(),
+        });
+    }
+
+    /// 環境を変える。**変数もレスポンスも作り直しになる**ので、
+    /// 表示中のレスポンスは捨てる（別の環境の結果が残るのは誤読のもと）。
+    pub fn set_env(&mut self, name: String) {
+        if self.env.as_deref() != Some(name.as_str()) {
+            self.env = Some(name);
+            self.pane = Pane::Idle;
+            self.response_scroll.reset();
         }
     }
 

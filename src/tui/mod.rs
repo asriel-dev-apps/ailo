@@ -31,7 +31,7 @@ use crate::run::Outcome;
 use crate::shape;
 use crate::workspace;
 
-pub use model::{App, Entry, Focus, Mode, Pane, Scroll, Tab};
+pub use model::{App, Areas, Entry, Focus, Mode, Overlay, Pane, Scroll, Tab, VarRow};
 
 /// 押されたキーに対して何をするか。**端末を触らずに決める**ので、テストできる。
 #[derive(Debug, PartialEq)]
@@ -40,6 +40,9 @@ pub enum Action {
     Quit,
     Send,
     Edit(String),
+    /// workspace を切り替える。**同じプロセスでは切り替えられない**ので、
+    /// 自分自身を `-w <名前>` で起動し直す（下の `switch_workspace` を見よ）。
+    SwitchWorkspace(String),
 }
 
 pub async fn run(env: Option<String>) -> Result<Outcome> {
@@ -62,11 +65,39 @@ pub async fn run(env: Option<String>) -> Result<Outcome> {
     }
 
     let mut screen = Screen::enter()?;
-    let result = event_loop(&mut screen.terminal, &mut app, env.as_deref()).await;
+    let result = event_loop(&mut screen.terminal, &mut app).await;
     // `screen` の Drop がここで端末を戻す。エラーで抜けても同じ。
     drop(screen);
-    result?;
-    Ok(Outcome { code: 0 })
+
+    match result? {
+        Exit::Quit => Ok(Outcome { code: 0 }),
+        Exit::Switch(name) => switch_workspace(&name),
+    }
+}
+
+/// workspace を変えて起動し直す。
+///
+/// **同じプロセスでは切り替えられない。** 置き場所は起動時に 1 度だけ決める作りで
+/// (`workspace::init` の `OnceLock`)、途中で変えると読んだ場所と書いた場所が
+/// 食い違う。その不変条件を崩すより、自分自身を `-w <名前>` で起動し直すほうが安い。
+///
+/// **端末は既に戻してから呼ぶこと。** `exec` は戻ってこないので、後始末の機会が無い。
+fn switch_workspace(name: &str) -> Result<Outcome> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("自分自身の場所が分かりません")?;
+    let mut cmd = std::process::Command::new(exe);
+    // 既定は名前を持たないので、`-w` を付けずに起動する。
+    if name != crate::workspace::Workspace::Default.label() {
+        cmd.arg("-w").arg(name);
+    }
+    cmd.arg("tui");
+    // `AILO_WORKSPACE` が残っていると `-w` の無い既定側で効いてしまう。
+    cmd.env_remove(crate::workspace::ENV_VAR);
+
+    // 戻ってきたということは起動できなかったということ。
+    let err = cmd.exec();
+    Err(anyhow::Error::new(err).context("起動し直せませんでした"))
 }
 
 fn load_entries() -> Result<Vec<Entry>> {
@@ -173,7 +204,14 @@ impl Drop for RawGuard {
     }
 }
 
-async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Result<()> {
+/// イベントループの抜け方。
+pub enum Exit {
+    Quit,
+    /// workspace を変えて起動し直す。
+    Switch(String),
+}
+
+async fn event_loop(terminal: &mut Term, app: &mut App) -> Result<Exit> {
     loop {
         terminal.draw(|f| view::draw(f, app))?;
 
@@ -200,15 +238,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
 
         match action {
             Action::None => {}
-            Action::Quit => return Ok(()),
+            Action::Quit => return Ok(Exit::Quit),
             Action::Send => {
                 let Some(name) = app.selected().map(|e| e.name.clone()) else {
                     continue;
                 };
                 app.pane = Pane::Sending;
                 terminal.draw(|f| view::draw(f, app))?;
-                app.pane = send_watching_for_cancel(&name, env).await?;
+                app.pane = send_watching_for_cancel(&name, app.env.as_deref(), app.dump).await?;
             }
+            Action::SwitchWorkspace(name) => return Ok(Exit::Switch(name)),
             Action::Edit(name) => {
                 // エディタは端末を占有する。**必ず画面を明け渡してから起動する。**
                 // 明け渡さずに起動すると、vim が alternate screen の上に描いて
@@ -225,7 +264,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, env: Option<&str>) -> Re
             }
         }
         if app.quit {
-            return Ok(());
+            return Ok(Exit::Quit);
         }
     }
 }
@@ -237,6 +276,10 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.quit = true;
         return Action::Quit;
+    }
+
+    if app.overlay.is_some() {
+        return on_overlay_key(app, key);
     }
 
     if app.mode == Mode::Filter {
@@ -276,6 +319,32 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         // マウス捕捉の入り切り。切ると端末のテキスト選択が戻る。
         KeyCode::Char('m') => {
             app.mouse = !app.mouse;
+            Action::None
+        }
+        // 一覧を作るのに設定を読む。読めなければ開かず、理由をレスポンス欄に出す。
+        KeyCode::Char('w') => {
+            match workspace_names() {
+                Ok(items) => app.open_workspace_picker(items),
+                Err(e) => app.pane = Pane::Failed(format!("{e}")),
+            }
+            Action::None
+        }
+        KeyCode::Char('E') => {
+            match crate::run::environment_names() {
+                Ok(items) => app.open_env_picker(items),
+                Err(e) => app.pane = Pane::Failed(format!("{e}")),
+            }
+            Action::None
+        }
+        KeyCode::Char('v') => {
+            match var_rows(app.env.as_deref()) {
+                Ok(rows) => app.open_vars(rows),
+                Err(e) => app.pane = Pane::Failed(format!("{e}")),
+            }
+            Action::None
+        }
+        KeyCode::Char('d') => {
+            app.dump = !app.dump;
             Action::None
         }
         KeyCode::Enter => Action::Send,
@@ -355,6 +424,67 @@ pub fn on_mouse(app: &mut App, m: MouseEvent) -> Action {
 
 /// ホイール 1 刻みで動く行数。
 const WHEEL: u16 = 3;
+
+/// 選べる workspace の名前。既定は表示名で出す。
+fn workspace_names() -> Result<Vec<String>> {
+    let base = crate::paths::config_base()?;
+    Ok(workspace::list(&base)
+        .into_iter()
+        .map(|w| w.label().to_string())
+        .collect())
+}
+
+/// 変数一覧の行。**値は `run::variables` の時点で伏せてある。**
+fn var_rows(env: Option<&str>) -> Result<Vec<VarRow>> {
+    Ok(crate::run::variables(env)?
+        .into_iter()
+        .map(|(d, expires)| VarRow {
+            name: d.name,
+            shown: d.shown,
+            source: d.from.to_string(),
+            expires: expires.unwrap_or_default(),
+            secret: d.secret,
+        })
+        .collect())
+}
+
+/// かぶせて出ているものへのキー。**`Esc` はどれでも閉じる。**
+fn on_overlay_key(app: &mut App, key: KeyEvent) -> Action {
+    let Some(overlay) = app.overlay.as_mut() else {
+        return Action::None;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.overlay = None;
+        }
+        KeyCode::Char('j') | KeyCode::Down => match overlay {
+            Overlay::Vars { rows, scroll } => {
+                let max = rows.len().saturating_sub(1) as u16;
+                scroll.down(1, max);
+            }
+            other => other.move_cursor(true),
+        },
+        KeyCode::Char('k') | KeyCode::Up => match overlay {
+            Overlay::Vars { scroll, .. } => scroll.up(1),
+            other => other.move_cursor(false),
+        },
+        KeyCode::Enter => {
+            let chosen = overlay.chosen().map(str::to_string);
+            let kind = app.overlay.take();
+            match (kind, chosen) {
+                (Some(Overlay::Workspace { .. }), Some(name)) => {
+                    return Action::SwitchWorkspace(name);
+                }
+                (Some(Overlay::Env { .. }), Some(name)) => {
+                    app.set_env(name);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    Action::None
+}
 
 /// フォーカス中のペインに配るキー。
 ///
@@ -459,8 +589,8 @@ fn with_terminal_released<T>(terminal: &mut Term, f: impl FnOnce() -> T) -> Resu
 /// `biased;` を付けて送信のほうを先に見る。既定のランダム順だと、応答を受け取って
 /// ダンプも capture も書き終えた結果を捨てて「中断しました」と出すことがある
 /// （応答受信後の処理に await が無いので、完了＝全部書き終えている）。
-async fn send_watching_for_cancel(name: &str, env: Option<&str>) -> Result<Pane> {
-    let sending = send(name, env);
+async fn send_watching_for_cancel(name: &str, env: Option<&str>, dump: bool) -> Result<Pane> {
+    let sending = send(name, env, dump);
     tokio::pin!(sending);
     loop {
         tokio::select! {
@@ -502,9 +632,10 @@ fn wants_cancel() -> Result<bool> {
 ///
 /// **CLI と同じ `run::send_saved` を通す。** ここで独自に組み立てると、
 /// マスク・ダンプ・capture のどれかが TUI 経由でだけ効かなくなる。
-async fn send(name: &str, env: Option<&str>) -> Pane {
+async fn send(name: &str, env: Option<&str>, dump: bool) -> Pane {
     let common = CommonArgs {
         env: env.map(str::to_string),
+        no_dump: !dump,
         ..CommonArgs::for_tui()
     };
     let mut notes = Vec::new();

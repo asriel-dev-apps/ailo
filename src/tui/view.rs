@@ -6,11 +6,11 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use super::model::{display_url, tab_lines, App, Focus, Mode, Pane, Tab};
+use super::model::{display_url, tab_lines, App, Focus, Mode, Overlay, Pane, Tab};
 
 /// フォーカス中のペインの枠。
 ///
@@ -73,6 +73,103 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.areas.list = cols[0];
     sidebar(f, app, cols[0]);
     detail(f, app, cols[1]);
+    overlay(f, app);
+}
+
+/// 中央にかぶせる矩形。画面の縦横の割合で決める。
+fn centred(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let w = (area.width * pct_w / 100).clamp(20, area.width);
+    let h = (area.height * pct_h / 100).clamp(3, area.height);
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn overlay(f: &mut Frame, app: &mut App) {
+    let Some(overlay) = app.overlay.as_mut() else {
+        return;
+    };
+    let area = centred(f.area(), 60, 60);
+    // **下を消してから描く。** 消さないと、後ろの文字が隙間から透ける。
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(overlay.title())
+        .border_style(Style::default().fg(Color::Cyan));
+
+    match overlay {
+        Overlay::Workspace { items, cursor } | Overlay::Env { items, cursor } => {
+            if items.is_empty() {
+                f.render_widget(
+                    Paragraph::new("ありません")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .block(block),
+                    area,
+                );
+                return;
+            }
+            let list = List::new(
+                items
+                    .iter()
+                    .map(|n| ListItem::new(n.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            let mut state = ListState::default();
+            state.select(Some(*cursor));
+            f.render_stateful_widget(list, area, &mut state);
+        }
+        Overlay::Vars { rows, scroll } => {
+            let lines: Vec<Line> = if rows.is_empty() {
+                vec![Line::from(Span::styled(
+                    "この環境に変数はありません",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                rows.iter()
+                    .map(|r| {
+                        let mut spans = vec![
+                            Span::styled(
+                                format!("{:<20}", r.name),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            // 秘匿値は伏せ字が入っている。ここで生の値に触る経路は無い。
+                            Span::styled(
+                                format!("{:<24}", r.shown),
+                                if r.secret {
+                                    Style::default().fg(Color::Yellow)
+                                } else {
+                                    Style::default()
+                                },
+                            ),
+                            Span::styled(
+                                format!(" {}", r.source),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ];
+                        if !r.expires.is_empty() {
+                            spans.push(Span::styled(
+                                format!("  期限 {}", r.expires),
+                                Style::default().fg(Color::DarkGray),
+                            ));
+                        }
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
+            let max = (lines.len() as u16).saturating_sub(area.height.saturating_sub(2));
+            scroll.clamp(max);
+            f.render_widget(
+                Paragraph::new(lines).scroll((scroll.top(), 0)).block(block),
+                area,
+            );
+        }
+    }
 }
 
 fn header(app: &App) -> Paragraph<'_> {
@@ -86,6 +183,14 @@ fn header(app: &App) -> Paragraph<'_> {
     ];
     // **切れていることだけを出す。** 既定は入りなので、入っているときに
     // 出しても場所を食うだけ。切れているのに気づかないほうが困る。
+    // **切れているものだけを出す。** 既定のままなら出しても場所を食うだけで、
+    // 既定から外れていることに気づかないほうが困る。
+    if !app.dump {
+        spans.push(Span::styled(
+            "  ダンプ切",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     if !app.mouse {
         spans.push(Span::styled(
             "  マウス切",
@@ -101,7 +206,7 @@ fn header(app: &App) -> Paragraph<'_> {
 /// 切れていた。消えるのが**抜け方**なので、初見の利用者は raw モードの画面に
 /// 取り残される。**途中で切れた案内は、無いより悪い。**
 const NORMAL_HINTS: [&str; 4] = [
-    " Tab ペイン   ↑↓ 選択/スクロール   Enter 送信   / 絞り込み   e 編集   m マウス   q 終了",
+    " Tab ペイン  ↑↓ 移動  Enter 送信  / 絞込  w ws  E 環境  v 変数  d ダンプ  e 編集  q 終了",
     " Tab ペイン   ↑↓ 移動   Enter 送信   e 編集   q 終了",
     " Tab ペイン   Enter 送信   q 終了",
     " q 終了",

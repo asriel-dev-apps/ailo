@@ -72,6 +72,27 @@ pub fn current() -> &'static Workspace {
     RESOLVED.get().unwrap_or(&FALLBACK)
 }
 
+/// 使える workspace を並べる。既定が先頭で、あとは名前順。
+///
+/// **`workspaces/` の下にあるディレクトリを見る。** 設定に一覧を持たないのは、
+/// 置き場所が正本だから。持つと、手で作ったディレクトリが一覧に出ないことになる。
+pub fn list(config_base: &Path) -> Vec<Workspace> {
+    let mut out = vec![Workspace::Default];
+    let Ok(entries) = std::fs::read_dir(config_base.join("workspaces")) else {
+        return out;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        // 名前として通らないディレクトリは出さない。選んでも使えない。
+        .filter(|n| validate(n).is_ok())
+        .collect();
+    names.sort();
+    out.extend(names.into_iter().map(Workspace::Named));
+    out
+}
+
 fn resolve(explicit: Option<&str>, from: &Path) -> Result<Workspace> {
     if let Some(name) = explicit {
         return named(name, "--workspace");
