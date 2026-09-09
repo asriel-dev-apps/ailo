@@ -1,0 +1,7 @@
+# examples/requests.toml が使う変数。
+
+default_env = "demo"
+
+[env.demo.vars]
+gh = "https://api.github.com"
+hb = "https://httpbin.org"

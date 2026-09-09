@@ -1,0 +1,83 @@
+# 試すための保存済みリクエスト一式。
+#
+# 認証の要らない公開 API だけを使う。そのままコピーして動く。
+#   cp examples/requests.toml ~/.config/ailo/workspaces/demo/requests.toml
+#   cp examples/config.toml   ~/.config/ailo/workspaces/demo/config.toml
+#   ailo -w demo tui
+#
+# `{{gh}}` と `{{hb}}` は config.toml 側で定義してある。
+
+# --- レスポンスが大きい。`--shape` と `--depth` の効きを見る -----------------
+
+[requests.gh-issues]
+method = "GET"
+url = "{{gh}}/repos/cli/cli/issues"
+items = ["Accept: application/vnd.github+json", "per_page==5"]
+
+# 幅の広いオブジェクト。`--depth 2` で切ると読みやすくなる。
+[requests.gh-repo]
+method = "GET"
+url = "{{gh}}/repos/cli/cli"
+items = ["Accept: application/vnd.github+json"]
+
+# --- リクエストが反響して返る。何を送ったかがそのまま見える -----------------
+
+[requests.echo]
+method = "POST"
+url = "{{hb}}/post"
+items = ["name=taro", "age:=30", "tags:=[\"a\",\"b\"]", "X-Trace: demo-1"]
+
+[requests.echo-form]
+method = "POST"
+url = "{{hb}}/post"
+form = true
+items = ["name=taro", "age=30"]
+
+[requests.echo-query]
+method = "GET"
+url = "{{hb}}/get"
+items = ["limit==50", "sort==name"]
+
+# --- 失敗の見え方 -----------------------------------------------------------
+
+# TUI で Enter を押してから Esc（または Ctrl-C）で打ち切れる。
+[requests.slow]
+method = "GET"
+url = "{{hb}}/delay/8"
+
+[requests.not-found]
+method = "GET"
+url = "{{hb}}/status/404"
+
+[requests.server-error]
+method = "GET"
+url = "{{hb}}/status/500"
+
+# --- capture: レスポンスの値を変数にして、次のリクエストで使う ---------------
+
+# httpbin は送った本文をそのまま返すので、ログインの往復を認証なしで真似できる。
+# 取り出した値は `{{demo_token}}` として次のリクエストから使える。
+[requests.fake-login]
+method = "POST"
+url = "{{hb}}/post"
+items = ["grant_type=client_credentials"]
+
+[requests.fake-login.capture]
+demo_token = ".json.grant_type"
+
+# 上で取った値をヘッダに載せて送る。httpbin が受け取ったヘッダを返すので、
+# 変数がちゃんと展開されて届いたことを目で確かめられる。
+[requests.use-token]
+method = "GET"
+url = "{{hb}}/headers"
+items = ["Authorization: Bearer {{demo_token}}"]
+
+# --- 本文が JSON でない場合 -------------------------------------------------
+
+[requests.plain-text]
+method = "GET"
+url = "{{hb}}/robots.txt"
+
+[requests.an-image]
+method = "GET"
+url = "{{hb}}/image/png"

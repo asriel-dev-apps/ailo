@@ -57,6 +57,31 @@ cargo install --path .
 
 Rust 1.87 以上が要る。macOS と Linux で動く。
 
+`cargo install` の出力先は `~/.cargo/bin`。PATH に無ければ通す（zsh の例）:
+
+```bash
+echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
+```
+
+更新は同じコマンドをもう一度。`--force` を付けると入れ替わる。
+
+```bash
+cargo install --git https://github.com/asriel-dev-apps/ailo --force
+```
+
+### まず試す
+
+認証の要らない公開 API だけを使った一式が `examples/` にある。既定の置き場所を
+汚さないよう `demo` という workspace に入れて使う。
+
+```bash
+mkdir -p ~/.config/ailo/workspaces/demo
+cp examples/requests.toml examples/config.toml ~/.config/ailo/workspaces/demo/
+ailo -w demo tui
+```
+
+中身と、ひととおり触るためのコマンドは `examples/README.md` にある。
+
 ### Claude Code から使う
 
 同梱の skill を入れると、エージェントが `curl` ではなく ailo を選ぶようになる。
