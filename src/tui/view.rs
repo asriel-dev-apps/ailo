@@ -109,6 +109,41 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     overlay(f, app);
 }
 
+/// エンドポイント欄の高さ。**URL が折り返す分だけ伸ばす。**
+///
+/// 固定 3 行（＝中身 1 行）にしていたとき、幅より長い URL は折り返し先が欄の外に
+/// なり、**画面から丸ごと消えていた**（`GET` だけが残る）。狭い端末では普通に起きる。
+/// 伸ばしすぎてもレスポンス欄を潰すので、中身は 3 行まで。
+fn endpoint_height(app: &App, width: u16) -> u16 {
+    const MAX_INNER: u16 = 3;
+    let Some(entry) = app.selected() else {
+        return 3;
+    };
+    let line = endpoint_line(&entry.req, &app.known_vars);
+    let inner = u16::try_from(
+        Paragraph::new(line)
+            .wrap(Wrap { trim: true })
+            .line_count(width.saturating_sub(2)),
+    )
+    .unwrap_or(MAX_INNER);
+    inner.clamp(1, MAX_INNER) + 2
+}
+
+/// エンドポイント欄に描く 1 行。**高さの計算と描画で同じものを使う。**
+fn endpoint_line(req: &crate::config::SavedRequest, known: &[String]) -> Line<'static> {
+    Line::from(
+        vec![Span::styled(
+            format!("{} ", req.method),
+            Style::default()
+                .fg(method_colour(&req.method))
+                .add_modifier(Modifier::BOLD),
+        )]
+        .into_iter()
+        .chain(with_vars(&display_url(&req.url), known))
+        .collect::<Vec<_>>(),
+    )
+}
+
 /// 中央にかぶせる矩形。画面の縦横の割合で決める。
 ///
 /// **`clamp` を使わない。** 端末が下限より小さいと `min > max` で `clamp` は panic する。
@@ -343,7 +378,7 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(endpoint_height(app, area.width)),
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Percentage(45),
@@ -368,19 +403,9 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 1. エンドポイント
     f.render_widget(
-        Paragraph::new(Line::from(
-            vec![Span::styled(
-                format!("{} ", entry.req.method),
-                Style::default()
-                    .fg(method_colour(&entry.req.method))
-                    .add_modifier(Modifier::BOLD),
-            )]
-            .into_iter()
-            .chain(with_vars(&display_url(&entry.req.url), &app.known_vars))
-            .collect::<Vec<_>>(),
-        ))
-        .wrap(Wrap { trim: true })
-        .block(framed(" エンドポイント ", app.focus == Focus::Endpoint)),
+        Paragraph::new(endpoint_line(&entry.req, &app.known_vars))
+            .wrap(Wrap { trim: true })
+            .block(framed(" エンドポイント ", app.focus == Focus::Endpoint)),
         rows[0],
     );
 

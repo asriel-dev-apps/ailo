@@ -1707,6 +1707,31 @@ fn restarting_for_a_new_workspace_keeps_the_chosen_environment() {
     assert_eq!(super::restart_args("既定", None), ["-w", "", "tui"]);
 }
 
+/// 幅より長い URL が画面から消えない。
+///
+/// エンドポイント欄を固定 3 行（中身 1 行）にしていたとき、折り返した先が欄の外に
+/// なり、**`GET` だけが残って URL が丸ごと消えていた**。狭い端末では普通に起きる。
+#[test]
+fn a_url_longer_than_the_pane_is_still_visible() {
+    let long = "{{base_url}}/repos/cli/cli/issues?state=open&per_page={{page_size}}&sort=created";
+    let mut a = App::new(
+        vec![Entry {
+            name: "issues".into(),
+            req: req("GET", long, &[]),
+        }],
+        "既定",
+        None,
+    );
+    a.known_vars = vec!["base_url".into()];
+    for (w, h) in [(46, 24), (100, 26)] {
+        let out = screen(&a, w, h);
+        assert!(
+            out.contains("/repos/cli/cli/issues"),
+            "{w}x{h} で URL が消えている:\n{out}"
+        );
+    }
+}
+
 /// 設定の `redact_headers` は、画面・編集器のガード・保存の門にも効く。
 ///
 /// `record_last` だけが設定を読んでいたときは、`X-Tenant` を秘匿指定しても
