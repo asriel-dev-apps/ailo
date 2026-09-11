@@ -1732,6 +1732,38 @@ fn a_url_longer_than_the_pane_is_still_visible() {
     }
 }
 
+/// 改行して書いた本文は、改行したまま画面に出る。
+///
+/// 1 項目 = 1 行として描いていたときは、複数行の JSON 本文が 1 行に潰れていた。
+/// 件数バッジは項目の数のままにする（本文は何行でも 1 項目）。
+#[test]
+fn a_multi_line_body_keeps_its_line_breaks_on_screen() {
+    let mut r = req("POST", "http://x/", &[]);
+    r.raw = Some("{\n  \"name\": \"taro\",\n  \"role\": \"editor\"\n}".into());
+    let mut a = App::new(
+        vec![Entry {
+            name: "create".into(),
+            req: r.clone(),
+        }],
+        "既定",
+        None,
+    );
+    a.set_tab(Tab::Body);
+    let out = screen(&a, 100, 26);
+    // **別々の行に出ていることを見る。** 同じ行に並んでいても「含む」は真になるので、
+    // それでは 1 行に潰れた状態と見分けが付かない（実際、最初に書いたときは
+    // 直す前のコードでも通ってしまった）。
+    let row = |needle: &str| {
+        out.lines()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` が画面に無い:\n{out}"))
+    };
+    let (name, role) = (row("\"name\""), row("\"role\""));
+    assert_ne!(name, role, "本文が 1 行に潰れている:\n{out}");
+    assert_eq!(role, name + 1, "行の順番が変わっている:\n{out}");
+    assert_eq!(tab_count(&r, Tab::Body), 1, "本文は何行でも 1 項目");
+}
+
 /// 設定の `redact_headers` は、画面・編集器のガード・保存の門にも効く。
 ///
 /// `record_last` だけが設定を読んでいたときは、`X-Tenant` を秘匿指定しても

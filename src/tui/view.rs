@@ -450,6 +450,10 @@ fn detail(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         lines
             .into_iter()
+            // **改行を含む項目は行に割る。** `--raw` の本文は 1 項目だが複数行ある。
+            // 割らないと 1 本の `Line` になり、改行が消えて 1 行に潰れて出る。
+            // 件数バッジは項目の数なので、割るのは描くときだけ。
+            .flat_map(|l| l.split('\n').map(str::to_string).collect::<Vec<_>>())
             .map(|l| Line::from(with_vars(&l, &app.known_vars)))
             .collect()
     };
