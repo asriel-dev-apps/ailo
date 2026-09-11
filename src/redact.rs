@@ -524,8 +524,14 @@ fn mask_unparsed_item(line: &str) -> Masked {
 pub fn mask_body(raw: &str) -> Masked {
     if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
         let found = mask_json_in_place(&mut value);
+        // **落とすものが無いなら、書いたとおりに返す。** 常に serde_json で組み直すと、
+        // 定義に改行して書いた本文が 1 行に潰れて画面に出る。読むための画面で
+        // 読みにくくしていた。落としたときだけ、組み直した形になる。
+        if found.is_none() {
+            return Masked::clean(raw);
+        }
         return Masked {
-            text: serde_json::to_string(&value).unwrap_or_else(|_| MASK.to_string()),
+            text: serde_json::to_string_pretty(&value).unwrap_or_else(|_| MASK.to_string()),
             found,
         };
     }
@@ -837,6 +843,18 @@ mod tests {
             let found = m.found.unwrap_or_else(|| panic!("保存の門が素通り: {url}"));
             assert!(found.blocks_saving(), "{url}");
         }
+    }
+
+    /// 落とすものが無い本文は、書いたとおりに出す。
+    ///
+    /// 常に `serde_json` で組み直していたときは、定義に改行して書いた JSON が
+    /// 画面で 1 行に潰れていた。読むための画面で読みにくくしていた。
+    #[test]
+    fn a_body_with_nothing_to_hide_is_shown_exactly_as_written() {
+        let raw = "{\n  \"name\": \"taro\",\n  \"role\": \"editor\"\n}";
+        let m = mask_body(raw);
+        assert!(m.found.is_none());
+        assert_eq!(m.text, raw, "書いたとおりに出ていない");
     }
 
     /// 落とすのは値。**名前は残す**（何が落ちたか分からないと直せない）。
