@@ -181,7 +181,7 @@ impl Config {
 
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Some(text) = read_or_empty(&path)? else {
             return Ok(Self::default());
         };
         toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))
@@ -232,6 +232,23 @@ impl Config {
     }
 }
 
+/// 無いファイルは「空」、**読めないファイルはエラー**。
+///
+/// 両方を `Ok(default)` にしていたせいで、非 UTF-8 や権限で読めない
+/// `requests.toml` が「まだ何も無い」と同じ扱いになり、次の保存が
+/// **既存の定義を全部消して 1 件で置き換えて**いた（`write_private` は
+/// tmp → rename なので、対象に書き込み権が無くても置き換わる）。
+/// 設定側も同じで、読めない `config.toml` は `redact_headers` が
+/// 空のまま通り、秘匿指定が黙って外れる。
+fn read_or_empty(path: &std::path::Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::from(e))
+            .with_context(|| format!("{} を読めません", paths::tildify(path))),
+    }
+}
+
 // -------------------------------------------------------------- requests.toml
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -265,7 +282,7 @@ impl Requests {
 
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
-        let Ok(text) = fs::read_to_string(&path) else {
+        let Some(text) = read_or_empty(&path)? else {
             return Ok(Self::default());
         };
         toml::from_str(&text).with_context(|| format!("{} を読めません", paths::tildify(&path)))

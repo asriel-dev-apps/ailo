@@ -2037,3 +2037,23 @@ fn selecting_a_name_we_do_not_have_leaves_the_filter_alone() {
     assert_eq!(a.filter, "t");
     assert_eq!(a.selected().unwrap().name, "two");
 }
+
+#[test]
+fn a_new_request_is_saved_without_an_overwrite_target() {
+    // ここが `Some` に化けると、新規が「編集中に書き換えられました」で
+    // 永久に保存できなくなる。逆に既存で `None` になると、他所の書き換えを
+    // 黙って踏み潰す。どちらも全テスト緑のまま通るので、ここで押さえる。
+    let new =
+        super::editor::Editing::open("", &SavedRequest::default(), super::editor::Target::New);
+    assert!(super::existing_for(&new).is_none());
+
+    let existing = super::editor::Editing::open(
+        "login",
+        &req("POST", "http://x/login", &[]),
+        super::editor::Target::Whole,
+    );
+    assert_eq!(
+        super::existing_for(&existing).map(|r| r.url),
+        Some("http://x/login".to_string())
+    );
+}

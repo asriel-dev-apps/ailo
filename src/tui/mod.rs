@@ -26,7 +26,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::prelude::{CrosstermBackend, Terminal};
 
 use crate::cli::CommonArgs;
-use crate::config::{Config, Requests};
+use crate::config::{Config, Requests, SavedRequest};
 use crate::dump;
 use crate::run::Outcome;
 use crate::shape;
@@ -386,8 +386,13 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         }
         // 新しいリクエストを作る。名前も編集器の中の `name = "..."` で決める。
         KeyCode::Char('n') => {
-            // **`hidden_on_screen` は通さない。** 下書きは定型文で、
-            // 秘匿値が入りようがない（保存の門は `save_edited` が持っている）。
+            // **`hidden_on_screen` は通さない。** 開く時点の下書きは定型文で、
+            // 見せてはいけない値が入りようがない（既存を開く `open_editor` と違う）。
+            //
+            // **保存の門はこれより狭い。** `check_definition` は `Assigned`
+            // だけを拒み、`Suspected`（`"my password is ..."` のような散文）は
+            // 通す。意図した閾値だが、その結果ここで作ったものが
+            // `e` / `T` では二度と開けなくなることがある（CLI で直せる）。
             app.editing = Some(Editing::open(
                 "",
                 &crate::config::SavedRequest::default(),
@@ -482,9 +487,7 @@ fn save_editing(app: &mut App) -> Result<()> {
     let Some(editing) = app.editing.as_mut() else {
         return Ok(());
     };
-    // **新規作成は `opened_from` を渡さない。** 既存と同じ比較に載せると、
-    // 「まだ無い」が「編集中に書き換えられた」に化ける。
-    let existing = (editing.target != Target::New).then(|| editing.opened_from.clone());
+    let existing = existing_for(editing);
     let outcome = editing.applied().and_then(|(name, req)| {
         crate::run::save_edited(&name, existing.as_ref(), req)?;
         Ok(name)
@@ -510,6 +513,15 @@ fn save_editing(app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 保存のとき「上書きする相手」として渡すもの。
+///
+/// **新規作成は渡さない。** 既存と同じ比較に載せると、「まだ無い」が
+/// 「編集中に書き換えられた」に化ける。逆に `Some` を落とすと、
+/// 他所の書き換えを黙って踏み潰す。
+fn existing_for(editing: &Editing) -> Option<SavedRequest> {
+    (editing.target != Target::New).then(|| editing.opened_from.clone())
 }
 
 /// 選べる workspace の名前。既定は表示名で出す。
