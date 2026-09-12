@@ -25,6 +25,9 @@ pub enum Target {
     Raw,
     /// 定義まるごと（TOML）。
     Whole,
+    /// まだ無いリクエストを作る。**名前も編集中の TOML から来る**（`name = "..."`）。
+    /// 名前を聞く小さな入力欄を別に作らないための形。
+    New,
 }
 
 impl Target {
@@ -34,6 +37,7 @@ impl Target {
             Target::Items(tab) => format!(" {} を編集 ", tab.label()),
             Target::Raw => " 本文を編集 ".into(),
             Target::Whole => " 定義まるごとを編集（TOML）".into(),
+            Target::New => " 新しいリクエスト（TOML）".into(),
         }
     }
 
@@ -104,9 +108,19 @@ impl Editing {
         self.area.lines().to_vec()
     }
 
-    /// 編集した中身を定義に畳み込む。**書き込みはしない。**
-    pub fn apply(&self) -> Result<SavedRequest> {
-        apply(&self.opened_from, self.target, &self.lines())
+    /// 保存する名前と定義。**書き込みはしない。**
+    ///
+    /// `New` のときだけ名前も編集中の TOML から来るので、名前と定義をここで一緒に返す。
+    /// 呼ぶ側が `Editing::name` を見て分岐すると、New だけ別の名前で保存される穴になる。
+    pub fn applied(&self) -> Result<(String, SavedRequest)> {
+        if self.target == Target::New {
+            let (name, req) = parse_new(&self.lines().join("\n"))?;
+            return Ok((name, req));
+        }
+        Ok((
+            self.name.clone(),
+            apply(&self.opened_from, self.target, &self.lines())?,
+        ))
     }
 }
 
@@ -126,8 +140,21 @@ fn initial_text(req: &SavedRequest, target: Target) -> Vec<String> {
             .lines()
             .map(str::to_string)
             .collect(),
+        Target::New => NEW_TEMPLATE.lines().map(str::to_string).collect(),
     }
 }
+
+/// 新規作成の下書き。**送れる最小限だけ**を置く。項目を並べて見せると、
+/// 消す作業から始まることになる。
+const NEW_TEMPLATE: &str = r#"name = "new-request"
+method = "GET"
+url = "https://example.com/"
+
+# items = ["Accept: application/json", "limit==50"]
+# raw = "{}"
+# [capture]
+# token = ".access_token"
+"#;
 
 /// そのタブに属する item だけを取り出す。
 ///
@@ -206,6 +233,24 @@ pub fn apply(base: &SavedRequest, target: Target, lines: &[String]) -> Result<Sa
         Target::Whole => {
             out = toml::from_str(&lines.join("\n")).context("定義として読めません")?;
         }
+        // **New は名前を持つので、ここ（名前の無い経路）には来ない。**
+        // `_` で受けると、将来の呼び出しが名前を落としたまま通ってしまう。
+        Target::New => anyhow::bail!("新規作成は `Editing::applied` を通してください"),
     }
     Ok(out)
+}
+
+/// `name = "..."` + 定義。**`serde(flatten)` は使わない**（toml では入れ子の
+/// テーブルで挙動が怪しい）。`name` を抜いた残りをそのまま定義として読む。
+pub fn parse_new(text: &str) -> Result<(String, SavedRequest)> {
+    let mut table: toml::Table = text.parse().context("定義として読めません")?;
+    let name = table
+        .remove("name")
+        .context("1 行目に `name = \"<名前>\"` を書いてください")?;
+    let name = name
+        .as_str()
+        .context("`name` は文字列で書いてください")?
+        .to_string();
+    let req: SavedRequest = table.try_into().context("定義として読めません")?;
+    Ok((name, req))
 }

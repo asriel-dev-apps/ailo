@@ -288,8 +288,8 @@ fn header(app: &App) -> Paragraph<'_> {
 /// 切れていた。消えるのが**抜け方**なので、初見の利用者は raw モードの画面に
 /// 取り残される。**途中で切れた案内は、無いより悪い。**
 const NORMAL_HINTS: [&str; 4] = [
-    " Tab ペイン  ↑↓ 移動  Enter 送信  / 絞込  w ws  E 環境  v 変数  d ダンプ  e 編集  q 終了",
-    " Tab ペイン   ↑↓ 移動   Enter 送信   e 編集   q 終了",
+    " Tab ペイン  ↑↓ 移動  Enter 送信  / 絞込  w ws  E 環境  v 変数  d ダンプ  n 新規  e 編集  q 終了",
+    " Tab ペイン   ↑↓ 移動   Enter 送信   n 新規   e 編集   q 終了",
     " Tab ペイン   Enter 送信   q 終了",
     " q 終了",
 ];
@@ -348,7 +348,7 @@ fn sidebar(f: &mut Frame, app: &mut App, area: Rect) {
 
     if items.is_empty() {
         let hint = if app.filter.is_empty() {
-            "ありません\n\n`ailo new <名前>` で\n定義できます"
+            "ありません\n\n`n` で作れます\n(`ailo new <名前>` でも)"
         } else {
             "一致しません"
         };

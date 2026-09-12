@@ -529,6 +529,21 @@ impl App {
         self.clamp();
     }
 
+    /// 名前で選び直す。**一覧は名前順なので、1 件増えると番号が別のものを指す。**
+    /// 絞り込みで隠れているときは、絞り込みを外してから選ぶ（作ったものが
+    /// どこにも出ないほうが分からない）。
+    pub fn select_by_name(&mut self, name: &str) {
+        if !self.visible().iter().any(|e| e.name == name) {
+            self.clear_filter();
+        }
+        if let Some(i) = self.visible().iter().position(|e| e.name == name) {
+            // `select_visible` は同じ番号だと何もしない。番号が同じまま中身が
+            // 変わっていることがあるので、ここでは直に入れて通知する。
+            self.selected = i;
+            self.on_request_changed();
+        }
+    }
+
     pub fn clear_filter(&mut self) {
         self.filter.clear();
         self.clamp();

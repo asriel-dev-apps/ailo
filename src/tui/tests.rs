@@ -1944,3 +1944,86 @@ fn the_editor_and_the_panes_agree_on_where_a_line_lives() {
         }
     }
 }
+
+// -------------------------------------------------------------- 新しいリクエスト
+
+#[test]
+fn n_opens_a_new_request_editor_with_a_template_that_parses() {
+    let mut a = app(&["one"]);
+    on_key(&mut a, key(KeyCode::Char('n')));
+    let e = a.editing.as_ref().expect("編集器が開く");
+    assert_eq!(e.target, super::editor::Target::New);
+    // **下書きはそのまま保存できる形であること。** 保存して初めて落ちると、
+    // 何を直せばいいのかが分からない。
+    let (name, req) = e.applied().expect("下書きがそのまま読める");
+    assert_eq!(name, "new-request");
+    assert_eq!(req.method, "GET");
+}
+
+#[test]
+fn a_new_request_takes_its_name_from_the_text() {
+    let text = r#"
+name = "greet"
+method = "post"
+url = "http://x/greet"
+items = ["Accept: application/json"]
+raw = "{\"a\": 1}"
+[capture]
+token = ".access_token"
+"#;
+    let (name, req) = super::editor::parse_new(text).unwrap();
+    assert_eq!(name, "greet");
+    assert_eq!(req.url, "http://x/greet");
+    assert_eq!(req.items, ["Accept: application/json"]);
+    assert_eq!(req.raw.as_deref(), Some("{\"a\": 1}"));
+    assert_eq!(
+        req.capture.get("token").map(String::as_str),
+        Some(".access_token")
+    );
+}
+
+#[test]
+fn a_new_request_without_a_name_is_refused() {
+    let text = "method = \"GET\"\nurl = \"http://x/\"\n";
+    assert!(super::editor::parse_new(text).is_err());
+}
+
+#[test]
+fn the_nameless_apply_refuses_the_new_target() {
+    // 名前を落としたまま保存する経路を作らせない。
+    let err = super::editor::apply(
+        &SavedRequest::default(),
+        super::editor::Target::New,
+        &["name = \"x\"".to_string()],
+    );
+    assert!(err.is_err());
+}
+
+#[test]
+fn selecting_by_name_survives_a_name_that_sorts_first() {
+    // 一覧は名前順。`aaa` を足すと番号が 1 つずれる。
+    let mut a = app(&["one", "two"]);
+    a.select_visible(1);
+    assert_eq!(a.selected().unwrap().name, "two");
+    a.reload(
+        ["aaa", "one", "two"]
+            .iter()
+            .map(|n| Entry {
+                name: (*n).to_string(),
+                req: req("GET", "http://x/", &[]),
+            })
+            .collect(),
+    );
+    a.select_by_name("aaa");
+    assert_eq!(a.selected().unwrap().name, "aaa");
+}
+
+#[test]
+fn selecting_by_name_clears_a_filter_that_hides_it() {
+    let mut a = app(&["one", "two"]);
+    a.push_filter('t');
+    assert_eq!(a.visible().len(), 1);
+    a.select_by_name("one");
+    assert!(a.filter.is_empty());
+    assert_eq!(a.selected().unwrap().name, "one");
+}

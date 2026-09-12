@@ -384,6 +384,17 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             open_editor(app, Target::Whole);
             Action::None
         }
+        // 新しいリクエストを作る。名前も編集器の中の `name = "..."` で決める。
+        KeyCode::Char('n') => {
+            // **`hidden_on_screen` は通さない。** 下書きは定型文で、
+            // 秘匿値が入りようがない（保存の門は `save_edited` が持っている）。
+            app.editing = Some(Editing::open(
+                "",
+                &crate::config::SavedRequest::default(),
+                Target::New,
+            ));
+            Action::None
+        }
         KeyCode::Enter => Action::Send,
         _ => on_focused_key(app, key),
     }
@@ -471,15 +482,23 @@ fn save_editing(app: &mut App) -> Result<()> {
     let Some(editing) = app.editing.as_mut() else {
         return Ok(());
     };
-    let outcome = editing
-        .apply()
-        .and_then(|req| crate::run::save_edited(&editing.name, &editing.opened_from, req));
+    // **新規作成は `opened_from` を渡さない。** 既存と同じ比較に載せると、
+    // 「まだ無い」が「編集中に書き換えられた」に化ける。
+    let existing = (editing.target != Target::New).then(|| editing.opened_from.clone());
+    let outcome = editing.applied().and_then(|(name, req)| {
+        crate::run::save_edited(&name, existing.as_ref(), req)?;
+        Ok(name)
+    });
 
     match outcome {
-        Ok(()) => {
+        Ok(saved) => {
             app.editing = None;
             // 書き換わったので読み直す。読み直さないと、画面が古い定義のまま。
             app.reload(load_entries()?);
+            // **読み直したあとに選び直す。** 一覧は名前順なので、新しい名前が
+            // 前に入ると選択の番号が別のリクエストを指したままになる。
+            // 絞り込みで新しい名前が見えないときは、絞り込みを外してから選ぶ。
+            app.select_by_name(&saved);
             app.pane = Pane::Idle;
         }
         Err(e) => {

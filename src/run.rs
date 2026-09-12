@@ -1176,15 +1176,27 @@ pub fn edit_saved(name: &str) -> Result<()> {
 /// `ailo new` と同じ検証（`check_definition`＝秘匿値の直書きガードを含む）と、
 /// 同じ衝突検出（開いてから保存するまでに書き換わっていたら上書きしない）を通す。
 /// TUI 側に書き込みを持たせると、この 2 つが片方だけ古くなる。
-pub fn save_edited(name: &str, opened_from: &SavedRequest, edited: SavedRequest) -> Result<()> {
+/// `opened_from` が `None` なら新規作成。**同じ名前が既にあれば拒む**
+/// （新規の入口が、既存を黙って踏み潰す経路にならないように）。
+pub fn save_edited(
+    name: &str,
+    opened_from: Option<&SavedRequest>,
+    edited: SavedRequest,
+) -> Result<()> {
     validate_request_name(name)?;
     check_definition(&edited)?;
 
     // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
     let _lock = crate::config::lock_config()?;
     let mut reqs = Requests::load()?;
-    if reqs.get(name) != Some(opened_from) {
-        bail!("編集している間に `{name}` が書き換えられました。上書きしていません");
+    match opened_from {
+        Some(base) if reqs.get(name) != Some(base) => {
+            bail!("編集している間に `{name}` が書き換えられました。上書きしていません")
+        }
+        None if reqs.get(name).is_some() => {
+            bail!("`{name}` はもうあります。別の名前にしてください")
+        }
+        _ => {}
     }
     reqs.put(name, edited);
     reqs.save()
