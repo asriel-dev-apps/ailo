@@ -533,6 +533,11 @@ impl App {
     /// 絞り込みで隠れているときは、絞り込みを外してから選ぶ（作ったものが
     /// どこにも出ないほうが分からない）。
     pub fn select_by_name(&mut self, name: &str) {
+        // **持っていない名前で絞り込みを消さない。** 読み直しの行き違いや
+        // workspace の切り替えで名前が消えているとき、絞り込みだけが黙って外れる。
+        if !self.all.iter().any(|e| e.name == name) {
+            return;
+        }
         if !self.visible().iter().any(|e| e.name == name) {
             self.clear_filter();
         }

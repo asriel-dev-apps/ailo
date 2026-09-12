@@ -1138,16 +1138,17 @@ pub fn edit_saved(name: &str) -> Result<()> {
             paths::tildify(&tmp)
         )
     })?;
-    check_definition(&req).map_err(|e| {
-        anyhow!(
-            "{e}\n書いたものは {} に残してあります",
-            paths::tildify(&tmp)
-        )
-    })?;
-
     {
         // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
         let _lock = crate::config::lock_config()?;
+        // **秘匿値の判定もロックの中。** 判定が設定を読む以上、判定と書き込みの
+        // 間に `config set` が入れるなら、判定は書き込みを守っていない。
+        check_definition(&req).map_err(|e| {
+            anyhow!(
+                "{e}\n書いたものは {} に残してあります",
+                paths::tildify(&tmp)
+            )
+        })?;
         let mut reqs = Requests::load()?;
         // **開いてから保存するまでの間に同じ名前が変わっていたら上書きしない。**
         // ロックは書き込み 1 回を守るだけで、編集中の変更は防げない。
@@ -1184,10 +1185,13 @@ pub fn save_edited(
     edited: SavedRequest,
 ) -> Result<()> {
     validate_request_name(name)?;
-    check_definition(&edited)?;
 
     // 保存済みリクエストも「読む → 変える → 書き戻す」なので、設定と同じ排他に入れる。
     let _lock = crate::config::lock_config()?;
+    // **秘匿値の判定は、ロックを取ってから。** `check_definition` は設定の
+    // `redact_headers` を読む。先に判定すると、その直後に `config set` が
+    // ヘッダを秘匿指定しても、こちらは古い判定のまま平文を書き込む。
+    check_definition(&edited)?;
     let mut reqs = Requests::load()?;
     match opened_from {
         Some(base) if reqs.get(name) != Some(base) => {

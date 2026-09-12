@@ -2027,3 +2027,13 @@ fn selecting_by_name_clears_a_filter_that_hides_it() {
     assert!(a.filter.is_empty());
     assert_eq!(a.selected().unwrap().name, "one");
 }
+
+#[test]
+fn selecting_a_name_we_do_not_have_leaves_the_filter_alone() {
+    // 読み直しの行き違いで名前が消えているとき、絞り込みだけが黙って外れない。
+    let mut a = app(&["one", "two"]);
+    a.push_filter('t');
+    a.select_by_name("three");
+    assert_eq!(a.filter, "t");
+    assert_eq!(a.selected().unwrap().name, "two");
+}
