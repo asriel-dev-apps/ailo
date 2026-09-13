@@ -60,6 +60,29 @@ ailo show 1                  # 直近のダンプ全体
 | `3` | 行はあるが本文は保持期間切れ。`ailo log` には残っている |
 | `1` | その番号の行が無い |
 
+## 履歴を集計する
+
+**履歴を `ailo log --limit 1000` で読んで数えない。** SQL で聞いて、答えだけ受け取る。
+表は `history` の 1 つだけ。列は `ailo query --schema` で出る(列名を間違えるとエラーになる)。
+
+```bash
+ailo query --schema
+ailo query "select status, count(*) from history group by 1"
+ailo query "select url, avg(ms) from history where ts >= '2026-09-01' group by url order by 2 desc limit 5"
+```
+
+出力は 1 行目が列名の JSON 配列、以降 1 行 1 JSON 配列。
+読み取り専用で、**1 文の SELECT だけ**が通る(書き込み・`ATTACH`・`PRAGMA`・他の表は失敗する)。
+展開前のテンプレートは出てこない。
+
+| 終了コード | 意味 |
+| --- | --- |
+| `0` | 結果を全部出した |
+| `4` | 上限(100 行 / 16 KiB / 5 秒)で打ち切った。行数・バイト数で超えたときは全体をファイルに保存し、標準エラーに `ailo show <ファイル名>` が出る |
+| `2` | SQL の誤り・許可されていない操作 |
+
+打ち切られたら、まず `limit` や集計で答えを小さくできないか考える。
+
 ## 認証が要る API
 
 秘匿値は引数に書かない。キーチェーンに預けて `{{名前}}` で参照する。
@@ -155,6 +178,7 @@ ailo env use stg                                           # 既定の環境を�
 | `ailo env use <名前>` | 既定の環境を切り替える |
 | `ailo secret set\|ls\|rm <env> [キー]` | 秘匿値の出し入れ |
 | `ailo log` / `ailo show <番号\|ファイル名>` | ダンプの索引 / 本体 |
+| `ailo query "<SELECT>"` / `ailo query --schema` | 履歴を SQL で集計する |
 
 終了コードは、送信できた限り 0(HTTP のステータスに関わらず)。
 `--fail` を付けると 400 以上で 1 になる。引数や変数の誤りなど送信前の失敗は 2。

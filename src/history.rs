@@ -9,8 +9,8 @@
 //! - **並び順は `rowid` の降順。** `ts` で並べない。並列書き込みの同秒衝突と
 //!   時計のずれで順序が入れ替わり、`log` の番号と `show` の番号がずれる。
 //! - **テンプレート列(`*_template`)は `ailo query` から見えてはいけない。**
-//!   authorizer で消す仕掛けは手順 2。**それまでは、読み出し側が列名を明示して
-//!   決して `select *` しないことだけが守り**になっている。
+//!   `query.rs` の authorizer が消す。ここの `recent()` は守りの無い接続で読むので、
+//!   **列名を明示して `select *` しない**ことは引き続き守る。
 
 use std::collections::HashSet;
 use std::fs;
@@ -116,7 +116,7 @@ pub struct Db {
 }
 
 /// 履歴 DB のファイル名。ダンプと同じディレクトリに置く(workspace の分けが付いてくる)。
-fn db_path() -> Result<PathBuf> {
+pub(crate) fn db_path() -> Result<PathBuf> {
     Ok(paths::dumps_dir()?.join("history.db"))
 }
 
@@ -160,7 +160,7 @@ fn lock_down(db: &Path) -> Result<()> {
     Ok(())
 }
 
-const SCHEMA: &str = r#"
+pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS history (
   -- `INTEGER PRIMARY KEY` は rowid の別名。**この別名であることが、
   -- 「並び順は追加順」を成立させている。** `WITHOUT ROWID` にしたり id を
@@ -917,8 +917,8 @@ mod tests {
                 .query_row("SELECT url_template FROM history", [], |r| r.get(0))
                 .unwrap();
             assert!(t.contains("{{api_key}}"));
-            // `recent` の返す型にテンプレートは無い。手順 2 の authorizer が
-            // 入るまでは、読み出し側が列名を明示していることだけが守りになる。
+            // `recent` の返す型にテンプレートは無い。`query` の外では、
+            // 読み出し側が列名を明示していることが守りになる。
             let row = &db.recent(1).unwrap()[0];
             assert_eq!(row.url, "https://api.example.com/auth?key=***");
         });

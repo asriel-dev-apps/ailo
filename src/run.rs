@@ -55,6 +55,15 @@ pub async fn run(command: Command) -> Result<Outcome> {
         Command::Secret(c) => secret(&c),
         Command::Log(a) => log(&a),
         Command::Show(a) => show(&a),
+        Command::Query(a) => match a.sql {
+            Some(sql) => Ok(Outcome {
+                code: crate::query::run(&sql)?,
+            }),
+            None => {
+                print!("{}", crate::query::schema());
+                Ok(OK)
+            }
+        },
         _ => unreachable!("リクエスト系は as_request で処理済み"),
     }
 }
