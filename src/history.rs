@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -34,6 +34,51 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 書き込みロックを掴む時間を短く保つためだけの値。大きくすると、取り込みの間に
 /// 走った本物のリクエストの索引書き込みが待たされる。
 const MIGRATE_CHUNK: usize = 200;
+
+/// 取り込みのために `index.jsonl` から切り離した断面の名前の頭。
+///
+/// この頭で始まるファイルは「切り離したが、まだ取り込み終えていない」もの。
+/// 起動のたびに拾い直すので、途中で落ちても置き去りにならない。
+const MIGRATING_PREFIX: &str = "index.jsonl.migrating.";
+
+/// 断面と退避先に付ける、他プロセスと衝突しない接尾辞。
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}", std::process::id())
+}
+
+/// 切り離し済みでまだ取り込んでいない断面。古い順に返す。
+fn pending_snapshots(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(MIGRATING_PREFIX))
+        })
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// 0600 で書く。隔離した行にも認証情報が入りうる。
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(text.as_bytes())
+}
 
 /// 履歴 1 行を作るための材料。マスク済みの索引項目と、展開前のテンプレート。
 pub struct NewRow<'a> {
@@ -88,22 +133,18 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
 /// 0600 で、`ensure_dir` は既存ディレクトリの権限を意図的に触らない。
 /// `AILO_DUMP_DIR` が共有ディレクトリを指していると、SQLite 化した瞬間に守りが下がる。
 ///
-/// **`-journal` を落とさないこと。** WAL が取れなかったとき(同期フォルダ・
-/// ネットワーク FS)、SQLite はロールバックジャーナルに落ちる。その世界では
-/// `-wal` / `-shm` は作られず、代わりに `-journal` が 0644 で作られる。
-/// テンプレート列を含むページがそこに載る。
+/// **本体を先に締めれば、サイドカーは付いてくる。** SQLite の unix VFS は
+/// `-wal` / `-shm` / `-journal` を作るとき**本体 DB の mode を引き継ぐ**
+/// (実測: 本体 600 → journal 600、644 → 644、640 → 640)。だから
+/// `Connection::open` の直後に本体を締めておけば、そのあとの `append` や
+/// `prune_bodies` が作るジャーナルも自動的に 0600 になる。
 ///
-/// **ただしこれは open の 1 回しか走らない。** `-journal` は**書き込み
-/// トランザクションのたびに**作られては消えるので、そのあとの `append` や
-/// `prune_bodies` が作るジャーナルまでは守れない。**WAL が取れない環境では、
-/// 一時ジャーナルの権限は保証できない。** 呼ぶ側はそれを警告に出すこと。
-/// トランザクション中の一瞬しか存在しないファイルを追いかけるより、
-/// 「その置き場所を使うな」と言うほうが正しい(WAL が取れない置き場所は、
-/// そもそもロックが壊れて全履歴が一度に飛びうる)。
+/// 残る窓は**いちばん最初の open だけ**。SQLite が本体を 0644 で作り、
+/// こちらが締めるまでの間に書き込みが走るとそのジャーナルは 0644 になる。
+/// だから本体を締めるのは**スキーマを流す前**。
 ///
-/// サイドカーは open の時点では**存在しない**。最初の書き込みで現れるので、
-/// スキーマを作ったあとに呼ぶこと。無いファイルを黙って飛ばす作りなので、
-/// 呼ぶ順番を間違えても失敗はしない(だからテストは「存在すること」も確かめる)。
+/// `-journal` も一覧に入れておく。WAL が取れない置き場所ではこれが使われる。
+/// 無いファイルは黙って飛ばすので、並べておいても害はない。
 fn lock_down(db: &Path) -> Result<()> {
     for p in [
         db.to_path_buf(),
@@ -193,6 +234,11 @@ impl Db {
         conn.busy_timeout(BUSY_TIMEOUT)?;
 
         let mut warnings = Vec::new();
+        // **スキーマを流す前に本体を締める。** ここより後ろの書き込みが作る
+        // ジャーナルは本体の mode を引き継ぐので、これで全部 0600 になる。
+        if let Err(e) = lock_down(&path) {
+            warnings.push(format!("{e:#}"));
+        }
         if let Some(mode) = set_wal(&conn)? {
             // **取れなかったことを検知する。** rusqlite は要求した journal_mode が
             // 取れなくても失敗しない。`AILO_DUMP_DIR` が同期フォルダやネットワーク FS を
@@ -202,8 +248,7 @@ impl Db {
             warnings.push(format!(
                 "履歴 DB の journal_mode が WAL になりません({mode})。{} が同期フォルダや\
                  ネットワーク FS を指していないか確認してください。\
-                 この状態では一時ジャーナルが他の利用者から読める権限で作られ、\
-                 ロックも壊れて履歴が一度に失われることがあります",
+                 この状態ではロックが壊れ、履歴が一度に失われることがあります",
                 paths::tildify(&dir)
             ));
         }
@@ -211,10 +256,15 @@ impl Db {
         conn.execute_batch(SCHEMA)
             .context("履歴 DB のスキーマを作成できません")?;
         // スキーマの作成が最初の書き込みなので、この時点でサイドカーがある。
-        lock_down(&path)?;
+        // **権限を締められないことで履歴を読めなくしない。** chmod が効かない FS や
+        // 他人所有の `history.db` で `?` を返すと、`ailo log` が恒久的に死ぬ。
+        // 読めないことのほうが、締められないことより重い。
+        if let Err(e) = lock_down(&path) {
+            warnings.push(format!("{e:#}"));
+        }
 
         let mut db = Db { conn, warnings };
-        db.migrate_jsonl(&dir)?;
+        db.migrate_jsonl(&dir);
         Ok(db)
     }
 
@@ -232,35 +282,70 @@ impl Db {
     /// 生きている DB を一度も掴まない」ことにある。SQLite の書き込みは WAL でも
     /// 直列化されるので、取り込みを 1 つの大きなトランザクションにすると、その間に
     /// 走った本物のリクエストの索引書き込みが待たされ、待ち時間を超えると落ちる。
-    /// 落ちた分はダンプ本体だけがディスクに残り、索引の行が永久に作られないまま、
-    /// 保持期間を過ぎて**黙って消える**。
     ///
-    /// 小分けにすれば、1 回に掴む時間は数ミリ秒で済み、この直列化が実害にならない。
-    /// 途中で落ちても入った分は正しい行で、`dump` の UNIQUE と `INSERT OR IGNORE` が
-    /// あるので次回そのまま続きから取り込める(`index.jsonl` は全部入るまで退避しない)。
-    /// 壊れた行の検出は 1 件も挿す前の解析段階で終わっているので、小分けにしても
-    /// 「壊れた行があれば取り込みを失敗させる」は保たれる。
-    fn migrate_jsonl(&mut self, dir: &Path) -> Result<()> {
-        let index = dir.join("index.jsonl");
-        // **読む前に排他を取る。** 逆にすると、2 プロセスが同時に読んだあと、
-        // 先に終えた側が rename したファイルを後続が rename しようとして ENOENT になる。
-        // それを `?` で返していたので、`index.jsonl` が残ったまま毎回 open が失敗し、
-        // `ailo log` が恒久的に死んでいた。
+    /// **一時 DB と同じにはならない。** 小分けにすると、コミットした分が途中で
+    /// `recent()` から見える。一度きり・数秒で、行の順序も壊れないので受け入れている。
+    /// 一方、既に行がある DB に一時 DB を rename で被せると、その間に入った行を
+    /// 捨てることになる。そちらのほうが重い。
+    ///
+    /// **`Db::open` をここで失敗させない。** 取り込みが失敗したときに `?` を返すと、
+    /// `ailo log` と `ailo show` が丸ごと使えなくなるうえ、`prune_bodies` は
+    /// 索引に行が入る経路の中にしか無いので、**保持期間の掃除ごと止まる**。
+    /// 認証情報を含むダンプが無期限に残り続けることになる。
+    fn migrate_jsonl(&mut self, dir: &Path) {
         let Some(_lock) = crate::dump::acquire_lock(&dir.join("migrate.lock")) else {
-            return Ok(());
-        };
-        let Ok(content) = fs::read_to_string(&index) else {
-            return Ok(());
+            return;
         };
 
+        // **読む前に切り離す。** 旧バイナリは `migrate.lock` を知らず `O_APPEND` で
+        // 追記する。読んでから rename すると、その間に入った行が取り込まれないまま
+        // 退避され、次回以降は `index.jsonl` しか見ないので**二度と拾われない**。
+        // 先に rename しておけば、以後の追記は新しい `index.jsonl` に載る。
+        let index = dir.join("index.jsonl");
+        if index.exists() {
+            let snap = dir.join(format!("{MIGRATING_PREFIX}{}", unique_suffix()));
+            if let Err(e) = fs::rename(&index, &snap) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    self.warnings
+                        .push(format!("{} を切り離せません: {e}", paths::tildify(&index)));
+                    return;
+                }
+            }
+        }
+
+        // 切り離し済みの断面を拾う。**前回 rename したあとに落ちた分もここで回収される。**
+        // 拾い漏らすと、そのファイルは誰も読まないまま残る。
+        for snap in pending_snapshots(dir) {
+            if let Err(e) = self.import_snapshot(&snap) {
+                // 次回また拾える。落とさない。
+                self.warnings.push(format!(
+                    "{} を取り込めません（次回やり直します）: {e:#}",
+                    paths::tildify(&snap)
+                ));
+            }
+        }
+    }
+
+    /// 切り離した断面 1 本を取り込み、退避する。
+    ///
+    /// **壊れた行は握りつぶさないが、取り込み全体も止めない。** 読めない行だけを
+    /// 別ファイルへ隔離し、行番号を警告に出す。止めてしまうと、1 行の破損で
+    /// 履歴と掃除が恒久的に死ぬ（旧 prune の「全部読む→書き直す→rename」と
+    /// `O_APPEND` の競合で、千切れた行は実際に起こりうると設計側も認めている）。
+    fn import_snapshot(&mut self, snap: &Path) -> Result<()> {
+        let content = fs::read_to_string(snap)
+            .with_context(|| format!("{} を読めません", paths::tildify(snap)))?;
+
         let mut entries = Vec::new();
+        let mut broken: Vec<(usize, &str)> = Vec::new();
         for (i, line) in content.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let e: IndexEntry = serde_json::from_str(line)
-                .with_context(|| format!("{} の {} 行目を読めません", index.display(), i + 1))?;
-            entries.push(e);
+            match serde_json::from_str::<IndexEntry>(line) {
+                Ok(e) => entries.push(e),
+                Err(_) => broken.push((i + 1, line)),
+            }
         }
 
         for chunk in entries.chunks(MIGRATE_CHUNK) {
@@ -290,12 +375,39 @@ impl Db {
             tx.commit()?;
         }
 
-        // **退避に失敗してもコマンドを落とさない。** 行はもう入っており、
-        // `INSERT OR IGNORE` なので次回また読まれても結果は変わらない。
-        // ここで `?` を返していたせいで、退避に一度失敗すると
-        // `ailo log` / `ailo show` が丸ごと使えなくなっていた。
-        let retired = index.with_extension("jsonl.migrated");
-        match fs::rename(&index, &retired) {
+        let dir = snap.parent().unwrap_or(Path::new("."));
+        let suffix = snap
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(MIGRATING_PREFIX))
+            .unwrap_or("unknown")
+            .to_string();
+
+        if !broken.is_empty() {
+            let lines: Vec<usize> = broken.iter().map(|(n, _)| *n).collect();
+            let kept = dir.join(format!("index.jsonl.broken.{suffix}"));
+            let text: String = broken.iter().map(|(_, l)| format!("{l}\n")).collect();
+            let where_to = match write_private(&kept, &text) {
+                Ok(()) => paths::tildify(&kept),
+                Err(e) => format!("(隔離にも失敗: {e})"),
+            };
+            self.warnings.push(format!(
+                "{} の {} 行目が読めません。その {} 行を {} へ隔離し、残りを取り込みました",
+                paths::tildify(snap),
+                lines
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                lines.len(),
+                where_to
+            ));
+        }
+
+        // **退避先も一意にする。** 固定名だと 2 回目の移行が前回の退避を黙って
+        // 上書きし、1 回目に取りこぼした行がディスクからも消える（実測）。
+        let retired = dir.join(format!("index.jsonl.migrated.{suffix}"));
+        match fs::rename(snap, &retired) {
             Ok(()) => self.warnings.push(format!(
                 "{} 件を履歴 DB に取り込みました({} に退避)",
                 entries.len(),
@@ -304,7 +416,7 @@ impl Db {
             Err(e) => self.warnings.push(format!(
                 "{} 件を履歴 DB に取り込みましたが、{} を退避できません: {e}",
                 entries.len(),
-                paths::tildify(&index)
+                paths::tildify(snap)
             )),
         }
         Ok(())
@@ -394,12 +506,18 @@ impl Db {
             .partition(|(i, (_, ts, _))| *i >= retention.keep_count || too_old(ts));
 
         if !dropped.is_empty() {
-            let mut mark = self
-                .conn
-                .prepare("UPDATE history SET body_deleted = 1 WHERE id = ?1")?;
-            for (_, (id, _, _)) in &dropped {
-                mark.execute([id])?;
+            // **1 行 1 トランザクションにしない。** auto-commit のまま回すと
+            // 1 行ごとに fsync が走る。12 万行の履歴を初めて掃除する `ailo get` 1 回で
+            // 10.4 秒かかっていた。取り込み側をわざわざ小分けにして掴む時間を
+            // 短くしているのに、こちらが正反対をやっていた。
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut mark = tx.prepare("UPDATE history SET body_deleted = 1 WHERE id = ?1")?;
+                for (_, (id, _, _)) in &dropped {
+                    mark.execute([id])?;
+                }
             }
+            tx.commit()?;
             // 印を付け終えてから消す。
             for (_, (_, _, dump)) in &dropped {
                 let _ = fs::remove_file(dir.join(dump));
@@ -494,6 +612,16 @@ mod tests {
         out
     }
 
+    /// 退避済みのファイル。名前は一意なので、数えるには走査が要る。
+    fn retired_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("migrated"))
+            .map(|e| e.path())
+            .collect()
+    }
+
     fn entry(dump: &str, ts: &str) -> IndexEntry {
         IndexEntry {
             ts: ts.into(),
@@ -555,25 +683,28 @@ mod tests {
         });
     }
 
-    /// 退避に失敗しても、行は入っていて `log` / `show` は使えること。
+    /// 取り込みに失敗しても `Db::open` は通り、次回また拾えること。
+    ///
+    /// ここで `?` を返していた頃は、1 本の断面が読めないだけで `ailo log` /
+    /// `ailo show` が丸ごと使えなくなり、`prune_bodies` は索引に行が入る経路の
+    /// 中にしか無いので**保持期間の掃除まで止まっていた**。
     #[test]
-    fn a_failed_retirement_does_not_take_the_history_down_with_it() {
+    fn a_failed_import_does_not_take_the_history_down_with_it() {
         with_dir(|dir| {
-            fs::write(
-                dir.join("index.jsonl"),
-                serde_json::to_string(&entry("a.json", "2026-09-13T00:00:00Z")).unwrap() + "\n",
-            )
-            .unwrap();
-            // 退避先をディレクトリにして rename を失敗させる。
-            fs::create_dir(dir.join("index.jsonl.migrated")).unwrap();
+            let snap = dir.join(format!("{MIGRATING_PREFIX}9999-dead"));
+            fs::write(&snap, "{}\n").unwrap();
+            // 読めない断面にする。
+            fs::set_permissions(&snap, fs::Permissions::from_mode(0o000)).unwrap();
 
-            let db = Db::open().expect("退避の失敗で履歴ごと開けなくなっている");
-            assert_eq!(db.recent(99).unwrap().len(), 1);
+            let db = Db::open().expect("取り込みの失敗で履歴ごと開けなくなっている");
             assert!(
-                db.warnings.iter().any(|w| w.contains("退避できません")),
+                db.warnings.iter().any(|w| w.contains("取り込めません")),
                 "黙って失敗している: {:?}",
                 db.warnings
             );
+            // 断面は残っている＝次回やり直せる。
+            assert!(snap.exists(), "取り込めなかった断面が消えている");
+            fs::set_permissions(&snap, fs::Permissions::from_mode(0o600)).unwrap();
         });
     }
 
@@ -603,7 +734,7 @@ mod tests {
             let db = Db::open().unwrap();
             assert_eq!(db.recent(99).unwrap().len(), 2);
             assert!(!dir.join("index.jsonl").exists());
-            assert!(dir.join("index.jsonl.migrated").exists());
+            assert_eq!(retired_files(dir).len(), 1);
 
             // 旧バイナリが走って JSONL が生え直しても、もう一度取り込める。
             // 重複は `dump` の UNIQUE と `INSERT OR IGNORE` が吸う。
@@ -614,18 +745,110 @@ mod tests {
         });
     }
 
+    /// 壊れた行は隔離して残す。**握りつぶさないが、履歴ごと殺しもしない。**
+    ///
+    /// 落としていた頃は、1 行の破損で `ailo log` / `show` が恒久的に exit 2 になり、
+    /// さらに `prune_bodies` は索引に行が入る経路の中にしか無いので、
+    /// **保持期間の掃除まで止まって認証情報入りのダンプが無期限に残っていた。**
     #[test]
-    fn a_broken_line_fails_the_migration_instead_of_being_dropped() {
+    fn a_broken_line_is_quarantined_without_bricking_the_history() {
         with_dir(|dir| {
             let good = serde_json::to_string(&entry("a.json", "2026-09-13T00:00:00Z")).unwrap();
             fs::write(dir.join("index.jsonl"), format!("{good}\n{{\"ts\":\n")).unwrap();
-            let err = match Db::open() {
-                Ok(_) => panic!("壊れた行があるのに取り込みが通った"),
-                Err(e) => e,
-            };
-            assert!(format!("{err:#}").contains("2 行目"), "{err:#}");
-            // 取り込めていないなら JSONL は残っていなければならない。
-            assert!(dir.join("index.jsonl").exists());
+
+            let db = Db::open().expect("壊れた行 1 つで履歴が開けなくなっている");
+            // 読めた行は入っている。
+            assert_eq!(db.recent(99).unwrap().len(), 1);
+            // 壊れた行は捨てず、隔離して残す。
+            let quarantined: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains("broken"))
+                .collect();
+            assert_eq!(quarantined.len(), 1, "壊れた行が隔離されていない");
+            assert!(fs::read_to_string(quarantined[0].path())
+                .unwrap()
+                .contains("{\"ts\":"));
+            // 何行目が読めなかったかを言う。
+            assert!(
+                db.warnings.iter().any(|w| w.contains("2 行目")),
+                "行番号が出ていない: {:?}",
+                db.warnings
+            );
+        });
+    }
+
+    /// 取り込みの最中に**古い版のバイナリ**が追記した行を失わない。
+    ///
+    /// 旧版は `migrate.lock` を知らず `O_APPEND` で書く。読んでから rename すると
+    /// その間の追記が退避ファイルへ流れ、二度と拾われない。先に切り離せば、
+    /// 以後の追記は新しい `index.jsonl` に載り、次回そのまま取り込まれる。
+    #[test]
+    fn a_row_appended_by_an_old_binary_during_migration_is_not_lost() {
+        with_dir(|dir| {
+            let index = dir.join("index.jsonl");
+            fs::write(
+                &index,
+                serde_json::to_string(&entry("first.json", "2026-09-13T00:00:00Z")).unwrap() + "\n",
+            )
+            .unwrap();
+            let db = Db::open().unwrap();
+            assert_eq!(db.recent(99).unwrap().len(), 1);
+            drop(db);
+
+            // 旧版が、移行後に追記した（＝新しい `index.jsonl` ができる）。
+            fs::write(
+                &index,
+                serde_json::to_string(&entry("late.json", "2026-09-13T00:00:01Z")).unwrap() + "\n",
+            )
+            .unwrap();
+            let db = Db::open().unwrap();
+            let dumps: Vec<String> = db.recent(99).unwrap().into_iter().map(|r| r.dump).collect();
+            assert!(dumps.contains(&"late.json".to_string()), "{dumps:?}");
+            assert_eq!(dumps.len(), 2);
+        });
+    }
+
+    /// 2 回目の移行が、1 回目の退避ファイルを黙って上書きしない。
+    ///
+    /// 固定名 `index.jsonl.migrated` だった頃は上書きしていた。取りこぼした行が
+    /// そこにしか残っていなかった場合、ディスクからも消えていた。
+    #[test]
+    fn retiring_never_overwrites_an_earlier_retired_file() {
+        with_dir(|dir| {
+            for dump in ["one.json", "two.json"] {
+                fs::write(
+                    dir.join("index.jsonl"),
+                    serde_json::to_string(&entry(dump, "2026-09-13T00:00:00Z")).unwrap() + "\n",
+                )
+                .unwrap();
+                drop(Db::open().unwrap());
+            }
+            assert_eq!(
+                retired_files(dir).len(),
+                2,
+                "退避ファイルが上書きされている"
+            );
+        });
+    }
+
+    /// 切り離したあとに落ちた断面を、次の起動が拾う。
+    #[test]
+    fn a_snapshot_left_behind_by_a_crash_is_picked_up_next_time() {
+        with_dir(|dir| {
+            // 「rename は済んだが取り込み前に落ちた」状態を直接作る。
+            fs::write(
+                dir.join(format!("{MIGRATING_PREFIX}9999-abc")),
+                serde_json::to_string(&entry("orphaned.json", "2026-09-13T00:00:00Z")).unwrap()
+                    + "\n",
+            )
+            .unwrap();
+            let db = Db::open().unwrap();
+            assert_eq!(
+                db.recent(99).unwrap()[0].dump,
+                "orphaned.json",
+                "置き去りの断面が拾われていない"
+            );
         });
     }
 
