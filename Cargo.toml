@@ -54,6 +54,13 @@ unicode-width = "0.2"
 # TUI 内の編集器。行の挿入・削除・やり直し・検索を自前で書かないため
 # (ユーザー指示 2026-09-09 で「本格的な編集器」を選択)。ratatui ^0.29 に対応。
 tui-textarea = { version = "0.7", features = ["search"] }
+# 送信履歴の索引。JSONL は絞り込みも集計もできず、エージェントに読ませると
+# それ自体がコンテキストを食う。ADR 0001 を参照。
+# `bundled` は SQLite の amalgamation を同梱する。C のツールチェーン依存を持ち込むが、
+# 「OS のライブラリに依存せず単一バイナリで配布する」方針(rustls / libsecret の dlopen)は
+# 保たれる。DuckDB は採らない: 1 プロセスが読み書きで開くと他が接続できず、
+# エージェントが並列に叩く CLI の土台にできない。
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 # 実 API の大半は gzip を返す。ailo は自分で gzip/brotli を有効にしているのに、

@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod config_edit;
 pub mod dump;
+pub mod history;
 pub mod http;
 pub mod keychain;
 pub mod output;

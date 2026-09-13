@@ -32,6 +32,10 @@ pub struct Outcome {
 const OK: Outcome = Outcome { code: 0 };
 /// 「探したが無かった」。エラー(2)ではない。`git config` と同じ流儀。
 const NOT_FOUND: Outcome = Outcome { code: 1 };
+/// 「行はあるが本文はもう無い」。履歴の行は無期限、本文は保持期間で消えるので、
+/// `show` の答えは 3 通りある。**「無かった」と同じコードにしない**:
+/// エージェントは「打ち間違えた」と「保持期間を過ぎた」で次の一手が変わる。
+const BODY_GONE: Outcome = Outcome { code: 3 };
 
 pub async fn run(command: Command) -> Result<Outcome> {
     if let Some((method, a)) = command.as_request() {
@@ -100,15 +104,12 @@ pub(crate) fn literal_secrets(req: &SavedRequest, r: &Redactor) -> Vec<String> {
 /// `X-Tenant` を秘匿指定した利用者に対し、`last.toml` では落ちるのに画面には出て、
 /// 編集器も開き、保存も通る、という状態になっていた。
 pub fn configured_redactor() -> Redactor {
-    let mut r = Redactor::new(true);
     // 設定が読めないときは既定の名前だけで判定する。ここで落とすと、
     // 設定が壊れている間は画面が一切開かなくなる。
-    if let Ok(cfg) = Config::load() {
-        for name in &cfg.redact_headers {
-            r.add_header_name(name);
-        }
+    match Config::load() {
+        Ok(cfg) => selection_redactor(&cfg),
+        Err(_) => Redactor::new(true),
     }
-    r
 }
 
 /// 画面に出す時点で伏せるもの。**保存を拒む閾値より広い。**
@@ -163,17 +164,38 @@ fn blocking_name(found: Option<redact::Found>) -> Option<String> {
         .map(|f| f.name().to_string())
 }
 
-/// 直前のリクエストを記録する。直書きの秘匿値は値を落とし、名前だけ残す。
+/// 直書きの秘匿値を落とした、そのまま送り直せる形。
 ///
-/// **設定の `redact_headers` をここでも読む。** 送信側の Redactor にだけ足していた
-/// ときは、`X-Tenant` のように利用者が秘匿指定したヘッダが、ダンプでは `***` なのに
-/// `last.toml` には平文で残った。マスクの定義は 1 か所から両方へ配る。
-fn record_last(recipe: &Recipe) -> Result<()> {
-    let r = configured_redactor();
+/// **`last.toml` と履歴の行が同じ関数から作られる。** ここを 2 か所に書くと、
+/// 片方だけ塞がった穴が入口を足すたびに開く（この repo で繰り返し起きている）。
+pub(crate) struct Sendable {
+    pub method: String,
+    pub url: String,
+    pub items: Vec<String>,
+    pub raw: Option<String>,
+    pub form: bool,
+    /// 値ごと落とした項目の**名前**。値は入らない。空でなければ再送できない。
+    pub redacted: Vec<String>,
+}
+
+/// 秘匿値の判定に使う Redactor。設定の `redact_headers` だけを足す。
+///
+/// **`--no-redact` には引きずられない。** あれはダンプ 1 本に対して利用者がその場で
+/// 選んだもの。履歴の行は**無期限に残る**ので、同じ扱いにすると「1 回 `--no-redact`
+/// を付けた」が永久に効く。
+fn selection_redactor(cfg: &Config) -> Redactor {
+    let mut r = Redactor::new(true);
+    for name in &cfg.redact_headers {
+        r.add_header_name(name);
+    }
+    r
+}
+
+fn sendable(recipe: &Recipe, r: &Redactor) -> Sendable {
     let mut items = Vec::with_capacity(recipe.items.len());
     let mut redacted = Vec::new();
     for raw in &recipe.items {
-        match blocking_name(redact::mask_item(raw, &r).found) {
+        match blocking_name(redact::mask_item(raw, r).found) {
             Some(name) => {
                 // 値そのものは書かない。何が落ちたかだけ残す。
                 redacted.push(name);
@@ -198,13 +220,30 @@ fn record_last(recipe: &Recipe) -> Result<()> {
         url = r.url(&recipe.url);
     }
 
-    LastInvocation {
+    Sendable {
         method: recipe.method.clone(),
         url,
         items,
         raw: raw_body,
         form: recipe.form,
         redacted,
+    }
+}
+
+/// 直前のリクエストを記録する。`ailo save` の材料。
+///
+/// **設定の `redact_headers` をここでも読む。** 送信側の Redactor にだけ足していた
+/// ときは、`X-Tenant` のように利用者が秘匿指定したヘッダが、ダンプでは `***` なのに
+/// `last.toml` には平文で残った。マスクの定義は 1 か所から両方へ配る。
+fn record_last(recipe: &Recipe) -> Result<()> {
+    let s = sendable(recipe, &configured_redactor());
+    LastInvocation {
+        method: s.method,
+        url: s.url,
+        items: s.items,
+        raw: s.raw,
+        form: s.form,
+        redacted: s.redacted,
     }
     .record()
 }
@@ -608,18 +647,17 @@ async fn perform(
             request: sent.request.clone(),
             response: sent.response.clone(),
         };
-        Some(
-            dump::write(
-                &record,
-                &redactor,
-                &Retention {
-                    keep_count: cfg.retention.keep_count,
-                    keep_days: cfg.retention.keep_days,
-                },
-            )
-            .map_err(|e| redact_error(&redactor, e))?
-            .path,
-        )
+        let written = dump::write(&record, &redactor).map_err(|e| redact_error(&redactor, e))?;
+        // **索引の書き込みでコマンドを失敗させない**(ADR 0001 §8)。リクエストは
+        // 既に送り終えている。POST が成功しているのに終了コードが非 0 になるのは、
+        // この道具では実害になる。
+        if let Err(e) = record_history(&written.entry, &recipe, &cfg, notes) {
+            notes.push(format!(
+                "警告: 履歴を記録できません: {}",
+                redact_error(&redactor, e)
+            ));
+        }
+        Some(written.path)
     };
 
     if let Some(got) = captured {
@@ -633,6 +671,32 @@ async fn perform(
         response: sent.response,
         dump_path,
         redactor,
+    })
+}
+
+/// 履歴に 1 行足し、保持期間を過ぎた**本文**を消す。
+///
+/// テンプレート列は `record_last` と同じ `sendable` を通す。判定は 1 つしかない。
+fn record_history(
+    entry: &dump::IndexEntry,
+    recipe: &Recipe,
+    cfg: &Config,
+    notes: &mut Vec<String>,
+) -> Result<()> {
+    let s = sendable(recipe, &selection_redactor(cfg));
+    let mut db = crate::history::Db::open()?;
+    notes.append(&mut db.warnings);
+    db.append(&crate::history::NewRow {
+        entry,
+        url_template: &s.url,
+        items_template: &s.items,
+        raw_template: s.raw.as_deref(),
+        form: s.form,
+        redacted: &s.redacted,
+    })?;
+    db.prune_bodies(&Retention {
+        keep_count: cfg.retention.keep_count,
+        keep_days: cfg.retention.keep_days,
     })
 }
 
@@ -1330,15 +1394,31 @@ fn read_secret_from_stdin() -> Result<String> {
 
 // ---------------------------------------------------------------------- 参照系
 
+/// 履歴 DB を開き、開くときの気づき(取り込み・journal_mode)を標準エラーへ出す。
+fn open_history() -> Result<crate::history::Db> {
+    let db = crate::history::Db::open()?;
+    for w in &db.warnings {
+        eprintln!("{w}");
+    }
+    Ok(db)
+}
+
 fn log(a: &LogArgs) -> Result<Outcome> {
-    let entries = dump::read_index(a.limit)?;
+    let entries = open_history()?.recent(a.limit)?;
     if entries.is_empty() {
-        println!("ダンプはまだありません");
+        println!("履歴はまだありません");
         return Ok(OK);
     }
     let p = Palette::detect();
     for (i, e) in entries.iter().enumerate() {
         let name = e.name.as_deref().unwrap_or("-");
+        // 本文が消えている行は、ファイル名の代わりにそれと分かる印を出す。
+        // ファイル名を出すと `ailo show <名前>` が「読めません」で落ちる。
+        let dump = if e.body_deleted {
+            "(本文は保持期間切れ)".to_string()
+        } else {
+            e.dump.clone()
+        };
         println!(
             "{:>3}  {}  {:>6}  {:<6} {}  {}  {}",
             i + 1,
@@ -1347,7 +1427,7 @@ fn log(a: &LogArgs) -> Result<Outcome> {
             e.method,
             e.url,
             p.dim(name),
-            p.dim(&e.dump),
+            p.dim(&dump),
         );
     }
     Ok(OK)
@@ -1356,11 +1436,21 @@ fn log(a: &LogArgs) -> Result<Outcome> {
 fn show(a: &ShowArgs) -> Result<Outcome> {
     let path = match a.target.parse::<usize>() {
         Ok(n) if n >= 1 => {
-            let entries = dump::read_index(n)?;
-            let entry = entries
-                .get(n - 1)
-                .with_context(|| format!("{n} 件目のダンプはありません"))?;
-            dump::dump_path(entry)?
+            // **番号は `recent` の 1 つだけが作る。** `log` と別に数えると、
+            // 1 件増えただけで `show 1` が別のものを指す。
+            let entries = open_history()?.recent(n)?;
+            let Some(entry) = entries.get(n - 1) else {
+                println!("{n} 件目の履歴はありません");
+                return Ok(NOT_FOUND);
+            };
+            if entry.body_deleted {
+                println!(
+                    "{n} 件目({} {})の本文は保持期間を過ぎて消えています。行は残っています",
+                    entry.method, entry.url
+                );
+                return Ok(BODY_GONE);
+            }
+            paths::dumps_dir()?.join(&entry.dump)
         }
         _ => {
             // ダンプ置き場の外へ出さない。このツールの主利用者はエージェントで、

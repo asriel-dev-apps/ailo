@@ -1,13 +1,13 @@
-//! 完全なリクエスト / レスポンスをファイルに落とし、索引に 1 行足す。
+//! 完全なリクエスト / レスポンスをファイルに落とす。
 //!
 //! ここが ailo の中核。本文を標準出力に出さずに済むのは、後から辿れる置き場所があるから。
-//! 索引(`index.jsonl`)を grep すれば、全文をコンテキストに通さずに目的の 1 件へ辿り着ける。
+//! 索引は `history` module(SQLite)。ここは本文ファイルの読み書きだけを持つ。
 //!
 //! 置き場所はリポジトリの外(XDG のデータディレクトリ)に固定する。作業ディレクトリの中に
 //! 置くと、`.gitignore` の入れ忘れ 1 回で認証情報が公開リポジトリへ流れる。
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -128,6 +128,8 @@ impl Default for Retention {
 
 pub struct Written {
     pub path: PathBuf,
+    /// 索引に足す 1 行。**マスクを通した後の値**が入る。
+    pub entry: IndexEntry,
 }
 
 /// いま時刻の RFC3339 表現とファイル名向けの表現を返す。
@@ -154,7 +156,7 @@ fn suffix_for(attempt: u32) -> String {
     )
 }
 
-fn ensure_dir(dir: &Path) -> Result<()> {
+pub(crate) fn ensure_dir(dir: &Path) -> Result<()> {
     // すでにあるディレクトリのパーミッションは触らない。
     // `AILO_DUMP_DIR` が既存の共有ディレクトリを指していた場合、こちらの都合で
     // 0700 に書き換えてしまう。作るときだけ絞る。
@@ -168,8 +170,11 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// ダンプ本体を書き、索引に 1 行足し、古いものを掃除する。
-pub fn write(dump: &Dump, redactor: &Redactor, retention: &Retention) -> Result<Written> {
+/// ダンプ本体を書く。
+///
+/// **索引に足すのは呼ぶ側。** 索引は SQLite で、行には展開前のテンプレートも載る
+/// (`history::NewRow`)。ここはテンプレートを知らないので、索引の材料だけ返す。
+pub fn write(dump: &Dump, redactor: &Redactor) -> Result<Written> {
     let dir = paths::dumps_dir()?;
     ensure_dir(&dir)?;
 
@@ -207,8 +212,9 @@ pub fn write(dump: &Dump, redactor: &Redactor, retention: &Retention) -> Result<
     f.write_all(json.as_bytes())?;
     f.write_all(b"\n")?;
 
-    append_index(
-        &IndexEntry {
+    Ok(Written {
+        path,
+        entry: IndexEntry {
             ts: redacted.ts.clone(),
             name: redacted.name.clone(),
             env: redacted.env.clone(),
@@ -219,12 +225,7 @@ pub fn write(dump: &Dump, redactor: &Redactor, retention: &Retention) -> Result<
             bytes: redacted.response.bytes,
             dump: filename,
         },
-        &dir,
-    )?;
-
-    prune(&dir, retention)?;
-
-    Ok(Written { path })
+    })
 }
 
 /// ダンプ全体にマスクを適用する。書き出す直前に必ず通す。
@@ -264,37 +265,25 @@ pub fn redact_response(res: &ResponseRecord, r: &Redactor) -> ResponseRecord {
     }
 }
 
-fn append_index(entry: &IndexEntry, dir: &Path) -> Result<()> {
-    let index = dir.join("index.jsonl");
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&index)
-        .with_context(|| format!("{} を開けません", index.display()))?;
-    writeln!(f, "{}", serde_json::to_string(entry)?)?;
-    Ok(())
-}
+/// これより古いロックは残骸とみなして奪う。
+const LOCK_STALE_SECS: u64 = 60;
 
-/// 掃除中であることを示すロック。これより古いロックは残骸とみなして奪う。
-const PRUNE_LOCK_STALE_SECS: u64 = 60;
-
-/// 掃除の排他を取る。取れなければ `None`。
+/// ファイルによる排他を取る。取れなければ `None`。
 ///
-/// 索引の追記は O_APPEND の 1 行書きなので競合しない。危ないのは掃除のほうで、
-/// 「全部読む → 書き直す → rename」の途中に別プロセスが追記すると、その行が消える。
-/// 掃除は後回しにしても困らないので、取れなければ黙って見送る。
-fn acquire_prune_lock(dir: &Path) -> Option<PruneLock> {
-    let path = dir.join("prune.lock");
+/// 使い道は 2 つ: 本文の掃除(`prune.lock`)と、`index.jsonl` の取り込み
+/// (`migrate.lock`)。どちらも**後回しにしても困らない**ので、取れなければ黙って
+/// 見送る。SQLite 自身のロックはこれより内側にある(ADR 0001 §8)。
+pub(crate) fn acquire_lock(path: &Path) -> Option<FileLock> {
+    let path = path.to_path_buf();
     match OpenOptions::new()
         .create_new(true)
         .write(true)
         .mode(0o600)
         .open(&path)
     {
-        Ok(_) => Some(PruneLock { path }),
+        Ok(_) => Some(FileLock { path }),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // 掃除の途中で落ちるとロックが残る。古すぎるものは奪って進む。
+            // 途中で落ちるとロックが残る。古すぎるものは奪って進む。
             let stale = fs::metadata(&path)
                 .and_then(|m| m.modified())
                 .and_then(|t| {
@@ -302,7 +291,7 @@ fn acquire_prune_lock(dir: &Path) -> Option<PruneLock> {
                         .duration_since(t)
                         .map_err(|_| std::io::Error::other("時刻が巻き戻っている"))
                 })
-                .map(|age| age.as_secs() > PRUNE_LOCK_STALE_SECS)
+                .map(|age| age.as_secs() > LOCK_STALE_SECS)
                 .unwrap_or(false);
             if stale {
                 let _ = fs::remove_file(&path);
@@ -313,143 +302,14 @@ fn acquire_prune_lock(dir: &Path) -> Option<PruneLock> {
     }
 }
 
-struct PruneLock {
+pub(crate) struct FileLock {
     path: PathBuf,
 }
 
-impl Drop for PruneLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
-}
-
-/// 保持条件を超えたダンプを消し、索引からも該当行を落とす。
-fn prune(dir: &Path, retention: &Retention) -> Result<()> {
-    // 排他が取れなければ見送る。別プロセスが掃除中か、直後に掃除される。
-    let Some(_lock) = acquire_prune_lock(dir) else {
-        return Ok(());
-    };
-
-    let index = dir.join("index.jsonl");
-    let Ok(content) = fs::read_to_string(&index) else {
-        return Ok(());
-    };
-
-    let entries: Vec<IndexEntry> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-
-    let cutoff = OffsetDateTime::now_utc() - time::Duration::days(retention.keep_days as i64);
-    let too_old = |e: &IndexEntry| OffsetDateTime::parse(&e.ts, &Rfc3339).is_ok_and(|t| t < cutoff);
-
-    // 新しいほうから keep_count 件だけ残す。
-    let start = entries.len().saturating_sub(retention.keep_count);
-    let (dropped, kept): (Vec<_>, Vec<_>) = entries
-        .into_iter()
-        .enumerate()
-        .partition(|(i, e)| *i < start || too_old(e));
-
-    if dropped.is_empty() {
-        return Ok(());
-    }
-
-    // 先に索引を差し替え、そのあとで実体を消す。逆にすると、途中で落ちたときに
-    // 「索引にあるのにファイルが無い」状態になり、`ailo show` が理由なく失敗する。
-    let rewritten: String = kept
-        .iter()
-        .filter_map(|(_, e)| serde_json::to_string(e).ok())
-        .map(|l| format!("{l}\n"))
-        .collect();
-    let tmp = index.with_extension(format!("jsonl.tmp.{}", std::process::id()));
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(rewritten.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &index)?;
-
-    for (_, e) in &dropped {
-        let _ = fs::remove_file(dir.join(&e.dump));
-    }
-
-    let referenced: std::collections::HashSet<&str> =
-        kept.iter().map(|(_, e)| e.dump.as_str()).collect();
-    remove_orphans(dir, &referenced, retention)?;
-    Ok(())
-}
-
-/// 索引から辿れなくなったダンプを消す。
-///
-/// 削除の対象を索引の行からしか辿らないと、何かの拍子に索引から落ちたダンプが
-/// **保持期間を超えて永久に残る**。ダンプには認証情報が入りうるので、
-/// 残留そのものがリスクになる。実体側からも掃く。
-fn remove_orphans(
-    dir: &Path,
-    referenced: &std::collections::HashSet<&str>,
-    retention: &Retention,
-) -> Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-    let max_age = std::time::Duration::from_secs(retention.keep_days * 24 * 60 * 60);
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.ends_with(".json") || referenced.contains(name) {
-            continue;
-        }
-        // 書かれた直後のダンプを消さないよう、保持期間を過ぎたものだけにする。
-        // 並行して走っている別プロセスが、まだ索引に載せていない可能性がある。
-        let too_old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .and_then(|t| {
-                SystemTime::now()
-                    .duration_since(t)
-                    .map_err(|_| std::io::Error::other("時刻が巻き戻っている"))
-            })
-            .map(|age| age > max_age)
-            .unwrap_or(false);
-        if too_old {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-    Ok(())
-}
-
-/// 索引を新しい順に読む。`ailo log` 用。
-pub fn read_index(limit: usize) -> Result<Vec<IndexEntry>> {
-    let index = paths::index_path()?;
-    let Ok(content) = fs::read_to_string(&index) else {
-        return Ok(Vec::new());
-    };
-    let mut entries: Vec<IndexEntry> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    entries.reverse();
-    entries.truncate(limit);
-    Ok(entries)
-}
-
-/// 索引の行に対応するダンプ本体のパス。
-pub fn dump_path(entry: &IndexEntry) -> Result<PathBuf> {
-    Ok(paths::dumps_dir()?.join(&entry.dump))
-}
-
-/// ダンプディレクトリが存在することだけ確かめる(`ailo log` などで使う)。
-pub fn dumps_exist() -> bool {
-    paths::index_path()
-        .map(|p| File::open(p).is_ok())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
