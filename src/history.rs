@@ -362,11 +362,10 @@ fn remove_orphans(dir: &Path, referenced: &HashSet<&str>, retention: &Retention)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     /// 隔離した `AILO_DUMP_DIR` で走らせる。
     ///
-    /// 環境変数はプロセス共有なので、この moduleのテストは直列でしか走れない。
+    /// 環境変数はプロセス共有なので、この module のテストは直列でしか走れない。
     /// `cargo test` は同一プロセス内で並列に走るため、ロックで直列化する。
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -569,7 +568,6 @@ mod tests {
             assert_eq!(r.bytes, 700_000);
             assert_eq!(r.ts, "2026-09-13T01:02:03Z");
             assert!(!r.body_deleted);
-            let _ = BTreeMap::<u8, u8>::new();
         });
     }
 }

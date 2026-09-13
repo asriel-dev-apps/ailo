@@ -42,14 +42,23 @@ ailo post https://api.example.com/users name=taro age:=30
 
 ## 後から本文を読む
 
-送信のたびに完全なリクエスト / レスポンスが `~/.local/share/ailo/dumps/` に残り、
-`index.jsonl` に 1 行ずつ索引が積まれる。**全文を読む前に索引で絞り込む。**
+送信のたびに完全なリクエスト / レスポンスが `~/.local/share/ailo/dumps/` に残る。
+**全文を読む前に `ailo log` で絞り込み、要る 1 件だけを `ailo show` で開く。**
 
 ```bash
 ailo log                     # 直近を新しい順に
+ailo log --limit 100
 ailo show 1                  # 直近のダンプ全体
-grep '"status":500' ~/.local/share/ailo/dumps/index.jsonl
 ```
+
+**索引の行は消えないが、本文は既定で 200 件 / 7 日ぶんを超えると消える。**
+`ailo show <番号>` の終了コードで区別できる。
+
+| 終了コード | 意味 |
+| --- | --- |
+| `0` | 本文を出した |
+| `3` | 行はあるが本文は保持期間切れ。`ailo log` には残っている |
+| `1` | その番号の行が無い |
 
 ## 認証が要る API
 

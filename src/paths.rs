@@ -66,11 +66,6 @@ pub fn dumps_dir() -> Result<PathBuf> {
     Ok(data_dir()?.join("dumps"))
 }
 
-/// ダンプ索引。1 リクエスト 1 行の JSONL。
-pub fn index_path() -> Result<PathBuf> {
-    Ok(dumps_dir()?.join("index.jsonl"))
-}
-
 /// ホームディレクトリ配下のパスを `~/...` に畳む。出力にフルパスを出さないため。
 pub fn tildify(path: &std::path::Path) -> String {
     if let Ok(h) = home() {

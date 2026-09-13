@@ -95,7 +95,8 @@ pub struct Dump {
     pub response: ResponseRecord,
 }
 
-/// 索引の 1 行。ダンプ本体を開かずに絞り込むための最小限だけを持つ。
+/// 索引 1 件分の材料。ダンプ本体を開かずに絞り込むための最小限だけを持つ。
+/// 索引そのものは `history` module(SQLite)が持ち、ここは行を作るための材料を返すだけ。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub ts: String,

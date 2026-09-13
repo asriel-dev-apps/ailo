@@ -125,16 +125,17 @@ ailo get https://api.example.com/users limit==50 'X-Trace: abc'
 
 ### 後から本文を読む
 
-送信のたびに完全なリクエスト / レスポンスが `~/.local/share/ailo/dumps/` に残り、
-`index.jsonl` に索引が積まれる。索引を絞ってから該当の 1 件だけを開ける。
+送信のたびに完全なリクエスト / レスポンスが `~/.local/share/ailo/dumps/` に残る。
+索引を辿ってから該当の 1 件だけを開ける。
 
 ```bash
 ailo log                     # 直近を新しい順に
+ailo log --limit 100
 ailo show 1                  # 直近のダンプ全体
-grep '"status":500' ~/.local/share/ailo/dumps/index.jsonl
 ```
 
-既定では新しいものから 200 件 / 7 日ぶんを保持し、超えた分は消える。
+**索引の行は消えない。本文だけが既定で 200 件 / 7 日ぶんを超えると消える。**
+本文が消えた行は `ailo log` に `(本文は保持期間切れ)` と出る。
 
 ### 環境と変数
 
