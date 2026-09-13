@@ -273,7 +273,7 @@ const LOCK_STALE_SECS: u64 = 60;
 ///
 /// 使い道は 2 つ: 本文の掃除(`prune.lock`)と、`index.jsonl` の取り込み
 /// (`migrate.lock`)。どちらも**後回しにしても困らない**ので、取れなければ黙って
-/// 見送る。SQLite 自身のロックはこれより内側にある(ADR 0001 §8)。
+/// 見送る。SQLite 自身のロックはこれより内側にある。
 pub(crate) fn acquire_lock(path: &Path) -> Option<FileLock> {
     let path = path.to_path_buf();
     match OpenOptions::new()

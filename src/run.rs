@@ -648,7 +648,7 @@ async fn perform(
             response: sent.response.clone(),
         };
         let written = dump::write(&record, &redactor).map_err(|e| redact_error(&redactor, e))?;
-        // **索引の書き込みでコマンドを失敗させない**(ADR 0001 §8)。リクエストは
+        // **索引の書き込みでコマンドを失敗させない**。リクエストは
         // 既に送り終えている。POST が成功しているのに終了コードが非 0 になるのは、
         // この道具では実害になる。
         if let Err(e) = record_history(&written.entry, &recipe, &cfg, notes) {
@@ -1434,6 +1434,8 @@ fn log(a: &LogArgs) -> Result<Outcome> {
 }
 
 fn show(a: &ShowArgs) -> Result<Outcome> {
+    // 行があると分かっているか。番号で指したときだけ真になる。
+    let mut row_known = false;
     let path = match a.target.parse::<usize>() {
         Ok(n) if n >= 1 => {
             // **番号は `recent` の 1 つだけが作る。** `log` と別に数えると、
@@ -1450,6 +1452,7 @@ fn show(a: &ShowArgs) -> Result<Outcome> {
                 );
                 return Ok(BODY_GONE);
             }
+            row_known = true;
             paths::dumps_dir()?.join(&entry.dump)
         }
         _ => {
@@ -1470,8 +1473,22 @@ fn show(a: &ShowArgs) -> Result<Outcome> {
             dir.join(name)
         }
     };
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("{} を読めません", paths::tildify(&path)))?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // **行があるのに本文が無いなら、答えは「本文はもう無い」**。
+        // 旧 prune は「索引を書く → 実体を消す」の順だったので、その間に落ちた行は
+        // 本文が無いまま `body_deleted = 0` で取り込まれる。素の読み込み失敗にすると、
+        // 答えが 3 通りのはずのところに 4 つめ(exit 2)が生える。
+        // 実体を外から消された場合も同じ扱いでよい。
+        Err(e) if row_known && e.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "{} 件目の本文はもうありません。行は `ailo log` に残っています",
+                a.target
+            );
+            return Ok(BODY_GONE);
+        }
+        Err(e) => return Err(e).with_context(|| format!("{} を読めません", paths::tildify(&path))),
+    };
     print!("{content}");
     Ok(OK)
 }

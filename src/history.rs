@@ -29,6 +29,12 @@ use crate::paths;
 /// 索引が待つ時間。別プロセスが書いている間の `SQLITE_BUSY` を握りつぶさない。
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 取り込みで 1 つのトランザクションに入れる件数。
+///
+/// 書き込みロックを掴む時間を短く保つためだけの値。大きくすると、取り込みの間に
+/// 走った本物のリクエストの索引書き込みが待たされる。
+const MIGRATE_CHUNK: usize = 200;
+
 /// 履歴 1 行を作るための材料。マスク済みの索引項目と、展開前のテンプレート。
 pub struct NewRow<'a> {
     pub entry: &'a IndexEntry,
@@ -76,17 +82,28 @@ fn sidecar(db: &Path, suffix: &str) -> PathBuf {
     db.with_file_name(name)
 }
 
-/// DB 本体と `-wal` / `-shm` に 0600 を課す。
+/// DB 本体と、SQLite が作るサイドカー全部に 0600 を課す。
 ///
-/// **SQLite はこの 3 つを 0644 で作る**(実測)。ダンプと `index.jsonl` は明示的に
+/// **SQLite はどれも 0644 で作る**(実測)。ダンプと旧 `index.jsonl` は明示的に
 /// 0600 で、`ensure_dir` は既存ディレクトリの権限を意図的に触らない。
 /// `AILO_DUMP_DIR` が共有ディレクトリを指していると、SQLite 化した瞬間に守りが下がる。
 ///
-/// `-wal` / `-shm` は open の時点では**存在しない**。最初の書き込みで現れるので、
+/// **`-journal` を落とさないこと。** WAL が取れなかったとき(同期フォルダ・
+/// ネットワーク FS)、SQLite はロールバックジャーナルに落ちる。その世界では
+/// `-wal` / `-shm` は作られず、代わりに `-journal` が**書き込みトランザクションの
+/// たびに** 0644 で作られては消える。テンプレート列を含むページがそこに載るので、
+/// `-wal` だけ守っていると、一番守りが下がっている環境でだけ穴が開く。
+///
+/// サイドカーは open の時点では**存在しない**。最初の書き込みで現れるので、
 /// スキーマを作ったあとに呼ぶこと。無いファイルを黙って飛ばす作りなので、
 /// 呼ぶ順番を間違えても失敗はしない(だからテストは「存在すること」も確かめる)。
 fn lock_down(db: &Path) -> Result<()> {
-    for p in [db.to_path_buf(), sidecar(db, "-wal"), sidecar(db, "-shm")] {
+    for p in [
+        db.to_path_buf(),
+        sidecar(db, "-wal"),
+        sidecar(db, "-shm"),
+        sidecar(db, "-journal"),
+    ] {
         if p.exists() {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o600))
                 .with_context(|| format!("{} のパーミッションを設定できません", p.display()))?;
@@ -101,6 +118,9 @@ CREATE TABLE IF NOT EXISTS history (
   ts            TEXT    NOT NULL,
   name          TEXT,
   env           TEXT,
+  -- `method` は展開前も展開後も同じ(変数を展開しても masking しても変わらない)ので、
+  -- テンプレート列を別に持たない。`ailo query` から method 別に集計したいので、
+  -- こちらは見える側に置く。
   method        TEXT    NOT NULL,
   url           TEXT    NOT NULL,
   status        INTEGER NOT NULL,
@@ -118,6 +138,40 @@ CREATE INDEX IF NOT EXISTS history_ts ON history(ts);
 CREATE INDEX IF NOT EXISTS history_live_body ON history(body_deleted, id);
 "#;
 
+/// `journal_mode` を WAL にする。WAL にできたら `None`、できなければ実際のモードを返す。
+///
+/// **`busy_timeout` はここには効かない。** ロールバックジャーナルから WAL への変換は
+/// DB 全体の排他ロックを要求し、取れないと SQLite は busy handler を呼ばずに
+/// `SQLITE_BUSY` を即座に返す。素で `?` すると、**まっさらな状態から 2 プロセスが
+/// 同時に立ち上がっただけで `ailo log` が exit 2 で死ぬ**(実測 13%)。変換が要るのは
+/// 初回だけで、既に WAL の DB に対しては no-op なので、定常状態では起きない。
+///
+/// 並んだ相手が変換を終えれば、こちらは no-op で通る。だから短く待って試し直す。
+/// それでも駄目なら**いま何になっているかを読んで返す**。開くこと自体は諦めない:
+/// 履歴は補助であって、これでコマンドを落としてはいけない。
+fn set_wal(conn: &Connection) -> Result<Option<String>> {
+    for attempt in 0..5 {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0)) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(None),
+            Ok(mode) => return Ok(Some(mode)),
+            Err(e) if is_busy(&e) => {
+                std::thread::sleep(Duration::from_millis(20 * (attempt + 1)));
+            }
+            Err(e) => return Err(e).context("履歴 DB の journal_mode を設定できません"),
+        }
+    }
+    // 変換はできなかったが、相手が終えていれば既に WAL になっている。
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    Ok((!mode.eq_ignore_ascii_case("wal")).then_some(mode))
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 impl Db {
     /// 履歴 DB を開く。無ければ作り、`index.jsonl` があれば取り込む。
     pub fn open() -> Result<Db> {
@@ -129,14 +183,12 @@ impl Db {
         conn.busy_timeout(BUSY_TIMEOUT)?;
 
         let mut warnings = Vec::new();
-        // **取れなかったことを検知する。** rusqlite は要求した journal_mode が
-        // 取れなくても失敗しない。`AILO_DUMP_DIR` が同期フォルダやネットワーク FS を
-        // 指していると WAL が取れず、ロックが壊れて全履歴が一度に壊れる。
-        // いまの最悪は「JSONL の 1 行が混線する」で、本文ファイルという冗長系が残る。
-        // SQLite と無期限履歴では、その冗長系を捨てたうえで全部が壊れる。
-        let mode: String =
-            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
-        if !mode.eq_ignore_ascii_case("wal") {
+        if let Some(mode) = set_wal(&conn)? {
+            // **取れなかったことを検知する。** rusqlite は要求した journal_mode が
+            // 取れなくても失敗しない。`AILO_DUMP_DIR` が同期フォルダやネットワーク FS を
+            // 指していると WAL が取れず、ロックが壊れて全履歴が一度に壊れる。
+            // いまの最悪は「JSONL の 1 行が混線する」で、本文ファイルという冗長系が残る。
+            // SQLite と無期限履歴では、その冗長系を捨てたうえで全部が壊れる。
             warnings.push(format!(
                 "履歴 DB の journal_mode が WAL になりません({mode})。{} が同期フォルダや\
                  ネットワーク FS を指していないか確認してください",
@@ -146,7 +198,7 @@ impl Db {
 
         conn.execute_batch(SCHEMA)
             .context("履歴 DB のスキーマを作成できません")?;
-        // スキーマの作成が最初の書き込みなので、この時点で `-wal` / `-shm` がある。
+        // スキーマの作成が最初の書き込みなので、この時点でサイドカーがある。
         lock_down(&path)?;
 
         let mut db = Db { conn, warnings };
@@ -163,17 +215,29 @@ impl Db {
     /// **壊れた行があれば取り込みを失敗させる。** 現行の reader と prune は不正行を
     /// `filter_map(...ok())` で握りつぶしている。そのまま移すと欠損が検出できない。
     ///
-    /// ADR は「一時 DB に入れてから rename」と書いているが、**採っていない**。
-    /// 取り込み全体を 1 つのトランザクションに入れれば、途中で落ちても行は 1 つも
-    /// 入らず `index.jsonl` も残るので、次回そのまま取り込み直せる。一時 DB が
-    /// 追加で防ぐものが無く、失敗したときに `.migrating` が残るぶんだけ悪い。
+    /// 設計では「一時 DB に入れてから rename」だが、**採っていない**。生きている DB へ
+    /// 直接入れ、代わりに**小分けにして**書く。一時 DB の利点は「取り込みの間、
+    /// 生きている DB を一度も掴まない」ことにある。SQLite の書き込みは WAL でも
+    /// 直列化されるので、取り込みを 1 つの大きなトランザクションにすると、その間に
+    /// 走った本物のリクエストの索引書き込みが待たされ、待ち時間を超えると落ちる。
+    /// 落ちた分はダンプ本体だけがディスクに残り、索引の行が永久に作られないまま、
+    /// 保持期間を過ぎて**黙って消える**。
+    ///
+    /// 小分けにすれば、1 回に掴む時間は数ミリ秒で済み、この直列化が実害にならない。
+    /// 途中で落ちても入った分は正しい行で、`dump` の UNIQUE と `INSERT OR IGNORE` が
+    /// あるので次回そのまま続きから取り込める(`index.jsonl` は全部入るまで退避しない)。
+    /// 壊れた行の検出は 1 件も挿す前の解析段階で終わっているので、小分けにしても
+    /// 「壊れた行があれば取り込みを失敗させる」は保たれる。
     fn migrate_jsonl(&mut self, dir: &Path) -> Result<()> {
         let index = dir.join("index.jsonl");
-        let Ok(content) = fs::read_to_string(&index) else {
+        // **読む前に排他を取る。** 逆にすると、2 プロセスが同時に読んだあと、
+        // 先に終えた側が rename したファイルを後続が rename しようとして ENOENT になる。
+        // それを `?` で返していたので、`index.jsonl` が残ったまま毎回 open が失敗し、
+        // `ailo log` が恒久的に死んでいた。
+        let Some(_lock) = crate::dump::acquire_lock(&dir.join("migrate.lock")) else {
             return Ok(());
         };
-        // 別プロセスが取り込み中なら見送る。次の送信で取り込まれる。
-        let Some(_lock) = crate::dump::acquire_lock(&dir.join("migrate.lock")) else {
+        let Ok(content) = fs::read_to_string(&index) else {
             return Ok(());
         };
 
@@ -187,39 +251,50 @@ impl Db {
             entries.push(e);
         }
 
-        let tx = self.conn.transaction()?;
-        {
-            // 移行された行はテンプレートを持たない。**この行は再送できない。**
-            // 画面まで先送りせず、ここで NULL と決めておく。
-            let mut stmt = tx.prepare(
-                "INSERT OR IGNORE INTO history
-                 (ts, name, env, method, url, status, ms, bytes, dump, body_deleted)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
-            )?;
-            for e in &entries {
-                stmt.execute(rusqlite::params![
-                    e.ts,
-                    e.name,
-                    e.env,
-                    e.method,
-                    e.url,
-                    e.status,
-                    e.ms as i64,
-                    e.bytes as i64,
-                    e.dump,
-                ])?;
+        for chunk in entries.chunks(MIGRATE_CHUNK) {
+            let tx = self.conn.transaction()?;
+            {
+                // 移行された行はテンプレートを持たない。**この行は再送できない。**
+                // 画面まで先送りせず、ここで NULL と決めておく。
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO history
+                     (ts, name, env, method, url, status, ms, bytes, dump, body_deleted)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                )?;
+                for e in chunk {
+                    stmt.execute(rusqlite::params![
+                        e.ts,
+                        e.name,
+                        e.env,
+                        e.method,
+                        e.url,
+                        e.status,
+                        e.ms as i64,
+                        e.bytes as i64,
+                        e.dump,
+                    ])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
 
+        // **退避に失敗してもコマンドを落とさない。** 行はもう入っており、
+        // `INSERT OR IGNORE` なので次回また読まれても結果は変わらない。
+        // ここで `?` を返していたせいで、退避に一度失敗すると
+        // `ailo log` / `ailo show` が丸ごと使えなくなっていた。
         let retired = index.with_extension("jsonl.migrated");
-        fs::rename(&index, &retired)
-            .with_context(|| format!("{} を退避できません", index.display()))?;
-        self.warnings.push(format!(
-            "{} 件を履歴 DB に取り込みました({} に退避)",
-            entries.len(),
-            paths::tildify(&retired)
-        ));
+        match fs::rename(&index, &retired) {
+            Ok(()) => self.warnings.push(format!(
+                "{} 件を履歴 DB に取り込みました({} に退避)",
+                entries.len(),
+                paths::tildify(&retired)
+            )),
+            Err(e) => self.warnings.push(format!(
+                "{} 件を履歴 DB に取り込みましたが、{} を退避できません: {e}",
+                entries.len(),
+                paths::tildify(&index)
+            )),
+        }
         Ok(())
     }
 
@@ -363,6 +438,35 @@ fn remove_orphans(dir: &Path, referenced: &HashSet<&str>, retention: &Retention)
 mod tests {
     use super::*;
 
+    /// ロールバックジャーナルに落ちた世界でも、書き込み中のジャーナルが 0600 であること。
+    ///
+    /// `AILO_DUMP_DIR` が同期フォルダやネットワーク FS のときに実際に通る経路。
+    /// `-wal` だけ守っていると、**一番守りが下がっている環境でだけ**穴が開く。
+    /// ここは `Db::open` を通さず、その世界を直接作って確かめる。
+    #[test]
+    fn the_rollback_journal_is_private_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("history.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO history (ts, method, url, status, ms, bytes, dump, url_template)
+             VALUES ('t', 'GET', 'u', 200, 1, 2, 'd.json', 'https://x/{{api_key}}')",
+        )
+        .unwrap();
+        // 書き込みトランザクションを開いたままにすると `-journal` が生きる。
+        // **実際にページを書き換える UPDATE にすること。** 0 行に当たる UPDATE では
+        // ジャーナルが作られず、テストが「無い」を「守れている」と読み違える。
+        conn.execute_batch("BEGIN IMMEDIATE; UPDATE history SET status = 201;")
+            .unwrap();
+        let journal = sidecar(&db, "-journal");
+        assert!(journal.exists(), "この経路で -journal が作られていない");
+        lock_down(&db).unwrap();
+        let mode = fs::metadata(&journal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "-journal が {mode:o}");
+    }
+
     /// 隔離した `AILO_DUMP_DIR` で走らせる。
     ///
     /// 環境変数はプロセス共有なので、この module のテストは直列でしか走れない。
@@ -417,6 +521,47 @@ mod tests {
                 let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
                 assert_eq!(mode, 0o600, "{} が {:o}", p.display(), mode);
             }
+        });
+    }
+
+    /// 取り込みが小分けになっていること。1 つの大きなトランザクションにすると、
+    /// その間に走った本物のリクエストの索引書き込みが待たされて落ちる。
+    #[test]
+    fn migration_commits_in_chunks_so_the_write_lock_is_never_held_long() {
+        with_dir(|dir| {
+            let lines: String = (0..MIGRATE_CHUNK * 2 + 7)
+                .map(|i| {
+                    serde_json::to_string(&entry(&format!("d{i}.json"), "2026-09-13T00:00:00Z"))
+                        .unwrap()
+                        + "\n"
+                })
+                .collect();
+            fs::write(dir.join("index.jsonl"), &lines).unwrap();
+            let db = Db::open().unwrap();
+            // 端数を落とさない(`chunks` の最後の 1 枚を取りこぼす書き方をしていないか)。
+            assert_eq!(db.recent(9999).unwrap().len(), MIGRATE_CHUNK * 2 + 7);
+        });
+    }
+
+    /// 退避に失敗しても、行は入っていて `log` / `show` は使えること。
+    #[test]
+    fn a_failed_retirement_does_not_take_the_history_down_with_it() {
+        with_dir(|dir| {
+            fs::write(
+                dir.join("index.jsonl"),
+                serde_json::to_string(&entry("a.json", "2026-09-13T00:00:00Z")).unwrap() + "\n",
+            )
+            .unwrap();
+            // 退避先をディレクトリにして rename を失敗させる。
+            fs::create_dir(dir.join("index.jsonl.migrated")).unwrap();
+
+            let db = Db::open().expect("退避の失敗で履歴ごと開けなくなっている");
+            assert_eq!(db.recent(99).unwrap().len(), 1);
+            assert!(
+                db.warnings.iter().any(|w| w.contains("退避できません")),
+                "黙って失敗している: {:?}",
+                db.warnings
+            );
         });
     }
 
