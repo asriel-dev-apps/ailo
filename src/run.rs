@@ -57,7 +57,7 @@ pub async fn run(command: Command) -> Result<Outcome> {
         Command::Show(a) => show(&a),
         Command::Query(a) => match a.sql {
             Some(sql) => Ok(Outcome {
-                code: crate::query::run(&sql)?,
+                code: crate::query::run(&sql),
             }),
             None => {
                 print!("{}", crate::query::schema());

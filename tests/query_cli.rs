@@ -158,3 +158,33 @@ fn a_query_that_never_ends_is_stopped() {
     assert!(run.stderr.contains("実行時間の上限"), "{}", run.stderr);
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
 }
+
+/// 途中の行で SQL が失敗したら、それまでの行を標準出力に残さない。
+/// 先頭だけの結果を完全な答えと読み違えさせないため。
+#[test]
+fn a_failure_midway_leaves_no_partial_answer_on_stdout() {
+    let (_server, sb) = history_with_templates();
+    let sql = "select json(case when id = 3 then '{broken' else id end) from history order by id";
+    let run = query(&sb, sql);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert_eq!(run.stdout, "", "途中までの行が出ている");
+    // コントロール: 失敗する行を除けば、同じ形の問い合わせは行を返す。
+    assert_eq!(
+        query(&sb, "select id from history where id < 3 order by id").ok(),
+        "[\"id\"]\n[1]\n[2]"
+    );
+}
+
+/// 保存先を知らせるのはファイル名だけ。置き場所の絶対パスを出さない。
+#[test]
+fn the_spill_notice_names_the_file_but_not_its_directory() {
+    let (_server, sb) = history_with_templates();
+    let run = query(
+        &sb,
+        "select a.id from history a, history b, history c, history d, history e",
+    );
+    assert_eq!(run.code, 4);
+    let dir = sb.data_dir().display().to_string();
+    assert!(!run.stderr.contains(&dir), "{}", run.stderr);
+    assert!(run.stderr.contains("`ailo show query-"), "{}", run.stderr);
+}

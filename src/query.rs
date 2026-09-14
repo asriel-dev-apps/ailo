@@ -10,7 +10,8 @@
 //!    再帰 CTE だけ。テンプレート列は `Ignore`(＝全経路で NULL)。**列も既定で隠す**:
 //!    `VISIBLE` に無い列は、後から足された列も含めて NULL になる
 //! 4. `PRAGMA query_only=1` と `SQLITE_DBCONFIG_DEFENSIVE`(接続も読み取り専用で開く)
-//! 5. 行数・出力バイト数・実行時間の上限。超えたら全体をファイルへ落とし、標準出力は先頭だけ
+//! 5. 行数・出力バイト数・実行時間・列数・1 行の大きさの上限。行数とバイト数で超えたら
+//!    全体をファイルへ落とし、標準出力は先頭だけ
 //!
 //! エラーはここの境界を通す。SQL 全文・列の値・絶対パスを反響させない。
 
@@ -20,7 +21,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -66,6 +66,10 @@ const FILE_BYTES: u64 = 64 * 1024 * 1024;
 const TIME_LIMIT: Duration = Duration::from_secs(5);
 /// 1 つの値の長さ。`randomblob(1e9)` のような 1 式での巨大な確保を塞ぐ。
 const VALUE_BYTES: i32 = 1024 * 1024;
+/// 結果の列数。値の上限と掛け合わせたものが 1 行の確保の上限になる。
+const MAX_COLUMNS: i32 = 100;
+/// 1 行の本文の合計。列を並べて値の上限を掛け算させない。
+const ROW_BYTES: usize = 8 * 1024 * 1024;
 
 /// 結果を出し切れなかった。行数・バイト数・時間のどれでも同じコード。
 pub const TRUNCATED: i32 = 4;
@@ -80,12 +84,23 @@ pub fn schema() -> String {
 }
 
 /// 問い合わせを走らせ、終了コードを返す。エラー文はここで作り、呼ぶ側では飾らない。
-pub fn run(sql: &str) -> Result<i32> {
-    let path = crate::history::db_path()?;
-    // 取り込みとスキーマ作成は書き込みの接続でやる(`ailo log` と同じ答えにするため)。
+///
+/// **どの失敗も `?` で main へ流さない。** main は原因の連鎖を全部出すので、
+/// パスを含む文脈がそのまま標準エラーに出る。
+pub fn run(sql: &str) -> i32 {
+    // 取り込みとスキーマ作成は書き込みの接続でやる。`ailo log` と同じ答えにするため
+    // (まだ取り込んでいない `index.jsonl` の分が query にだけ無い、を作らない)。
+    // **SQL からは何も書けない**: 書き込むのはこの初期化だけで、`ailo log` と同じもの。
     // **開いたままにしておく。** 最後の接続が閉じると `-shm` が消え、
     // 読み取り専用の接続は WAL の DB を開けなくなる。
-    let db = crate::history::Db::open()?;
+    let opened = crate::history::db_path().and_then(|p| Ok((p, crate::history::Db::open()?)));
+    let (path, db) = match opened {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("エラー: 履歴 DB を開けません。`ailo log` で原因を確認してください");
+            return 2;
+        }
+    };
     for w in &db.warnings {
         eprintln!("{w}");
     }
@@ -97,28 +112,26 @@ pub fn run(sql: &str) -> Result<i32> {
                 "エラー: 履歴 DB を問い合わせ用に開けません: {}",
                 explain(&e)
             );
-            return Ok(2);
+            return 2;
         }
     };
-    let deadline = Instant::now() + TIME_LIMIT;
-    conn.progress_handler(1000, Some(move || Instant::now() > deadline))?;
 
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("エラー: {}", explain(&e));
-            return Ok(2);
+            return 2;
         }
     };
     // authorizer で足りているはずだが、書き換える文なら走らせない。
     if !stmt.readonly() {
         eprintln!("エラー: {DENIED}");
-        return Ok(2);
+        return 2;
     }
     // 空文字やコメントだけの SQL は、列の無い「文」として prepare を通ってしまう。
     if stmt.column_count() == 0 {
         eprintln!("エラー: 結果を返す SELECT を 1 文渡してください");
-        return Ok(2);
+        return 2;
     }
 
     let columns: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
@@ -126,17 +139,33 @@ pub fn run(sql: &str) -> Result<i32> {
         Ok(r) => r,
         Err(e) => {
             eprintln!("エラー: {}", explain(&e));
-            return Ok(2);
+            return 2;
         }
     };
     let mut out = Output::new(&columns);
-    let failure = loop {
+    let stopped = loop {
         match rows.next() {
             Ok(Some(row)) => {
-                let values: Vec<serde_json::Value> = (0..columns.len())
-                    .map(|i| to_json(row.get_ref(i).unwrap_or(ValueRef::Null)))
+                let values: Vec<ValueRef<'_>> = (0..columns.len())
+                    .map(|i| row.get_ref(i).unwrap_or(ValueRef::Null))
                     .collect();
-                if !out.push(&serde_json::Value::Array(values).to_string()) {
+                // **JSON に組み立てる前に測る。** 1 つの値は `VALUE_BYTES` までだが、
+                // 列を並べれば 1 行は列数倍になる。組み立ててから測ると、その前に確保が済む。
+                let raw: usize = values
+                    .iter()
+                    .map(|v| match v {
+                        ValueRef::Text(t) => t.len(),
+                        _ => 0,
+                    })
+                    .sum();
+                if raw > ROW_BYTES {
+                    break Some(format!(
+                        "1 行の大きさの上限({} MiB)を超えたので打ち切りました",
+                        ROW_BYTES / 1024 / 1024
+                    ));
+                }
+                let line = serde_json::Value::Array(values.into_iter().map(to_json).collect());
+                if !out.push(line.to_string()) {
                     break Some(format!(
                         "ファイルの上限({} MiB)に達したので打ち切りました",
                         FILE_BYTES / 1024 / 1024
@@ -150,14 +179,17 @@ pub fn run(sql: &str) -> Result<i32> {
                     TIME_LIMIT.as_secs()
                 ));
             }
+            // **途中まで出した行を残さない。** 標準出力へはまだ何も書いていない。
+            // 先頭だけの結果を「全部」と読み違えさせないため。
             Err(e) => {
                 eprintln!("エラー: {}", explain(&e));
-                return Ok(2);
+                return 2;
             }
         }
     };
+    drop(rows);
     drop(db);
-    out.finish(failure)
+    out.finish(stopped)
 }
 
 /// 5 つの守りを課した読み取り専用の接続。**どれか 1 つでも課せなければ Err。**
@@ -168,19 +200,29 @@ fn open_hardened(path: &std::path::Path) -> rusqlite::Result<Connection> {
     )?;
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
     conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, VALUE_BYTES)?;
+    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, MAX_COLUMNS)?;
     let defensive = conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
-    // PRAGMA は authorizer が通さないので、その前に流す。
+    // PRAGMA と sqlite_master は authorizer が通さないので、その前に済ませる。
     conn.pragma_update(None, "query_only", true)?;
     let query_only: bool = conn.pragma_query_value(None, "query_only", |r| r.get(0))?;
     // **課したつもりで課せていない、を黙って通さない。**
     if !defensive || !query_only || conn.limit(Limit::SQLITE_LIMIT_ATTACHED)? != 0 {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    conn.authorizer(Some(authorize))?;
+    let schema_names: Vec<String> = conn
+        .prepare("SELECT lower(name) FROM sqlite_master")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let deadline = Instant::now() + TIME_LIMIT;
+    conn.progress_handler(1000, Some(move || Instant::now() > deadline))?;
+    conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+        authorize(&schema_names, ctx)
+    }))?;
     Ok(conn)
 }
 
-fn authorize(ctx: AuthContext<'_>) -> Authorization {
+/// `schema_names` は DB に実在する表・索引の名前(小文字)。
+fn authorize(schema_names: &[String], ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
         // ファイルに触る唯一の組み込み関数。実行時は既定で無効だが、その前提に依存しない。
@@ -201,16 +243,27 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
                 Authorization::Ignore
             }
         }
-        // 列を 1 つも読まない参照(`count(*)`)。再帰 CTE を数えるときに表名 = CTE 名で来る。
-        // 値は何も出ない(他の表でも行数しか分からない)。
-        AuthAction::Read {
-            column_name: "", ..
-        } => Authorization::Ignore,
         // 引数の JSON を展開するだけの表値関数。DB の中身には触らない。
         AuthAction::Read {
             table_name: "json_each" | "json_tree",
             ..
         } => Authorization::Allow,
+        // 列を 1 つも読まない参照(`count(*)`)。CTE を数えるときに表名 = CTE 名で来る。
+        // authorizer からは CTE と本物の表を見分けられない(どちらも database 名が無い)ので、
+        // **本物の表と組み込みの仮想表の名前なら拒む**。行数だけでも、他の表の中身の
+        // 手がかりになる(`count(*) from sqlite_master` や `dbstat`)。
+        AuthAction::Read {
+            table_name,
+            column_name: "",
+        } => {
+            let t = table_name.to_ascii_lowercase();
+            let builtin = t.starts_with("sqlite_") || t.starts_with("pragma_") || t == "dbstat";
+            if builtin || schema_names.contains(&t) {
+                Authorization::Deny
+            } else {
+                Authorization::Ignore
+            }
+        }
         // 他の表(sqlite_master・dbstat・pragma 表など)、書き込み、ATTACH、PRAGMA、トランザクション。
         _ => Authorization::Deny,
     }
@@ -222,7 +275,8 @@ const DENIED: &str =
 /// SQLite のエラーを、SQL 全文・値・パスを含まない文に写す。
 ///
 /// rusqlite の `SqlInputError` は Display に **SQL 全文**を含むので、素で出さない。
-/// SQLite の文言は、SQL の中の識別子だけを反響するものに限って残す。
+/// SQLite の文言のうち、SQL から識別子を反響するものは**識別子が素直な綴りのときだけ**
+/// 残す(`"/private/x"` のように引用符で何でも識別子にできる)。
 /// 生の SQL を選んだ利点「列名を間違えればエラーになる」には `no such column: x` が要る。
 fn explain(e: &rusqlite::Error) -> String {
     use rusqlite::Error as E;
@@ -241,28 +295,49 @@ fn explain(e: &rusqlite::Error) -> String {
         }
         _ => {}
     }
-    const ECHOES_ONLY_IDENTIFIERS: &[&str] = &[
-        "no such column:",
-        "no such table:",
-        "no such function:",
-        "ambiguous column name:",
-        "near \"",
-        "unrecognized token:",
-        "incomplete input",
-        "wrong number of arguments",
-        "misuse of aggregate",
-        "not authorized",
-        "too many attached databases",
-        "string or blob too big",
-    ];
-    match msg {
-        Some(m) if ECHOES_ONLY_IDENTIFIERS.iter().any(|p| m.starts_with(p)) => {
-            m.chars().take(120).collect()
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 64
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    };
+    let m = msg.unwrap_or_default();
+    if let Some(rest) = m.strip_prefix("near \"") {
+        return match rest.split_once("\": syntax error") {
+            Some((tok, "")) if plain(tok) => format!("near \"{tok}\": syntax error"),
+            _ => "syntax error".into(),
+        };
+    }
+    for p in [
+        "no such column",
+        "no such table",
+        "no such function",
+        "ambiguous column name",
+        "unrecognized token",
+    ] {
+        if let Some(rest) = m.strip_prefix(p).and_then(|r| r.strip_prefix(": ")) {
+            return if plain(rest) {
+                format!("{p}: {rest}")
+            } else {
+                p.into()
+            };
         }
-        _ => match e.sqlite_error_code() {
-            Some(code) => format!("SQL を実行できません({code:?})"),
-            None => "SQL を実行できません".into(),
-        },
+    }
+    // 識別子を含みうる残りは、決まった頭だけを出す。
+    for p in [
+        "incomplete input",
+        "wrong number of arguments to function",
+        "misuse of aggregate",
+        "too many columns",
+        "string or blob too big",
+    ] {
+        if m.starts_with(p) {
+            return p.into();
+        }
+    }
+    match e.sqlite_error_code() {
+        Some(code) => format!("SQL を実行できません({code:?})"),
+        None => "SQL を実行できません".into(),
     }
 }
 
@@ -278,62 +353,63 @@ fn to_json(v: ValueRef<'_>) -> serde_json::Value {
 
 /// 標準出力は先頭の行だけ。上限を超えた時点で全体をファイルへ切り替える。
 ///
+/// **標準出力へは最後にまとめて書く。** 途中で SQL が失敗したとき、
+/// 先頭だけの結果を完全な答えに見せないため。溜めるのは上限の範囲だけなので小さい。
+///
 /// 1 行目は列名の JSON 配列、以降は 1 行 1 JSON 配列。ファイルは
 /// `{"columns":[...],"rows":[...]}` で、`.json` なので本文と同じ保持期間で掃除される。
 struct Output {
     header: String,
-    printed: Vec<String>,
-    printed_bytes: usize,
+    head: Vec<String>,
+    head_bytes: usize,
     rows: usize,
     file: Option<(PathBuf, BufWriter<File>, u64)>,
-    file_error: Option<String>,
+    file_failed: bool,
 }
 
 impl Output {
     fn new(columns: &[String]) -> Self {
         let header = serde_json::to_string(columns).unwrap_or_else(|_| "[]".into());
-        println!("{header}");
         Output {
-            printed_bytes: header.len() + 1,
+            head_bytes: header.len() + 1,
             header,
-            printed: Vec::new(),
+            head: Vec::new(),
             rows: 0,
             file: None,
-            file_error: None,
+            file_failed: false,
         }
     }
 
-    /// 1 行足す。ファイルの上限に達したら false。
-    fn push(&mut self, line: &str) -> bool {
+    /// 1 行足す。これ以上続けられないなら false。
+    fn push(&mut self, line: String) -> bool {
         self.rows += 1;
-        if self.file.is_none() && self.file_error.is_none() {
-            if self.rows <= STDOUT_ROWS && self.printed_bytes + line.len() < STDOUT_BYTES {
-                println!("{line}");
-                self.printed_bytes += line.len() + 1;
-                self.printed.push(line.to_string());
+        if self.file.is_none() {
+            if self.rows <= STDOUT_ROWS && self.head_bytes + line.len() < STDOUT_BYTES {
+                self.head_bytes += line.len() + 1;
+                self.head.push(line);
                 return true;
             }
-            if let Err(e) = self.spill() {
-                self.file_error = Some(e.to_string());
+            if self.spill().is_err() {
+                // 全体を残せない。数えるだけ続けても答えは出せないので止める。
+                self.file_failed = true;
+                return false;
             }
         }
-        match &mut self.file {
-            Some((_, w, written)) => {
-                let sep = if self.rows == 1 { "\n" } else { ",\n" };
-                if *written + (sep.len() + line.len()) as u64 > FILE_BYTES {
-                    return false;
-                }
-                *written += (sep.len() + line.len()) as u64;
-                w.write_all(sep.as_bytes()).is_ok() && w.write_all(line.as_bytes()).is_ok()
-            }
-            // ファイルを作れなかった。行を数えるだけ続けても答えは出せないので止める。
-            None => false,
+        let Some((_, w, written)) = &mut self.file else {
+            return false;
+        };
+        let sep = if self.rows == 1 { "\n" } else { ",\n" };
+        let n = (sep.len() + line.len()) as u64;
+        if *written + n > FILE_BYTES {
+            return false;
         }
+        *written += n;
+        w.write_all(sep.as_bytes()).is_ok() && w.write_all(line.as_bytes()).is_ok()
     }
 
-    /// ここまでに出した行ごと、ファイルへ移る。
-    fn spill(&mut self) -> Result<()> {
-        let dir = paths::dumps_dir()?;
+    /// ここまでに溜めた行ごと、ファイルへ移る。
+    fn spill(&mut self) -> std::io::Result<()> {
+        let dir = paths::dumps_dir().map_err(std::io::Error::other)?;
         let stamp = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
         let path = dir.join(format!("query-{stamp}-{}.json", std::process::id()));
         let f = OpenOptions::new()
@@ -342,11 +418,10 @@ impl Output {
             .mode(0o600)
             .open(&path)?;
         let mut w = BufWriter::new(f);
-        let mut written = 0u64;
         let head = format!("{{\"columns\":{},\"rows\":[", self.header);
         w.write_all(head.as_bytes())?;
-        written += head.len() as u64;
-        for (i, line) in self.printed.iter().enumerate() {
+        let mut written = head.len() as u64;
+        for (i, line) in self.head.iter().enumerate() {
             let sep = if i == 0 { "\n" } else { ",\n" };
             w.write_all(sep.as_bytes())?;
             w.write_all(line.as_bytes())?;
@@ -356,48 +431,53 @@ impl Output {
         Ok(())
     }
 
-    fn finish(self, stopped: Option<String>) -> Result<i32> {
-        let shown = self.printed.len();
-        if let Some(e) = self.file_error {
+    fn finish(self, stopped: Option<String>) -> i32 {
+        println!("{}", self.header);
+        for line in &self.head {
+            println!("{line}");
+        }
+        let shown = self.head.len();
+        let limits = format!("{STDOUT_ROWS} 行 / {} KiB", STDOUT_BYTES / 1024);
+        if self.file_failed {
             eprintln!(
-                "結果が上限({STDOUT_ROWS} 行 / {} KiB)を超えました。先頭 {shown} 行だけ出しています。\
-                 全体を保存するファイルを作れません: {e}",
-                STDOUT_BYTES / 1024
+                "結果が上限({limits})を超えました。先頭 {shown} 行だけ出しています。全体を保存するファイルを作れません"
             );
-            return Ok(TRUNCATED);
+            return TRUNCATED;
         }
         let Some((path, mut w, _)) = self.file else {
             if let Some(why) = stopped {
                 eprintln!("{why}。出したのは {shown} 行です");
-                return Ok(TRUNCATED);
+                return TRUNCATED;
             }
-            return Ok(0);
+            return 0;
         };
         let tail = if stopped.is_some() {
             "\n],\"truncated\":true}\n"
         } else {
             "\n]}\n"
         };
+        // ファイル名だけを出す。場所は `ailo show` が知っている。
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if w.write_all(tail.as_bytes())
             .and_then(|_| w.flush())
             .is_err()
         {
-            bail!("{} に書き込めません", paths::tildify(&path));
+            eprintln!(
+                "結果が上限({limits})を超えました。先頭 {shown} 行だけ出しています。全体を {name} に書き切れませんでした"
+            );
+            return TRUNCATED;
         }
         let saved = match &stopped {
             Some(why) => format!("{why}。それまでの {} 行", self.rows),
             None => format!("全 {} 行", self.rows),
         };
         eprintln!(
-            "結果が上限({STDOUT_ROWS} 行 / {} KiB)を超えたので、先頭 {shown} 行だけ出しました。\
-             {saved}を {} に保存しました(`ailo show {}`)",
-            STDOUT_BYTES / 1024,
-            paths::tildify(&path),
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
+            "結果が上限({limits})を超えたので、先頭 {shown} 行だけ出しました。{saved}を保存しました(`ailo show {name}`)"
         );
-        Ok(TRUNCATED)
+        TRUNCATED
     }
 }
 
@@ -509,6 +589,10 @@ mod tests {
                 "[[5]]",
             ),
             ("select count(*) from json_each('[1,2]')", "[[2]]"),
+            (
+                "with t as materialized (select id from history) select count(*) from t",
+                "[[3]]",
+            ),
             ("select sum(value) from json_each('[1,2]')", "[[3]]"),
         ];
         for (sql, want) in cases {
@@ -539,6 +623,12 @@ mod tests {
             "select * from sqlite_master",
             "select * from pragma_table_info('history')",
             "select * from dbstat",
+            "select count(*) from sqlite_master",
+            "select count(*) from sqlite_schema",
+            "select count(*) from SQLITE_MASTER",
+            "select count(*) from dbstat",
+            "select count(*) from pragma_table_info('history')",
+            "select count(*) from history_ts",
             "select load_extension('/tmp/x')",
             "begin",
             "vacuum",
@@ -575,6 +665,16 @@ mod tests {
         assert!(all(&conn, "select length(randomblob(1000))").is_ok());
     }
 
+    /// 1 つずつは上限内の値を列に並べても、列数で止まること。
+    #[test]
+    fn many_legal_values_cannot_multiply_into_a_huge_row() {
+        let (_t, conn) = fixture();
+        let wide = vec!["1"; MAX_COLUMNS as usize + 1].join(", ");
+        assert!(all(&conn, &format!("select {wide}")).is_err());
+        let ok = vec!["1"; MAX_COLUMNS as usize].join(", ");
+        assert!(all(&conn, &format!("select {ok}")).is_ok());
+    }
+
     #[test]
     fn errors_do_not_echo_the_sql_or_paths() {
         let (_t, conn) = fixture();
@@ -583,6 +683,11 @@ mod tests {
             "selec 'literal-value-xyz'",
             "select * from history where url = 'literal-value-xyz' and",
             "attach '/private/abs/path/literal-value-xyz.db' as x",
+            "select * from \"/private/literal-value-xyz\"",
+            "select history.\"/private/literal-value-xyz\" from history",
+            "select \"/private/literal-value-xyz\"() from history",
+            "select 1 from history \"/private/literal-value-xyz\" \"x\"",
+            "select count(*) from history where url = 'literal-value-xyz",
         ] {
             let err = conn.prepare(sql).map(|_| ()).unwrap_err();
             let shown = explain(&err);
