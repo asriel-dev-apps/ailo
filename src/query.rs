@@ -101,8 +101,12 @@ pub fn run(sql: &str) -> i32 {
             return 2;
         }
     };
-    for w in &db.warnings {
-        eprintln!("{w}");
+    // 中身(取り込み・隔離の置き場所)はパスを含むので出さない。`ailo log` が同じものを出す。
+    if !db.warnings.is_empty() {
+        eprintln!(
+            "履歴の初期化で {} 件の注意があります。`ailo log` で確認してください",
+            db.warnings.len()
+        );
     }
 
     let conn = match open_hardened(&path) {
@@ -211,7 +215,8 @@ fn open_hardened(path: &std::path::Path) -> rusqlite::Result<Connection> {
         return Err(rusqlite::Error::InvalidQuery);
     }
     let schema_names: Vec<String> = conn
-        .prepare("SELECT lower(name) FROM sqlite_master")?
+        // 索引は FROM に書けないので、表とビューだけ。索引名と同じ CTE を拒まない。
+        .prepare("SELECT lower(name) FROM sqlite_master WHERE type IN ('table', 'view')")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let deadline = Instant::now() + TIME_LIMIT;
@@ -428,13 +433,20 @@ impl Output {
             .open(&path)?;
         let mut w = BufWriter::new(f);
         let head = format!("{{\"columns\":{},\"rows\":[", self.header);
-        w.write_all(head.as_bytes())?;
         let mut written = head.len() as u64;
+        let mut body = w.write_all(head.as_bytes());
         for (i, line) in self.head.iter().enumerate() {
             let sep = if i == 0 { "\n" } else { ",\n" };
-            w.write_all(sep.as_bytes())?;
-            w.write_all(line.as_bytes())?;
+            body = body
+                .and_then(|_| w.write_all(sep.as_bytes()))
+                .and_then(|_| w.write_all(line.as_bytes()));
             written += (sep.len() + line.len()) as u64;
+        }
+        if let Err(e) = body {
+            // 作ったのに書き切れなかった。ここで消さないと、誰も名前を知らないまま残る。
+            drop(w);
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
         }
         self.file = Some((path, w, written));
         Ok(())
@@ -602,6 +614,10 @@ mod tests {
                 "with t as materialized (select id from history) select count(*) from t",
                 "[[3]]",
             ),
+            (
+                "with history_ts as materialized (select id from history) select count(*) from history_ts",
+                "[[3]]",
+            ),
             ("select sum(value) from json_each('[1,2]')", "[[3]]"),
         ];
         for (sql, want) in cases {
@@ -637,7 +653,6 @@ mod tests {
             "select count(*) from SQLITE_MASTER",
             "select count(*) from dbstat",
             "select count(*) from pragma_table_info('history')",
-            "select count(*) from history_ts",
             "select load_extension('/tmp/x')",
             "begin",
             "vacuum",
