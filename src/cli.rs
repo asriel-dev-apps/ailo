@@ -69,6 +69,8 @@ pub enum Command {
     Log(LogArgs),
     /// ダンプ本体を表示する
     Show(ShowArgs),
+    /// 履歴を SQL で問い合わせる (読み取り専用。表は history)
+    Query(QueryArgs),
     /// 保存済みリクエストを一覧・実行する画面を開く
     Tui(TuiArgs),
 }
@@ -310,6 +312,17 @@ pub struct LogArgs {
     /// 表示する件数
     #[arg(long, short, default_value_t = 20)]
     pub limit: usize,
+}
+
+#[derive(Debug, Args)]
+pub struct QueryArgs {
+    /// 1 文の SELECT (例: "select status, count(*) from history group by 1")
+    #[arg(required_unless_present = "schema")]
+    pub sql: Option<String>,
+
+    /// 使える列を出す
+    #[arg(long, conflicts_with = "sql")]
+    pub schema: bool,
 }
 
 #[derive(Debug, Args)]

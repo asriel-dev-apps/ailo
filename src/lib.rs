@@ -15,6 +15,7 @@ pub mod keychain;
 pub mod output;
 pub mod paths;
 pub mod pick;
+pub mod query;
 pub mod redact;
 pub mod run;
 pub mod secrets;

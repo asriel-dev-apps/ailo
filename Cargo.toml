@@ -60,7 +60,9 @@ tui-textarea = { version = "0.7", features = ["search"] }
 # 「OS のライブラリに依存せず単一バイナリで配布する」方針(rustls / libsecret の dlopen)は
 # 保たれる。DuckDB は採らない: 1 プロセスが読み書きで開くと他が接続できず、
 # エージェントが並列に叩く CLI の土台にできない。
-rusqlite = { version = "0.40", features = ["bundled"] }
+# `hooks`(authorizer / progress_handler)と `limits`(ATTACHED を 0)は `ailo query` の守り。
+# どちらも依存 crate を増やさない。
+rusqlite = { version = "0.40", features = ["bundled", "hooks", "limits"] }
 
 [dev-dependencies]
 # 実 API の大半は gzip を返す。ailo は自分で gzip/brotli を有効にしているのに、

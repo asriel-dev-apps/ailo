@@ -10,8 +10,8 @@ use time::OffsetDateTime;
 use crate::args::{self, Item};
 use crate::capture;
 use crate::cli::{
-    Command, CommonArgs, ConfigCommand, EnvCommand, LogArgs, RequestArgs, RunArgs, SaveArgs,
-    SecretCommand, ShowArgs,
+    Command, CommonArgs, ConfigCommand, EnvCommand, LogArgs, QueryArgs, RequestArgs, RunArgs,
+    SaveArgs, SecretCommand, ShowArgs,
 };
 use crate::config::{Config, LastInvocation, Requests, SavedRequest, State};
 use crate::config_edit;
@@ -19,6 +19,7 @@ use crate::dump::{self, Dump, Retention};
 use crate::output::{self, Format, Palette};
 use crate::paths;
 use crate::pick;
+use crate::query;
 use crate::redact::{self, Redactor};
 use crate::secrets;
 use crate::shape;
@@ -55,6 +56,7 @@ pub async fn run(command: Command) -> Result<Outcome> {
         Command::Secret(c) => secret(&c),
         Command::Log(a) => log(&a),
         Command::Show(a) => show(&a),
+        Command::Query(a) => query_cmd(&a),
         _ => unreachable!("リクエスト系は as_request で処理済み"),
     }
 }
@@ -1431,6 +1433,18 @@ fn log(a: &LogArgs) -> Result<Outcome> {
         );
     }
     Ok(OK)
+}
+
+fn query_cmd(a: &QueryArgs) -> Result<Outcome> {
+    match &a.sql {
+        Some(sql) => Ok(Outcome {
+            code: query::run(sql),
+        }),
+        None => {
+            print!("{}", query::schema());
+            Ok(OK)
+        }
+    }
 }
 
 fn show(a: &ShowArgs) -> Result<Outcome> {
