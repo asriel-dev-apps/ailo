@@ -154,7 +154,7 @@ pub fn run(sql: &str) -> i32 {
                 let raw: usize = values
                     .iter()
                     .map(|v| match v {
-                        ValueRef::Text(t) => t.len(),
+                        ValueRef::Text(t) | ValueRef::Blob(t) => t.len(),
                         _ => 0,
                     })
                     .sum();
@@ -183,6 +183,7 @@ pub fn run(sql: &str) -> i32 {
             // 先頭だけの結果を「全部」と読み違えさせないため。
             Err(e) => {
                 eprintln!("エラー: {}", explain(&e));
+                out.abandon();
                 return 2;
             }
         }
@@ -405,6 +406,14 @@ impl Output {
         }
         *written += n;
         w.write_all(sep.as_bytes()).is_ok() && w.write_all(line.as_bytes()).is_ok()
+    }
+
+    /// 失敗した問い合わせの書きかけを残さない。閉じていない JSON を答えに見せないため。
+    fn abandon(self) {
+        if let Some((path, w, _)) = self.file {
+            drop(w);
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// ここまでに溜めた行ごと、ファイルへ移る。

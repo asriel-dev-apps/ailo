@@ -188,3 +188,29 @@ fn the_spill_notice_names_the_file_but_not_its_directory() {
     assert!(!run.stderr.contains(&dir), "{}", run.stderr);
     assert!(run.stderr.contains("`ailo show query-"), "{}", run.stderr);
 }
+
+/// ファイルへ落としたあとで失敗したら、書きかけのファイルを残さない。
+#[test]
+fn a_failure_after_spilling_leaves_no_half_written_file() {
+    let (_server, sb) = history_with_templates();
+    let sql = "with recursive n(x) as (select 1 union all select x + 1 from n where x < 200) \
+               select json(case when x = 150 then '{broken' else x end) from n";
+    let run = query(&sb, sql);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let spilled = std::fs::read_dir(sb.data_dir().join("dumps"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("query-"))
+        .count();
+    assert_eq!(spilled, 0, "書きかけのファイルが残っている");
+}
+
+/// BLOB も 1 行の大きさに数える(本文には出さないが、確保はされる)。
+#[test]
+fn blobs_count_toward_the_row_size_limit() {
+    let (_server, sb) = history_with_templates();
+    let cols = ["zeroblob(1000000)"; 10].join(", ");
+    let run = query(&sb, &format!("select {cols}"));
+    assert_eq!(run.code, 4, "{}", run.stderr);
+    assert!(run.stderr.contains("1 行の大きさ"), "{}", run.stderr);
+}
