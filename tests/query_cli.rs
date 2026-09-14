@@ -67,7 +67,7 @@ fn templates_never_come_out_of_query_but_are_really_stored() {
 }
 
 #[test]
-fn ordinary_aggregation_works() {
+fn ordinary_aggregation_returns_the_expected_rows() {
     let (_server, sb) = history_with_templates();
     assert_eq!(
         query(&sb, "select count(*) from history").ok(),

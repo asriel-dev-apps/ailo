@@ -32,7 +32,7 @@ use crate::paths;
 /// query から値が見える列。**ここに無い列は NULL になる。**
 ///
 /// 並びは `--schema` の出力順。説明はエージェントが読む前提で短く。
-pub const VISIBLE: &[(&str, &str)] = &[
+const VISIBLE: &[(&str, &str)] = &[
     ("id", "INTEGER  追加順の連番。大きいほど新しい"),
     ("ts", "TEXT     送信時刻 (RFC 3339, UTC)"),
     (
@@ -72,7 +72,7 @@ const MAX_COLUMNS: i32 = 100;
 const ROW_BYTES: usize = 8 * 1024 * 1024;
 
 /// 結果を出し切れなかった。行数・バイト数・時間のどれでも同じコード。
-pub const TRUNCATED: i32 = 4;
+const TRUNCATED: i32 = 4;
 
 /// `ailo query --schema`。定数から出す(`PRAGMA` は authorizer が通さない)。
 pub fn schema() -> String {
@@ -146,7 +146,7 @@ pub fn run(sql: &str) -> i32 {
             return 2;
         }
     };
-    let mut out = Output::new(&columns);
+    let mut out = Sink::new(&columns);
     let stopped = loop {
         match rows.next() {
             Ok(Some(row)) => {
@@ -364,7 +364,7 @@ fn to_json(v: ValueRef<'_>) -> serde_json::Value {
 ///
 /// 1 行目は列名の JSON 配列、以降は 1 行 1 JSON 配列。ファイルは
 /// `{"columns":[...],"rows":[...]}` で、`.json` なので本文と同じ保持期間で掃除される。
-struct Output {
+struct Sink {
     header: String,
     head: Vec<String>,
     head_bytes: usize,
@@ -373,10 +373,10 @@ struct Output {
     file_failed: bool,
 }
 
-impl Output {
+impl Sink {
     fn new(columns: &[String]) -> Self {
         let header = serde_json::to_string(columns).unwrap_or_else(|_| "[]".into());
-        Output {
+        Sink {
             head_bytes: header.len() + 1,
             header,
             head: Vec::new(),
@@ -410,7 +410,16 @@ impl Output {
             return false;
         }
         *written += n;
-        w.write_all(sep.as_bytes()).is_ok() && w.write_all(line.as_bytes()).is_ok()
+        if w.write_all(sep.as_bytes()).is_ok() && w.write_all(line.as_bytes()).is_ok() {
+            return true;
+        }
+        // 書けなかった。上限で止めたのと区別しないと「保存しました」と嘘をつく。
+        if let Some((path, w, _)) = self.file.take() {
+            drop(w);
+            let _ = std::fs::remove_file(path);
+        }
+        self.file_failed = true;
+        false
     }
 
     /// 失敗した問い合わせの書きかけを残さない。閉じていない JSON を答えに見せないため。
@@ -461,7 +470,7 @@ impl Output {
         let limits = format!("{STDOUT_ROWS} 行 / {} KiB", STDOUT_BYTES / 1024);
         if self.file_failed {
             eprintln!(
-                "結果が上限({limits})を超えました。先頭 {shown} 行だけ出しています。全体を保存するファイルを作れません"
+                "結果が上限({limits})を超えました。先頭 {shown} 行だけ出しています。全体を保存できませんでした"
             );
             return TRUNCATED;
         }
